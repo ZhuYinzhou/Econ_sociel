@@ -4,20 +4,34 @@
 import os
 import sys
 import time
-import yaml
 import torch
 import argparse
 import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Any, List
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:  # pragma: no cover
+    wandb = None  # type: ignore
 
 # Import necessary components
 from utils.logging import get_logger
 from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
 from learners import REGISTRY as le_REGISTRY
+
+# YAML loader: prefer PyYAML; fallback to ruamel.yaml if PyYAML isn't available.
+try:
+    import yaml  # type: ignore
+    _HAS_PYYAML = True
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore
+    _HAS_PYYAML = False
+    try:
+        from ruamel.yaml import YAML  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError("No YAML parser available. Please install PyYAML (pyyaml) or ruamel.yaml.") from e
 
 def parse_args():
     """Parse command line arguments"""
@@ -33,6 +47,7 @@ def parse_args():
     parser.add_argument('--api_key', type=str, help='Together API key')
     parser.add_argument('--seed', type=int, help='Random seed')
     parser.add_argument('--env', type=str, help='Environment name')
+    parser.add_argument('--load_model_path', type=str, help='Optional checkpoint directory to load (expects files saved by learner.save_models)')
     
     # wandb related parameters
     parser.add_argument('--use_wandb', action='store_true', help='Whether to use wandb for experiment logging')
@@ -45,7 +60,11 @@ def parse_args():
 def load_config(config_path: str) -> SimpleNamespace:
     """Load YAML configuration file"""
     with open(config_path, 'r') as f:
-        config_dict = yaml.safe_load(f)
+        if _HAS_PYYAML and yaml is not None:
+            config_dict = yaml.safe_load(f)
+        else:
+            y = YAML(typ="safe")
+            config_dict = y.load(f)
     
     # Recursively convert to SimpleNamespace for easy access
     def dict_to_namespace(d):
@@ -92,6 +111,9 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
     
     if args.env:
         config.env = args.env
+
+    if getattr(args, "load_model_path", None):
+        config.load_model_path = str(args.load_model_path)
     
     # Add wandb related configuration
     if not hasattr(config, 'wandb'):
@@ -182,6 +204,18 @@ def setup_experiment(config: SimpleNamespace):
     
     # Initialize learner
     learner = le_REGISTRY[config.learner](mac=mac, scheme=scheme, logger=logger, args=config)
+
+    # Optional: resume/load checkpoint
+    load_path = str(getattr(config, "load_model_path", "") or "").strip()
+    if load_path:
+        try:
+            if os.path.isdir(load_path):
+                learner.load_models(load_path)
+                logger.info(f"Loaded checkpoint from: {load_path}")
+            else:
+                logger.warning(f"load_model_path is set but not a directory: {load_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint from {load_path}: {e}")
     
     return runner, mac, learner, logger, device
 
@@ -212,8 +246,47 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     # Training loop
     episode = 0
     t_env = 0
+
+    # ===== B: curriculum schedule (optional) =====
+    # config.curriculum example:
+    # curriculum:
+    #   enabled: true
+    #   t_env_steps: [20000, 60000]   # thresholds (env steps) to advance
+    #   n_stages: [7, 10, 13]         # must be len(t_env_steps)+1
+    cur = getattr(config, "curriculum", SimpleNamespace())
+    cur_enabled = bool(getattr(cur, "enabled", False))
+    cur_t_env_steps = list(getattr(cur, "t_env_steps", [])) if cur_enabled else []
+    cur_n_stages = list(getattr(cur, "n_stages", [])) if cur_enabled else []
+    cur_idx = 0
+    if cur_enabled and cur_n_stages:
+        # initialize to the first stage count (should be <= original env_args.n_stages)
+        try:
+            ns0 = int(cur_n_stages[0])
+            runner.set_env_n_stages(ns0)
+            # keep config in sync for logging
+            if hasattr(config, "env_args"):
+                config.env_args.n_stages = ns0
+        except Exception as e:
+            logger.warning(f"Failed to initialize curriculum: {e}")
     
     while t_env < t_max:
+        # curriculum advance
+        if cur_enabled and cur_n_stages and cur_t_env_steps and (cur_idx + 1) < len(cur_n_stages):
+            try:
+                next_threshold = int(cur_t_env_steps[cur_idx])
+            except Exception:
+                next_threshold = None
+            if next_threshold is not None and t_env >= next_threshold:
+                cur_idx += 1
+                try:
+                    ns = int(cur_n_stages[cur_idx])
+                    runner.set_env_n_stages(ns)
+                    if hasattr(config, "env_args"):
+                        config.env_args.n_stages = ns
+                    logger.info(f"[Curriculum] Switched to n_stages={ns} at t_env={t_env}")
+                except Exception as e:
+                    logger.warning(f"Failed to advance curriculum at t_env={t_env}: {e}")
+
         # Run episode
         episode_batch = runner.run(test_mode=False)
         
@@ -354,10 +427,18 @@ def run_test(runner, logger, config: SimpleNamespace):
                     gt_t = int(info.get("gt_t", -1))
                 except Exception:
                     gt_t = -1
+                # A: only evaluate steps with usable supervision
                 try:
-                    n_stages = int(getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13))
+                    gt_av = int(info.get("gt_available", 1))
+                except Exception:
+                    gt_av = 1
+                try:
+                    # Use runtime env n_stages if available (curriculum may change it)
+                    n_stages = int(getattr(getattr(runner, "env", None), "n_stages", getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13)))
                 except Exception:
                     n_stages = 13
+                if gt_av <= 0:
+                    continue
                 if gt_t < 0 or gt_t >= n_stages:
                     continue
 
@@ -410,6 +491,10 @@ def run_test(runner, logger, config: SimpleNamespace):
 def setup_wandb(config: SimpleNamespace, logger):
     """Initialize wandb for experiment tracking"""
     if hasattr(config, 'wandb') and config.wandb.use_wandb:
+        if wandb is None:
+            logger.warning("wandb is enabled in config but package 'wandb' is not installed. Disabling wandb logging.")
+            config.wandb.use_wandb = False
+            return
         logger.info("Initializing wandb...")
         
         wandb.init(
@@ -426,6 +511,8 @@ def setup_wandb(config: SimpleNamespace, logger):
 
 def log_to_wandb(data: Dict, step: int, prefix: str = ''):
     """Log data to wandb"""
+    if wandb is None:
+        return
     if wandb.run is not None:
         wandb.log({f"{prefix}{k}": v for k, v in data.items()}, step=step)
 
@@ -459,7 +546,7 @@ def main():
         sys.exit(1)
     finally:
         # Clean up wandb
-        if wandb.run is not None:
+        if wandb is not None and wandb.run is not None:
             wandb.finish()
 
 if __name__ == "__main__":

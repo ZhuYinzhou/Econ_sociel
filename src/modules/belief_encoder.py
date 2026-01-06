@@ -334,12 +334,21 @@ class BeliefEncoder(nn.Module):
         logits = self.population_update_head(x)
         if return_logits:
             return logits
-        z_hat = F.softmax(logits, dim=-1)
+        # === continuous scalar mode: K=1 means z ∈ [-1,1] ===
+        if int(self.population_belief_dim) == 1:
+            # tanh squashes to [-1,1]
+            z_hat = torch.tanh(logits)
+        else:
+            z_hat = F.softmax(logits, dim=-1)
 
         # residual mixing (convex combination keeps simplex)
         if self.population_update_residual_mixing:
-            z_in = torch.clamp(z_t, min=0.0)
-            z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+            if int(self.population_belief_dim) == 1:
+                # scalar convex mixing, clamp to [-1,1]
+                z_in = torch.clamp(z_t, min=-1.0, max=1.0)
+            else:
+                z_in = torch.clamp(z_t, min=0.0)
+                z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
             if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
                 mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
             else:
@@ -347,7 +356,9 @@ class BeliefEncoder(nn.Module):
             # broadcast scalar -> [bs,1]
             mix = mix.to(z_hat.device, dtype=z_hat.dtype).view(1, 1)
             z_out = mix * z_hat + (1.0 - mix) * z_in
-            # safety renorm
+            if int(self.population_belief_dim) == 1:
+                return torch.clamp(z_out, min=-1.0, max=1.0)
+            # safety renorm (categorical simplex)
             return z_out / torch.clamp(z_out.sum(dim=-1, keepdim=True), min=1e-8)
 
         return z_hat
@@ -484,7 +495,26 @@ class BeliefEncoder(nn.Module):
         if z_pred.size(-1) != z_target.size(-1):
             raise ValueError(f"z_pred/z_target K 不一致: {z_pred.size(-1)} vs {z_target.size(-1)}")
 
-        # normalize for safety
+        # === continuous scalar mode: K=1 -> regression in [-1,1] ===
+        if int(z_pred.size(-1)) == 1:
+            # coerce mask
+            if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
+                z_mask = z_mask.squeeze(-1)
+            z_mask = z_mask.to(z_pred.device, dtype=z_pred.dtype)
+
+            # clamp to valid range
+            z_pred = torch.clamp(z_pred, min=-1.0, max=1.0)
+            z_target = torch.clamp(z_target, min=-1.0, max=1.0)
+            # choose regression loss
+            lt = str(loss_type or "mse").lower()
+            if lt in ("smooth_l1", "huber"):
+                per = F.smooth_l1_loss(z_pred, z_target, reduction="none").squeeze(-1)
+            else:
+                per = (z_pred - z_target).pow(2).squeeze(-1)
+            per = per * z_mask
+            return per.sum() / (z_mask.sum() + eps)
+
+        # normalize for safety (categorical simplex)
         z_pred = torch.clamp(z_pred, min=0.0)
         z_target = torch.clamp(z_target, min=0.0)
         z_pred = z_pred / torch.clamp(z_pred.sum(dim=-1, keepdim=True), min=eps)
@@ -494,7 +524,8 @@ class BeliefEncoder(nn.Module):
             z_mask = z_mask.squeeze(-1)
         z_mask = z_mask.to(z_pred.device, dtype=z_pred.dtype)
 
-        if loss_type.lower() == "kl":
+        lt = str(loss_type or "kl").lower()
+        if lt == "kl":
             loss = F.kl_div((z_pred + eps).log(), z_target, reduction="none").sum(dim=-1)
         else:  # CE (soft target)
             loss = -(z_target * (z_pred + eps).log()).sum(dim=-1)

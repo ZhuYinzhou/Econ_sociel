@@ -36,6 +36,7 @@ import pickle
 import json
 import glob
 import hashlib
+import re
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -81,6 +82,30 @@ def _as_mapping(obj: Any) -> Optional[Dict[str, Any]]:
         except Exception:
             return None
     return None
+
+
+def _normalize_label(s: Any) -> str:
+    """
+    与 `ECON/src/envs/hisim_social_env.py::_normalize_label` 对齐：
+    把可能形态的 stance label 归一化到稳定字符串。
+    """
+    if s is None:
+        return ""
+    ss = str(s).strip()
+    if not ss:
+        return ""
+    ss2 = re.sub(r"\s+", " ", ss).strip()
+    low = ss2.lower()
+    mapping = {
+        "neutral": "Neutral",
+        "none": "Neutral",
+        "unknown": "Neutral",
+        "oppose": "Oppose",
+        "against": "Oppose",
+        "support": "Support",
+        "favor": "Support",
+    }
+    return mapping.get(low, ss2)
 
 
 def _extract_text(tweet: Dict[str, Any]) -> str:
@@ -244,7 +269,7 @@ def _extract_label(tweet: Dict[str, Any]) -> Optional[str]:
             continue
         s = str(v).strip()
         if s != "":
-            return s
+            return _normalize_label(s)
     return None
 
 def _neighbor_stage_label(macro, neighbors, t):
@@ -282,7 +307,7 @@ def _stage_label(stage_items: List[Any]) -> Optional[str]:
             continue
         lab = _extract_label(d)
         if lab:
-            labels.append(lab)
+            labels.append(_normalize_label(lab))
     if not labels:
         return None
     return Counter(labels).most_common(1)[0][0]
@@ -469,12 +494,20 @@ def build_label2id_from_macros(macro_paths: List[str]) -> Dict[str, int]:
                         continue
                     lab = _extract_label(d)
                     if lab:
-                        labels.add(lab)
+                        labels.add(_normalize_label(lab))
     if not labels:
         raise RuntimeError("未能从 macro 数据中抽取任何标签字段（stance_label 等）。")
-    # 稳定排序，保证可复现
-    label_list = sorted(labels)
-    return {lab: i for i, lab in enumerate(label_list)}
+    # 为了与 hisim_social_env 的实现对齐，这里默认强制 K=3，并优先使用 canonical 映射
+    # Neutral=0, Oppose=1, Support=2
+    canonical = {"Neutral": 0, "Oppose": 1, "Support": 2}
+    if set(canonical.keys()).issubset(labels):
+        return dict(canonical)
+
+    # fallback: 稳定排序取前三类；不足则用 canonical 补齐
+    picked = sorted(list(labels))[:3]
+    if len(picked) < 3:
+        picked = (picked + ["Neutral", "Oppose", "Support"])[:3]
+    return {lab: i for i, lab in enumerate(picked)}
 
 
 def convert_hisim_macro_to_belief_hf_dataset(
@@ -500,6 +533,9 @@ def convert_hisim_macro_to_belief_hf_dataset(
     max_population_tweets_total: int = 200,
     export_micro_user_sequences: bool = False,
     split_by_user: bool = True,
+    force_k: int = 3,
+    export_z_transition_dataset: bool = True,
+    z_transition_out_dir: str = "",
 ) -> None:
     """
     主转换入口：扫描 hisim_data_root 下的宏观数据，生成信念网络训练样本，并保存为 HF dataset。
@@ -545,11 +581,17 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     print("收集标签集合并构建 label2id...")
     label2id = build_label2id_from_macros(all_macro_paths)
-    print(f"标签数: {len(label2id)} | labels: {list(label2id.keys())}")
+    # 兼容参数：当前程序的社交环境强制 K=3，这里也保持一致
+    if int(force_k) != 3:
+        print(f"[WARN] force_k={force_k} 目前未实现可变 K；将继续使用 K=3 以对齐 hisim_social_env。")
+    print(f"标签数(K=3): {len(label2id)} | labels: {list(label2id.keys())}")
 
-    # split buckets
+    # split buckets (belief dataset)
     split_names = ("train", "validation", "test")
     split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
+
+    # split buckets (z-transition dataset)
+    z_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
 
     stats = {
         "topics": list(filtered.keys()),
@@ -581,6 +623,15 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "population_micro_user_scope": population_micro_user_scope,
         "population_micro_sampling": population_micro_sampling,
         "max_population_tweets_total": int(max_population_tweets_total),
+        "export_z_transition_dataset": bool(export_z_transition_dataset),
+    }
+
+    z_stats = {
+        "topics": list(filtered.keys()),
+        "label2id_size": len(label2id),
+        "num_examples": 0,
+        "export_z_transition_dataset": bool(export_z_transition_dataset),
+        "z_transition_definition": "secondary_users_stage_label_dist: z_t and z_target are distributions over [Neutral,Oppose,Support] computed from per-user stage majority label",
     }
 
     def _load_user_history_snippet(topic: str, user: str) -> str:
@@ -811,6 +862,91 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         "texts": pop_texts[: max_population_tweets_total if max_population_tweets_total > 0 else None],
                     }
 
+            # === 可选：导出 z(t)->z(t+1) transition 数据集（用于训练 BeliefEncoder.population_update_head）===
+            # 每条样本对应一个 stage transition（t in [0..12]），目标为“次要用户(secondary)的 stage label”
+            # 映射到标量 [-1,0,1] 后取均值，得到连续态度 z ∈ [-1,1]，学习 z(t)->z(t+1) 的回归动态。
+            if export_z_transition_dataset:
+                def _stage_scalar_over_users(users_list: List[str], stage_t: int) -> Tuple[float, int]:
+                    # label -> scalar mapping
+                    v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
+                    total = 0
+                    acc = 0.0
+                    for uu in users_list:
+                        ud = macro.get(uu)
+                        if not isinstance(ud, dict):
+                            continue
+                        st_items = ud.get(stage_t) or []
+                        if not isinstance(st_items, list) or not st_items:
+                            continue
+                        lab = _stage_label(st_items)
+                        lab = _normalize_label(lab)
+                        if not lab:
+                            continue
+                        total += 1
+                        acc += float(v_map.get(str(lab), 0.0))
+                    if total <= 0:
+                        return 0.0, 0
+                    z = acc / float(total)
+                    return float(max(-1.0, min(1.0, z))), int(total)
+
+                # secondary users = not in core_users
+                secondary_users = [u for u in macro.keys() if str(u) not in core_users]
+                for t in range(0, 13):
+                    z_t, labeled_t = _stage_scalar_over_users(secondary_users, t)
+                    z_tp1, labeled_tp1 = _stage_scalar_over_users(secondary_users, t + 1)
+
+                    # Build a compact "population observation" question. Use population_cache texts if enabled.
+                    pop = population_cache.get(t, {}) if use_population_observation else {}
+                    pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
+                    # render texts
+                    rendered_texts: List[str] = []
+                    for u_txt in (pop_texts or [])[: min(120, max(0, int(max_population_tweets_total)) if max_population_tweets_total > 0 else 120)]:
+                        try:
+                            u0, txt0 = u_txt
+                            if txt0:
+                                rendered_texts.append(f"- [{u0}] {txt0}")
+                        except Exception:
+                            continue
+
+                    q_lines: List[str] = []
+                    q_lines.append("You are predicting how the SECONDARY-user population stance evolves over stages.")
+                    q_lines.append(f"Topic: {topic}")
+                    q_lines.append(f"Event: {event}")
+                    q_lines.append(f"Stage t: {t}")
+                    q_lines.append("")
+                    q_lines.append("Population-level observed texts at stage t (secondary users):")
+                    if rendered_texts:
+                        q_lines.extend(rendered_texts[:200])
+                    else:
+                        q_lines.append("(no population texts available)")
+                    q_lines.append("")
+                    q_lines.append("Task: Predict the NEXT-stage population stance scalar z(t+1) in [-1, 1].")
+                    q_lines.append("Interpretation: Oppose=-1, Neutral=0, Support=+1; z is the mean over secondary users at that stage.")
+                    q = "\n".join(q_lines)
+
+                    ex = {
+                        "question": q,
+                        # dummy answer; reward can be disabled in training config (ts_weight=0)
+                        "answer": "\\boxed{0}",
+                        "topic": str(topic),
+                        "event": str(event),
+                        "t": int(t),
+                        "stage_t": int(t),
+                        # mark as non-core sample; this dataset is for secondary population dynamics
+                        "is_core_user": False,
+                        # transition supervision
+                        "z_t": float(z_t),
+                        "z_target": float(z_tp1),
+                        "z_mask": 1.0,
+                        "labeled_secondary_users_t": int(labeled_t),
+                        "labeled_secondary_users_tp1": int(labeled_tp1),
+                    }
+
+                    # Split by stage (stable) to avoid leakage across transition stages
+                    split = "train" if t <= 9 else ("validation" if t == 10 else "test")
+                    z_split_examples[split].append(ex)
+                    z_stats["num_examples"] += 1
+
             users = list(macro.keys())
             if max_users > 0:
                 users = users[: max_users]
@@ -830,9 +966,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     stats["num_candidates_core"] += 1
                 else:
                     stats["num_candidates_noncore"] += 1
-                # 关键策略：不为次要用户生成监督样本（只作为 population observation 注入）
-                if not is_core_user:
-                    continue
+                # 允许为次要用户也生成监督样本（用于训练“次要用户信念网络”）。
+                # 通过 `--user-scope core/noncore/all` 控制生成范围；样本内用 is_core_user 字段区分。
                 # stages expected 0..13
                 # iterate t in [0,12], require t+1 exists and non-empty
                 for t in range(0, 13):
@@ -1003,6 +1138,31 @@ def convert_hisim_macro_to_belief_hf_dataset(
     with open(os.path.join(output_dir, "stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
+    # === save z-transition dataset (optional) ===
+    if export_z_transition_dataset and z_stats.get("num_examples", 0) > 0:
+        z_out = str(z_transition_out_dir or "").strip()
+        if not z_out:
+            z_out = output_dir.rstrip("/") + "_z_transition"
+        _ensure_dir(z_out)
+        if _HAS_DATASETS:
+            z_ds = DatasetDict({k: Dataset.from_list(v) for k, v in z_split_examples.items() if v})  # type: ignore[misc]
+            print(f"保存 z_transition HuggingFace 数据集到: {z_out}")
+            z_ds.save_to_disk(z_out)  # type: ignore[union-attr]
+        else:
+            print("[WARN] 当前环境未安装 `datasets`，将改为输出 z_transition JSONL。")
+            for split, items in z_split_examples.items():
+                if not items:
+                    continue
+                jsonl_path = os.path.join(z_out, f"{split}.jsonl")
+                with open(jsonl_path, "w", encoding="utf-8") as f:
+                    for it in items:
+                        f.write(json.dumps(it, ensure_ascii=False) + "\n")
+            print(f"已输出 z_transition JSONL 到: {z_out}")
+        with open(os.path.join(z_out, "label2id.json"), "w", encoding="utf-8") as f:
+            json.dump(label2id, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(z_out, "stats.json"), "w", encoding="utf-8") as f:
+            json.dump(z_stats, f, ensure_ascii=False, indent=2)
+
     print("完成。")
 
 
@@ -1029,7 +1189,7 @@ def main():
     parser.add_argument(
         "--hisim-data-root",
         type=str,
-        default="/home/zhuyinzhou/MAS/HiSim/data",
+        default="/data/zhuyinzhou/HiSim/data",
         help="HiSim/data 根目录（包含 hisim_with_tweet/ 与 user_data/）",
     )
     parser.add_argument(
@@ -1160,6 +1320,23 @@ def main():
         action="store_true",
         help="当 population-text-source=micro 时，额外导出每个用户的 micro 序列（jsonl），便于后续训练 latent z/attention/RNN",
     )
+    parser.add_argument(
+        "--force-k",
+        type=int,
+        default=3,
+        help="强制标签空间大小 K。你的社交模拟训练链路目前固定 K=3（Neutral/Oppose/Support）。",
+    )
+    parser.add_argument(
+        "--export-z-transition-dataset",
+        action="store_true",
+        help="同时导出 z(t)->z(t+1) transition 数据集（用于训练 BeliefEncoder.population_update_head）。",
+    )
+    parser.add_argument(
+        "--z-transition-out-dir",
+        type=str,
+        default="",
+        help="z_transition 数据集输出目录（留空则不单独输出；你也可以直接用 --out-dir 的目录）。",
+    )
 
     args = parser.parse_args()
 
@@ -1189,6 +1366,9 @@ def main():
         max_population_tweets_total=args.max_population_tweets_total,
         export_micro_user_sequences=args.export_micro_user_sequences,
         split_by_user=(not args.no_split_by_user),
+        force_k=int(args.force_k),
+        export_z_transition_dataset=bool(args.export_z_transition_dataset),
+        z_transition_out_dir=str(args.z_transition_out_dir or ""),
     )
 
 

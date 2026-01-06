@@ -12,12 +12,16 @@ test_nepisode: 2
 
 n_agents: 3
 belief_dim: 128
+population_belief_dim: 1
 text_embed_dim: 1024
 batch_size_run: 1
 # 社交媒体任务：动作类型为 5 类（post/retweet/reply/like/do_nothing）
 # 注意：env.step 实际消费的是 LLM 输出 JSON；这里的 n_actions 主要用于 buffer/selector 的占位形状与兼容。
 n_actions: 5
 max_seq_length: 1024
+
+# hisim_social_env 需要 env.step 接收 JSON 动作；直接使用执行器 0 的输出（transformer_agent.py 内置 JSON 修复器）
+env_action_source: "llm_response_0"
 
 # 注意：llm_model_name 仅用于 HuggingFace tokenizer（不要填 OpenAI 模型名）。
 # 建议保持为本地可用的 tokenizer（如 gpt2），避免下载失败时退化成极简 tokenizer。
@@ -62,14 +66,27 @@ env_args:
   # 边缘用户 latent z / ABM baseline（后续可替换为可学习模块）
   z_alpha: 0.03
   z_decay: 0.995
+  # 连续态度标量 z ∈ [-1,1]
+  population_belief_mode: "scalar"
 
   # reward：先做一个可运行的 imitation-style reward
   reward_w_stance: 0.7
   reward_w_text: 0.3
+  # A: 缺失的 t+1 监督不计入 reward（避免把缺失当 do_nothing）
+  mask_missing_gt: true
+  # C: 次要用户 z_target 监督门控：若 (t+1) 可标注的 edge 用户数低于阈值，则该步 z_mask=0
+  min_edge_labels_for_z_target: 200
+
+# B: curriculum（可选）：先用更短的 stage 训练更稳定，然后逐步拉到 13
+curriculum:
+  enabled: true
+  # 在这些 t_env（环境步数）阈值处推进到下一个 n_stages
+  t_env_steps: [20000, 60000]
+  n_stages: [7, 10, 13]
 
 # Innovation: z(t)->z(t+1) 监督（BeliefEncoder.population_update_head）
 z_transition_loss_weight: 1.0
-z_transition_loss_type: "kl"
+z_transition_loss_type: "mse"
 
 # 可选：同时让 BeliefEncoder 预测次要用户 action_type 分布（无监督/弱监督时可先关掉）
 use_secondary_action_head: false

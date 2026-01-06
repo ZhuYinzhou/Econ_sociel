@@ -164,6 +164,41 @@ class EpisodeRunner:
             device=self.args.device
         )
 
+    # ===== B: curriculum support (update n_stages / episode_limit at runtime) =====
+    def set_env_n_stages(self, n_stages: int) -> None:
+        """
+        Update env.n_stages (if supported) and rebuild episode_limit + EpisodeBatch factory.
+        This enables curriculum training without restarting the whole process.
+        """
+        try:
+            ns = int(n_stages)
+        except Exception:
+            return
+        if ns <= 0:
+            return
+        if not hasattr(self.env, "n_stages"):
+            self.logger.warning("Runner curriculum requested but env has no attribute n_stages.")
+            return
+        # update env
+        try:
+            self.env.n_stages = int(ns)
+            # keep env episode_limit consistent
+            if hasattr(self.env, "core_users"):
+                self.env.episode_limit = int(ns) * len(getattr(self.env, "core_users"))
+        except Exception as e:
+            self.logger.warning(f"Failed to set env.n_stages={ns}: {e}")
+            return
+
+        # refresh env_info / episode_limit and rebuild batch factory
+        try:
+            self.env_info = self.env.get_env_info()
+            self.episode_limit = int(self.env_info.get("episode_limit", self.episode_limit))
+            self.new_batch = self._init_batch_handler()
+            self.reset_runner_state()
+            self.logger.info(f"[Curriculum] Updated env n_stages={ns}, episode_limit={self.episode_limit}")
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh runner after setting n_stages={ns}: {e}")
+
     def run(self, test_mode: bool = False) -> EpisodeBatch:
         """
         Run a complete episode (processing one data sample from the dataset).
@@ -203,10 +238,37 @@ class EpisodeRunner:
 
                 discrete_actions, mac_extra_info = self._get_actions(test_mode, raw_observation_text=_next_obs)
 
-                # Determine action for env.step(): 默认使用 coordinator commitment_text（字符串）
-                action_for_env_step = mac_extra_info.get("commitment_text", "")
-                if not action_for_env_step and mac_extra_info.get("llm_responses"):
-                    action_for_env_step = mac_extra_info["llm_responses"][0] if mac_extra_info["llm_responses"] else ""
+                # Determine action for env.step()
+                # Default: use coordinator commitment_text (string).
+                # For offline classification-style training (HF dataset with \\boxed{id}),
+                # you can set args.env_action_source="discrete_action_boxed" to use the chosen discrete action.
+                action_source = str(getattr(self.args, "env_action_source", "commitment")).strip().lower()
+                action_for_env_step = ""
+                if action_source in ("discrete_action_boxed", "boxed", "discrete"):
+                    try:
+                        # discrete_actions is typically shape (bs, n_agents) or (n_agents,)
+                        a = discrete_actions
+                        if isinstance(a, torch.Tensor):
+                            # take batch 0 if exists
+                            if a.ndim >= 2:
+                                a0 = a[0]
+                            else:
+                                a0 = a
+                            # take agent 0 as the env action (you can change to majority vote later)
+                            aid = int(a0[0].item()) if a0.numel() > 0 else 0
+                        else:
+                            aid = int(a)
+                    except Exception:
+                        aid = 0
+                    action_for_env_step = f"\\boxed{{{aid}}}"
+                elif action_source in ("llm_response_0", "executor0", "executor_0", "response0"):
+                    # Use the first executor response directly (useful for hisim_social_env where env expects JSON action).
+                    rs = mac_extra_info.get("llm_responses") or []
+                    action_for_env_step = rs[0] if isinstance(rs, list) and len(rs) > 0 else ""
+                else:
+                    action_for_env_step = mac_extra_info.get("commitment_text", "")
+                    if not action_for_env_step and mac_extra_info.get("llm_responses"):
+                        action_for_env_step = mac_extra_info["llm_responses"][0] if mac_extra_info["llm_responses"] else ""
 
                 step_extra_info = {
                     "agent_responses": mac_extra_info.get("llm_responses", []),
@@ -380,7 +442,7 @@ class EpisodeRunner:
                     if isinstance(bt_pre, dict):
                         # canonical tensors
                         if "population_z" in bt_pre:
-                            # vshape=(3,) -> tensor shape (3,), will broadcast to (bs,3)
+                            # vshape=(population_belief_dim,) -> tensor shape (K,), will broadcast to (bs,K)
                             post_data_dict["belief_pre_population_z"] = bt_pre["population_z"].to(self.args.device)
                             # for population_update_head training
                             post_data_dict["z_t"] = bt_pre["population_z"].to(self.args.device)
@@ -403,7 +465,7 @@ class EpisodeRunner:
             self.logger.warning(f"Failed to add belief tensor fields to batch: {e}")
 
         # === optional latent-z supervision fields (global, from env_info) ===
-        # env_info may contain: z_pred (len=3), z_target (len=3), z_mask (float)
+        # env_info may contain: z_pred/z_target (len=population_belief_dim), z_mask (float)
         try:
             if isinstance(env_info, dict) and ("z_pred" in env_info or "z_target" in env_info or "z_mask" in env_info):
                 z_pred = env_info.get("z_pred")
@@ -510,6 +572,8 @@ class EpisodeRunner:
         """
         commitment_dim = getattr(self.args, 'commitment_embedding_dim', 768)
         belief_dim = getattr(self.args, 'belief_dim')
+        pop_dim = int(getattr(self.args, "population_belief_dim", 3))
+        pop_dim = max(1, pop_dim)
         # Max question length here refers to max token length after tokenization
         # It should come from env_args, which HuggingFaceDatasetEnv also uses.
         max_token_len = getattr(self.args.env_args, "max_question_length", 512)
@@ -541,20 +605,20 @@ class EpisodeRunner:
             "group_representation": {"vshape": (belief_dim,), "dtype": torch.float32}
             ,
             # latent z supervision (global)
-            "z_pred": {"vshape": (3,), "dtype": torch.float32},
-            "z_target": {"vshape": (3,), "dtype": torch.float32},
+            "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
+            "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_mask": {"vshape": (1,), "dtype": torch.float32},
 
             # === belief inputs (explicit, tensorized; global) ===
             # stage index
             "stage_t": {"vshape": (1,), "dtype": torch.int64},
             # for population belief update head (z(t) -> z(t+1))
-            "z_t": {"vshape": (3,), "dtype": torch.float32},
+            "z_t": {"vshape": (pop_dim,), "dtype": torch.float32},
             # belief inputs (pre/post)
-            "belief_pre_population_z": {"vshape": (3,), "dtype": torch.float32},
+            "belief_pre_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
             "belief_pre_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
             "belief_pre_is_core_user": {"vshape": (1,), "dtype": torch.int64},
-            "belief_post_population_z": {"vshape": (3,), "dtype": torch.float32},
+            "belief_post_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
             "belief_post_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
             "belief_post_is_core_user": {"vshape": (1,), "dtype": torch.int64},
         }

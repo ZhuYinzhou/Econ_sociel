@@ -144,6 +144,79 @@ class ABMDecayUpdater(PopulationZUpdater):
         return [v / ssum for v in zz] if ssum > 0 else [1.0 / k for _ in range(k)]
 
 
+class ScalarABMDecayUpdater:
+    """
+    标量版 baseline updater：z ∈ [-1,1]
+    - 先从 stage 内聚合的 stance 计数推一个 z_hat（按 label 名映射到 -1/0/1 的加权平均）
+    - 再做平滑更新：z <- decay*z + alpha*z_hat
+    """
+
+    def __init__(self, alpha: float = 0.03, decay: float = 0.995):
+        self.alpha = float(alpha)
+        self.decay = float(decay)
+
+    def reset(self) -> float:
+        return 0.0
+
+    def init_aggregator(self) -> Dict[str, Any]:
+        # 仍用 K=3 的计数聚合（对齐核心 stance labels）
+        return {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+
+    def update(
+        self,
+        z: float,
+        agg: Dict[str, Any],
+        *,
+        id2label: Dict[int, str],
+        stage_end: bool,
+    ) -> float:
+        if not stage_end:
+            return float(z)
+        prev = float(z)
+        try:
+            counts = (agg or {}).get("counts") or [0, 0, 0]
+            counts = [int(x) for x in list(counts)[:3]]
+            total = sum(max(0, c) for c in counts)
+            if total <= 0:
+                z_hat = 0.0
+            else:
+                v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
+                z_hat = 0.0
+                for i in range(3):
+                    lab = str(id2label.get(i, ""))
+                    z_hat += float(max(0, counts[i])) * float(v_map.get(lab, 0.0))
+                z_hat = z_hat / float(total)
+            out = (self.decay * prev) + (self.alpha * float(z_hat))
+            return float(max(-1.0, min(1.0, out)))
+        except Exception:
+            return float(max(-1.0, min(1.0, prev)))
+
+
+class ScalarNoopUpdater:
+    """标量版 noop：stage end 时保持不变（并夹紧到[-1,1]）。"""
+
+    def reset(self) -> float:
+        return 0.0
+
+    def init_aggregator(self) -> Dict[str, Any]:
+        return {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+
+    def update(
+        self,
+        z: float,
+        agg: Dict[str, Any],
+        *,
+        id2label: Dict[int, str],
+        stage_end: bool,
+    ) -> float:
+        if not stage_end:
+            return float(z)
+        try:
+            return float(max(-1.0, min(1.0, float(z))))
+        except Exception:
+            return 0.0
+
+
 class NoopUpdater(PopulationZUpdater):
     """不更新 z（用于 ablation/debug）。"""
 
@@ -360,6 +433,10 @@ class HiSimSocialEnv(gym.Env):
         self.n_stages = int(kwargs.get("n_stages", 13))  # use 0..12 by default
         self.max_neighbor_posts = int(kwargs.get("max_neighbor_posts", 8))
         self.max_population_texts = int(kwargs.get("max_population_texts", 20))
+        # A: supervision masking for missing next-step labels/text
+        self.mask_missing_gt = bool(kwargs.get("mask_missing_gt", True))
+        # C: gate z supervision by minimum labeled edge users at target stage
+        self.min_edge_labels_for_z_target = int(kwargs.get("min_edge_labels_for_z_target", 0))
         # secondary users (edge) simulation via belief network (innovation hook)
         self.use_secondary_belief_sim = bool(kwargs.get("use_secondary_belief_sim", False))
         self.secondary_sim_max_users = int(kwargs.get("secondary_sim_max_users", 200))
@@ -369,9 +446,20 @@ class HiSimSocialEnv(gym.Env):
         self.max_recent_self_posts = int(kwargs.get("max_recent_self_posts", 6))
 
         # ABM/latent z update (baseline; can be swapped later)
+        # population_belief_mode (new preferred name; keep backward compatibility with population_z_mode):
+        # - "categorical3": legacy, z is a prob vector over K=3 labels
+        # - "scalar"/"continuous": z is a scalar in [-1,1] representing direction & intensity
+        _pbm = kwargs.get("population_belief_mode", None)
+        if _pbm is None:
+            _pbm = kwargs.get("population_z_mode", "categorical3")
+        _pbm = str(_pbm).strip().lower()
+        if _pbm in ("scalar", "continuous", "cont", "float", "regression"):
+            self.population_z_mode = "continuous"
+        else:
+            self.population_z_mode = "categorical3"
         self.z_alpha = float(kwargs.get("z_alpha", 0.03))  # update rate
         self.z_decay = float(kwargs.get("z_decay", 0.995))  # slow forgetting
-        self.stance_k = int(kwargs.get("stance_k", 3))  # 强制 K=3 对齐训练端 scheme
+        self.stance_k = int(kwargs.get("stance_k", 3))  # 核心用户 stance label 仍保持 K=3
         self.label2id_path = kwargs.get("label2id_path", "")
         self.population_z_updater_name = str(kwargs.get("population_z_updater", "abm_decay")).strip().lower()
         self.z_agg_max_texts = int(kwargs.get("z_agg_max_texts", 0))  # 0=不存 text；>0 存储部分 post 文本供 NN updater 用
@@ -516,17 +604,36 @@ class HiSimSocialEnv(gym.Env):
         logger.info(f"[HiSimSocialEnv] labels(K={self.num_labels})={self.label2id}")
 
         # population_z updater
-        if self.population_z_updater_name in ("abm_decay", "abm", "decay"):
-            self.z_updater: PopulationZUpdater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
-        elif self.population_z_updater_name in ("none", "noop", "no_op", "no-op"):
-            self.z_updater = NoopUpdater()
-        else:
-            logger.warning(f"[HiSimSocialEnv] 未知 population_z_updater={self.population_z_updater_name}，回退 abm_decay")
+        # NOTE:
+        # - categorical3: use list-prob updater (PopulationZUpdater)
+        # - continuous/scalar: use scalar updater (z in [-1,1]) but still aggregate counts over K=3 labels
+        self._z_accumulator = PopulationZUpdater()  # only used for stage-wise count aggregation
+        self.z_scalar_updater: Optional[Any] = None
+        if self.population_z_mode == "continuous":
+            if self.population_z_updater_name in ("abm_decay", "abm", "decay"):
+                self.z_scalar_updater = ScalarABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
+            elif self.population_z_updater_name in ("none", "noop", "no_op", "no-op"):
+                self.z_scalar_updater = ScalarNoopUpdater()
+            else:
+                logger.warning(f"[HiSimSocialEnv] 未知 population_z_updater={self.population_z_updater_name}（continuous 模式），回退 scalar abm_decay")
+                self.z_scalar_updater = ScalarABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
+            # keep a categorical updater instance for compatibility (should not be used in continuous mode)
             self.z_updater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
+        else:
+            if self.population_z_updater_name in ("abm_decay", "abm", "decay"):
+                self.z_updater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
+            elif self.population_z_updater_name in ("none", "noop", "no_op", "no-op"):
+                self.z_updater = NoopUpdater()
+            else:
+                logger.warning(f"[HiSimSocialEnv] 未知 population_z_updater={self.population_z_updater_name}，回退 abm_decay")
+                self.z_updater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
 
-        # === supervision target for latent z: edge users stance distribution from macro ===
-        # z ∈ Δ^K (K=num_labels), here expected K=3
+        # === supervision target for latent z (secondary users) ===
+        # - categorical3: z ∈ Δ^K (K=num_labels=3)
+        # - continuous: z ∈ [-1,1] scalar (mean stance value over secondary users)
         self.edge_dist_by_stage: Dict[int, List[float]] = {}
+        self.edge_z_scalar_by_stage: Dict[int, float] = {}
+        self.edge_label_count_by_stage: Dict[int, int] = {}
         for t in range(14):
             counts = [0 for _ in range(self.num_labels)]
             total = 0
@@ -542,10 +649,24 @@ class HiSimSocialEnv(gym.Env):
                     continue
                 counts[self.label2id[lab]] += 1
                 total += 1
+            self.edge_label_count_by_stage[t] = int(total)
             if total <= 0:
                 self.edge_dist_by_stage[t] = [1.0 / self.num_labels for _ in range(self.num_labels)]
             else:
                 self.edge_dist_by_stage[t] = [c / total for c in counts]
+            # continuous scalar: map (Oppose, Neutral, Support) -> (-1,0,+1) then take expectation
+            try:
+                p = self.edge_dist_by_stage[t]
+                # indices are aligned to label2id; in canonical mapping we expect Neutral=0, Oppose=1, Support=2
+                # but we keep it robust: compute by label name if possible
+                v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
+                z_val = 0.0
+                for i in range(self.num_labels):
+                    lab = self.id2label.get(i, "")
+                    z_val += float(p[i]) * float(v_map.get(str(lab), 0.0))
+                self.edge_z_scalar_by_stage[t] = float(max(-1.0, min(1.0, z_val)))
+            except Exception:
+                self.edge_z_scalar_by_stage[t] = 0.0
 
         # precompute micro texts bucketed by stage (for population observation)
         micro_path = os.path.join(self.hisim_data_root, "hisim_with_tweet", f"{self.topic}_micro.pkl")
@@ -572,10 +693,20 @@ class HiSimSocialEnv(gym.Env):
         # (edge_user, stage)-> {"action_type":str, "stance_id":Optional[int], "text":str}
         # simulated from belief network (optional)
         self.secondary_posts: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        # population latent z distribution (vector over labels)
-        self.population_z = self.z_updater.reset(self.num_labels)
+        # population latent z (either prob vec over labels or scalar)
+        if self.population_z_mode == "continuous":
+            # scalar z in [-1,1]
+            try:
+                self.population_z = float(self.z_scalar_updater.reset()) if self.z_scalar_updater is not None else 0.0
+            except Exception:
+                self.population_z = 0.0
+        else:
+            self.population_z = self.z_updater.reset(self.num_labels)
         # stage-level aggregation for delayed z update
-        self._z_agg: Dict[str, Any] = self.z_updater.init_aggregator(self.num_labels)
+        if self.population_z_mode == "continuous":
+            self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+        else:
+            self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
         self.current_obs: Optional[str] = None
         self.current_info: Dict[str, Any] = {}
@@ -590,6 +721,7 @@ class HiSimSocialEnv(gym.Env):
         if not isinstance(belief_inputs, dict):
             belief_inputs = {}
 
+        # K for core stance labels remains 3; population_z may be scalar when population_z_mode="continuous".
         k = int(belief_inputs.get("k") or self.num_labels or 3)
         k = max(1, k)
 
@@ -598,10 +730,20 @@ class HiSimSocialEnv(gym.Env):
             nb = (list(nb) if isinstance(nb, (tuple, list)) else [])[:k]
             nb = (nb + [0 for _ in range(k)])[:k]
 
-        pz = belief_inputs.get("population_z") or [1.0 / k for _ in range(k)]
-        if not isinstance(pz, list) or len(pz) != k:
-            pz = (list(pz) if isinstance(pz, (tuple, list)) else [])[:k]
-            pz = (pz + [1.0 / k for _ in range(k)])[:k]
+        pz_raw = belief_inputs.get("population_z")
+        if self.population_z_mode == "continuous":
+            # scalar z in [-1,1] -> tensor shape (1,)
+            try:
+                z = float(pz_raw) if pz_raw is not None else float(self.population_z)
+            except Exception:
+                z = 0.0
+            z = max(-1.0, min(1.0, z))
+            pz = [z]
+        else:
+            pz = pz_raw or [1.0 / k for _ in range(k)]
+            if not isinstance(pz, list) or len(pz) != k:
+                pz = (list(pz) if isinstance(pz, (tuple, list)) else [])[:k]
+                pz = (pz + [1.0 / k for _ in range(k)])[:k]
 
         t = int(belief_inputs.get("t", 0))
         is_core = bool(belief_inputs.get("is_core_user", True))
@@ -610,7 +752,7 @@ class HiSimSocialEnv(gym.Env):
             "t": torch.tensor([t], dtype=torch.int64, device=device),  # (1,)
             "is_core_user": torch.tensor([1 if is_core else 0], dtype=torch.int64, device=device),  # (1,)
             "neighbor_stance_counts": torch.tensor(nb, dtype=torch.float32, device=device),  # (K,)
-            "population_z": torch.tensor(pz, dtype=torch.float32, device=device),  # (K,)
+            "population_z": torch.tensor(pz, dtype=torch.float32, device=device),  # (K,) or (1,)
         }
 
     def _collect_belief_inputs(self, user: str, t: int) -> Dict[str, Any]:
@@ -632,7 +774,7 @@ class HiSimSocialEnv(gym.Env):
             if labn in self.label2id:
                 nb_counts[self.label2id[labn]] += int(c)
 
-        return {
+        out = {
             "user": str(user),
             "t": int(t),
             "k": int(self.num_labels),
@@ -641,10 +783,12 @@ class HiSimSocialEnv(gym.Env):
             "user_history": str(user_history) if user_history is not None else "",
             "neighbor_stance_counts": nb_counts,  # List[int], len=K
             "neighbor_texts": [str(x[1]) for x in (neighbor_texts or [])],
-            "population_z": [float(v) for v in (self.population_z or [])],  # List[float], len=K
+            # population_z: either List[float] (categorical3) or float scalar (continuous)
+            "population_z": self.population_z if self.population_z_mode == "continuous" else [float(v) for v in (self.population_z or [])],
             "population_dist": {str(k): float(v) for k, v in (pop_dist or {}).items()},
             "population_texts": [str(x) for x in (pop_texts or [])],
         }
+        return out
 
     def get_env_info(self) -> Dict[str, Any]:
         return {
@@ -716,7 +860,11 @@ class HiSimSocialEnv(gym.Env):
         return "post"
 
     def _population_obs(self, t: int) -> Tuple[Dict[str, float], List[str]]:
-        dist = {self.id2label[i]: float(self.population_z[i]) for i in range(self.num_labels) if i in self.id2label}
+        if self.population_z_mode == "continuous":
+            # represent as a single scalar summary
+            dist = {"z_scalar": float(self.population_z)}
+        else:
+            dist = {self.id2label[i]: float(self.population_z[i]) for i in range(self.num_labels) if i in self.id2label}
         # prefer simulated secondary posts (micro) when enabled; fallback to observed micro texts
         sample: List[str] = []
         if self.use_secondary_belief_sim and self.secondary_posts:
@@ -797,10 +945,16 @@ class HiSimSocialEnv(gym.Env):
             lines.append("")
 
         if pop_dist:
-            topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
-            lines.append("Population latent z distribution (edge users, simulated):")
-            lines.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
-            lines.append("")
+            if self.population_z_mode == "continuous":
+                zc = float(pop_dist.get("z_scalar", 0.0))
+                lines.append("Population latent z scalar (edge users, simulated):")
+                lines.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
+                lines.append("")
+            else:
+                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
+                lines.append("Population latent z distribution (edge users, simulated):")
+                lines.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
+                lines.append("")
         if pop_texts:
             lines.append("Population observed texts (from micro, aligned to stage t):")
             for txt in pop_texts:
@@ -828,8 +982,15 @@ class HiSimSocialEnv(gym.Env):
         self.episode_steps = 0
         self.core_posts = {}
         self.secondary_posts = {}
-        self.population_z = self.z_updater.reset(self.num_labels)
-        self._z_agg = self.z_updater.init_aggregator(self.num_labels)
+        if self.population_z_mode == "continuous":
+            try:
+                self.population_z = float(self.z_scalar_updater.reset()) if self.z_scalar_updater is not None else 0.0
+            except Exception:
+                self.population_z = 0.0
+            self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+        else:
+            self.population_z = self.z_updater.reset(self.num_labels)
+            self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
         user = self._current_user()
         self.current_obs = self._build_observation(user, self.stage_t)
@@ -874,7 +1035,25 @@ class HiSimSocialEnv(gym.Env):
         Stores results into self.secondary_posts.
         """
         k = int(self.num_labels)
-        z = self._normalize_prob_vec(z_probs if z_probs is not None else self.population_z, k)
+        # For continuous mode, convert scalar z into a categorical distribution for sampling (keeps existing secondary_posts format).
+        if self.population_z_mode == "continuous":
+            try:
+                if isinstance(z_probs, torch.Tensor):
+                    z_scalar = float(z_probs.detach().flatten()[0].item())
+                elif isinstance(z_probs, (list, tuple)) and len(z_probs) > 0:
+                    z_scalar = float(z_probs[0])
+                else:
+                    z_scalar = float(z_probs) if z_probs is not None else float(self.population_z)
+            except Exception:
+                z_scalar = float(self.population_z) if self.population_z is not None else 0.0
+            z_scalar = max(-1.0, min(1.0, z_scalar))
+            # simple triangular mapping: more mass to Support when z>0, to Oppose when z<0, Neutral peaks near 0
+            p_support = max(0.0, z_scalar)
+            p_oppose = max(0.0, -z_scalar)
+            p_neutral = max(0.0, 1.0 - abs(z_scalar))
+            z = self._normalize_prob_vec([p_neutral, p_oppose, p_support], k)
+        else:
+            z = self._normalize_prob_vec(z_probs if z_probs is not None else self.population_z, k)
 
         # action type distribution over 5 actions
         at_default = [1.0, 0.0, 0.0, 0.0, 0.0]  # default: post only
@@ -988,7 +1167,10 @@ class HiSimSocialEnv(gym.Env):
 
         # accumulate per-step signals for delayed z update (stage end)
         if self._z_agg is None or not isinstance(self._z_agg, dict):
-            self._z_agg = self.z_updater.init_aggregator(self.num_labels)
+            if self.population_z_mode == "continuous":
+                self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+            else:
+                self._z_agg = self.z_updater.init_aggregator(self.num_labels)
         # 控制聚合文本量，避免 info 太大（供未来 NN updater 可选使用）
         if self.z_agg_max_texts <= 0:
             post_for_agg = ""
@@ -999,7 +1181,7 @@ class HiSimSocialEnv(gym.Env):
             if isinstance(texts, list) and len(texts) >= self.z_agg_max_texts:
                 post_for_agg = ""
         if expresses_stance and pred_sid is not None:
-            self._z_agg = self.z_updater.accumulate(
+            self._z_agg = self._z_accumulator.accumulate(
                 self._z_agg,
                 int(pred_sid),
                 t=int(t),
@@ -1012,14 +1194,23 @@ class HiSimSocialEnv(gym.Env):
         gt_sid, gt_lab, gt_text = (None, None, None)
         if gt_t < self.n_stages:
             gt_sid, gt_lab, gt_text = self._gt_for(user, gt_t)
-            gt_action_type = self._infer_action_type_from_text(gt_text)
-            reward_action_type = 1.0 if str(action_type) == str(gt_action_type) else 0.0
-            reward_stance = 0.0
-            if expresses_stance and (gt_sid is not None) and (pred_sid is not None) and int(pred_sid) == int(gt_sid):
-                reward_stance = 1.0
-            reward_text = _jaccard_sim(str(post_text), str(gt_text)) if (expresses_stance and gt_text) else 0.0
+            # A: if t+1 supervision is missing, do NOT treat it as do_nothing; mask it out.
+            gt_available = bool((gt_sid is not None) or (gt_text is not None and str(gt_text).strip() != ""))
+            if (not gt_available) and self.mask_missing_gt:
+                gt_action_type = ""
+                reward_action_type = 0.0
+                reward_stance = 0.0
+                reward_text = 0.0
+            else:
+                gt_action_type = self._infer_action_type_from_text(gt_text)
+                reward_action_type = 1.0 if str(action_type) == str(gt_action_type) else 0.0
+                reward_stance = 0.0
+                if expresses_stance and (gt_sid is not None) and (pred_sid is not None) and int(pred_sid) == int(gt_sid):
+                    reward_stance = 1.0
+                reward_text = _jaccard_sim(str(post_text), str(gt_text)) if (expresses_stance and gt_text) else 0.0
         else:
             # last stage has no t+1 supervision; do not reward/penalize
+            gt_available = False
             gt_action_type = ""
             reward_action_type = 0.0
             reward_stance = 0.0
@@ -1046,17 +1237,49 @@ class HiSimSocialEnv(gym.Env):
         if is_end_of_stage:
             # innovation: allow MAC/BeliefEncoder to drive secondary-user simulation via predicted z(t+1)
             z_next_from_belief = extra_info.get("secondary_z_next") if isinstance(extra_info, dict) else None
-            if self.use_secondary_belief_sim and z_next_from_belief is not None:
-                self.population_z = self._normalize_prob_vec(z_next_from_belief, self.num_labels)
+            if self.population_z_mode == "continuous":
+                # prefer model-predicted z_next scalar if provided
+                if self.use_secondary_belief_sim and z_next_from_belief is not None:
+                    try:
+                        if isinstance(z_next_from_belief, torch.Tensor):
+                            z_next_val = float(z_next_from_belief.detach().flatten()[0].item())
+                        else:
+                            z_next_val = float(z_next_from_belief)
+                    except Exception:
+                        z_next_val = float(self.population_z) if self.population_z is not None else 0.0
+                    self.population_z = float(max(-1.0, min(1.0, z_next_val)))
+                else:
+                    # baseline update: scalar updater
+                    if self.z_scalar_updater is not None:
+                        self.population_z = float(
+                            self.z_scalar_updater.update(
+                                float(self.population_z) if self.population_z is not None else 0.0,
+                                self._z_agg,
+                                id2label=self.id2label,
+                                stage_end=True,
+                            )
+                        )
+                    else:
+                        # ultra-safe fallback
+                        try:
+                            self.population_z = float(max(-1.0, min(1.0, float(self.population_z))))
+                        except Exception:
+                            self.population_z = 0.0
             else:
-                self.population_z = self.z_updater.update(
-                    self.population_z,
-                    self._z_agg,
-                    t=int(t),
-                    stage_end=True,
-                )
+                if self.use_secondary_belief_sim and z_next_from_belief is not None:
+                    self.population_z = self._normalize_prob_vec(z_next_from_belief, self.num_labels)
+                else:
+                    self.population_z = self.z_updater.update(
+                        self.population_z,
+                        self._z_agg,
+                        t=int(t),
+                        stage_end=True,
+                    )
             # reset aggregator for next stage
-            self._z_agg = self.z_updater.init_aggregator(self.num_labels)
+            if self.population_z_mode == "continuous":
+                self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+            else:
+                self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
             # simulate secondary users for the NEXT stage (after population_z updated)
             if self.use_secondary_belief_sim and (not terminated):
@@ -1094,12 +1317,13 @@ class HiSimSocialEnv(gym.Env):
             "gt_stance_id": int(gt_sid) if gt_sid is not None else None,
             "gt_stance_label": gt_lab,
             "gt_action_type": str(gt_action_type),
+            "gt_available": 1 if bool(gt_available) else 0,
             "reward_action_type": reward_action_type,
             "reward_ts": reward_stance,  # treat stance match as task-specific reward
             "reward_al": 0.0,
             "reward_cc": 0.0,
             "reward_text": reward_text,
-            "population_z": list(self.population_z),
+            "population_z": float(self.population_z) if self.population_z_mode == "continuous" else list(self.population_z),
             # belief inputs（显式）
             "belief_inputs_pre": belief_inputs_pre,
             "belief_inputs_post": belief_inputs_post,
@@ -1109,12 +1333,24 @@ class HiSimSocialEnv(gym.Env):
         # Only provide target once per stage: at the step that ends stage t.
         # Target is edge distribution at stage (t+1) (transition supervision).
         z_mask = 1.0 if (is_end_of_stage and (t + 1) < self.n_stages) else 0.0
-        z_target = self.edge_dist_by_stage.get(t + 1, [1.0 / self.num_labels for _ in range(self.num_labels)]) if z_mask > 0 else [0.0 for _ in range(self.num_labels)]
+        # C: gate z supervision if labeled edge users at (t+1) are too few
+        z_target_stage = int(t) + 1
+        labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
+        if z_mask > 0 and self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
+            z_mask = 0.0
+        if self.population_z_mode == "continuous":
+            # represent as length-1 vector for training compatibility
+            z_target = [float(self.edge_z_scalar_by_stage.get(z_target_stage, 0.0))] if z_mask > 0 else [0.0]
+            z_pred = [float(self.population_z) if self.population_z is not None else 0.0]
+        else:
+            z_target = self.edge_dist_by_stage.get(z_target_stage, [1.0 / self.num_labels for _ in range(self.num_labels)]) if z_mask > 0 else [0.0 for _ in range(self.num_labels)]
+            z_pred = list(self.population_z)
         info.update(
             {
-                "z_pred": list(self.population_z),   # predicted/maintained latent z after update
-                "z_target": list(z_target),          # supervision target (edge users macro dist)
+                "z_pred": z_pred,                    # predicted/maintained latent z after update
+                "z_target": z_target,                # supervision target
                 "z_mask": float(z_mask),             # 1.0 on stage boundary, else 0.0
+                "z_target_labeled_edge_n": int(labeled_edge_n),
             }
         )
 

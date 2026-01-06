@@ -242,10 +242,23 @@ class LLMBasicMAC:
             agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode
         )
         
-        # Generate LLM responses if raw text is provided
-        if raw_observation_text is not None:
-            # Get strategy from coordinator
-            strategy = self._get_strategy(raw_observation_text)
+        # Generate LLM responses if raw text is provided AND enabled.
+        # For offline belief-network training on HF datasets, you typically want to disable
+        # expensive online LLM calls and use discrete actions instead.
+        enable_llm_rollout = bool(getattr(self.args, "enable_llm_rollout", True))
+        if raw_observation_text is not None and enable_llm_rollout:
+            # Social-mode detection:
+            # - hisim_social_env expects executor to output JSON actions.
+            # - coordinator math-style strategy/commitment prompts can hurt; default to NO coordinator in social mode.
+            env_name = str(getattr(self.args, "env", "") or "").strip().lower()
+            action_source = str(getattr(self.args, "env_action_source", "") or "").strip().lower()
+            is_social = (env_name == "hisim_social_env") or (action_source in ("llm_response_0", "executor0", "executor_0", "response0"))
+
+            # Coordinator hint (optional). For social tasks default to empty hint to avoid math prompt leakage.
+            if is_social:
+                strategy = ""
+            else:
+                strategy = self._get_strategy(raw_observation_text)
             
             # Get executor responses
             executor_responses = []
@@ -255,24 +268,34 @@ class LLMBasicMAC:
                     strategy=strategy
                 )
                 executor_responses.append(response)
-            
-            # Generate commitment
-            commitment_text = self._generate_commitment(
-                raw_observation_text, strategy, executor_responses,
-                agent_info.get("group_repr"), agent_info.get("prompt_embeddings")
-            )
-            
-            # Get commitment embedding
-            commitment_embedding = self.commitment_embedder.embed_commitments([commitment_text])
-            
-            agent_info.update({
-                "strategy": strategy,
-                "llm_responses": executor_responses,
-                "executor_responses": executor_responses,
-                "commitment": commitment_text,
-                "commitment_text": commitment_text,
-                "commitment_embedding": commitment_embedding
-            })
+
+            if is_social:
+                # For social simulation, we don't need a "final answer" commitment.
+                # Use executor outputs directly as env actions (EpisodeRunner env_action_source=llm_response_0).
+                agent_info.update({
+                    "strategy": strategy,
+                    "llm_responses": executor_responses,
+                    "executor_responses": executor_responses,
+                    "commitment": "",
+                    "commitment_text": "",
+                    "commitment_embedding": None
+                })
+            else:
+                # Generate commitment (math-style coordinator). Kept for backward compatibility with original ECON tasks.
+                commitment_text = self._generate_commitment(
+                    raw_observation_text, strategy, executor_responses,
+                    agent_info.get("group_repr"), agent_info.get("prompt_embeddings")
+                )
+                # Get commitment embedding
+                commitment_embedding = self.commitment_embedder.embed_commitments([commitment_text])
+                agent_info.update({
+                    "strategy": strategy,
+                    "llm_responses": executor_responses,
+                    "executor_responses": executor_responses,
+                    "commitment": commitment_text,
+                    "commitment_text": commitment_text,
+                    "commitment_embedding": commitment_embedding
+                })
         
         return chosen_actions, agent_info
 
@@ -631,19 +654,58 @@ Final Answer (max 50 tokens):"""
 
     def cuda(self):
         """Move all components to CUDA."""
-        self.agent.cuda()
-        self.coordinator.cuda()
-        self.belief_encoder.cuda()
-        self.commitment_embedder.cuda()
+        # Only torch modules should receive .cuda().
+        try:
+            if getattr(self, "agent", None) is not None and hasattr(self.agent, "cuda"):
+                self.agent.cuda()
+        except Exception as e:
+            logger.warning(f"Failed to cuda() agent: {e}")
+        try:
+            if getattr(self, "belief_encoder", None) is not None and hasattr(self.belief_encoder, "cuda"):
+                self.belief_encoder.cuda()
+        except Exception as e:
+            logger.warning(f"Failed to cuda() belief_encoder: {e}")
+        # coordinator / commitment_embedder are wrappers (not necessarily nn.Module); do not force cuda().
+        # If they implement cuda(), call it best-effort.
+        for name in ("coordinator", "commitment_embedder"):
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            fn = getattr(obj, "cuda", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as e:
+                    logger.debug(f"Skipping {name}.cuda() due to error: {e}")
 
     def save_models(self, path: str):
         """Save all model components."""
         self.agent.save_models(path)
-        # Additional saving logic for other components if needed
+        # Save BeliefEncoder (critical for HiSim: includes population_update_head for z_transition)
+        try:
+            if getattr(self, "belief_encoder", None) is not None:
+                torch.save(self.belief_encoder.state_dict(), f"{path}/belief_encoder.th")
+        except Exception as e:
+            logger.warning(f"Failed to save belief_encoder: {e}")
+        # Note: coordinator / commitment_embedder are stateless wrappers around external APIs.
 
     def load_models(self, path: str):
         """Load all model components."""
         self.agent.load_models(path)
+        # Load BeliefEncoder if present
+        try:
+            import os
+
+            p = f"{path}/belief_encoder.th"
+            if getattr(self, "belief_encoder", None) is not None and os.path.exists(p):
+                sd = torch.load(p, map_location=lambda storage, loc: storage)
+                try:
+                    self.belief_encoder.load_state_dict(sd, strict=True)
+                except Exception as e_strict:
+                    logger.warning(f"Strict load for belief_encoder failed ({e_strict}); retrying strict=False")
+                    self.belief_encoder.load_state_dict(sd, strict=False)
+        except Exception as e:
+            logger.warning(f"Failed to load belief_encoder: {e}")
         # Additional loading logic for other components if needed
 
     def _create_minimal_tokenizer(self):

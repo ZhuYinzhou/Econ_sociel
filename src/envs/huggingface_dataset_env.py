@@ -1,7 +1,12 @@
 import gym
 from gym import spaces
 import numpy as np
-from datasets import load_dataset, Dataset, IterableDataset
+import os
+from datasets import load_dataset, Dataset, IterableDataset, DatasetDict
+try:
+    from datasets import load_from_disk  # type: ignore
+except Exception:
+    load_from_disk = None  # type: ignore
 from typing import Dict, Any, Optional, Tuple, List
 from loguru import logger
 import re
@@ -23,20 +28,65 @@ class HuggingFaceDatasetEnv(gym.Env):
         self.is_streaming = kwargs.get("dataset_streaming", False)
         self.use_random_sampling = kwargs.get("use_random_sampling", True)  # 添加随机采样选项
         self.use_dataset_episode = kwargs.get("use_dataset_episode", False)  # 数据集级别episode选项
+        # Optional discrete-action size for training (e.g., stance classification K=3)
+        # Note: action_space remains Text; this n_actions is for runner/buffer/action_selector shapes.
+        self.n_actions = int(kwargs.get("n_actions", 1))
+
+        # Optional filter for datasets that contain both core/non-core samples
+        # - None: use all samples
+        # - True: only samples with sample["is_core_user"] == True
+        # - False: only samples with sample["is_core_user"] == False
+        self.filter_is_core_user = kwargs.get("filter_is_core_user", None)
+        if isinstance(self.filter_is_core_user, str):
+            s = self.filter_is_core_user.strip().lower()
+            if s in ("core", "true", "1", "yes"):
+                self.filter_is_core_user = True
+            elif s in ("noncore", "non-core", "false", "0", "no"):
+                self.filter_is_core_user = False
+            else:
+                self.filter_is_core_user = None
         
         self.question_field = kwargs.get("question_field_name", "question")
         self.answer_field = kwargs.get("answer_field_name", "answer")
         
         # For reward calculation, if needed directly in env
         self.reward_args = kwargs.get("reward_config", {})
+        # Whether to emit belief/z supervision fields from samples (for z_transition training)
+        self.emit_belief_fields = bool(kwargs.get("emit_belief_fields", True))
+        # Optional: population belief dim for offline transition supervision.
+        # - K=3: categorical distribution over stances
+        # - K=1: scalar z in [-1,1]
+        self.population_belief_dim = int(kwargs.get("population_belief_dim", 3))
+        self.population_belief_dim = max(1, self.population_belief_dim)
 
         try:
-            self.dataset = load_dataset(
-                self.dataset_path, 
-                name=self.dataset_config_name, 
-                split=self.dataset_split,
-                streaming=self.is_streaming
-            )
+            # Support both:
+            # - HuggingFace hub datasets via load_dataset(...)
+            # - local datasets saved by DatasetDict.save_to_disk(...) via load_from_disk(...)
+            use_local_disk = bool(isinstance(self.dataset_path, str) and os.path.isdir(self.dataset_path))
+            if use_local_disk:
+                if self.is_streaming:
+                    logger.warning("dataset_streaming=True is not supported for load_from_disk datasets. Forcing streaming=False.")
+                    self.is_streaming = False
+                if load_from_disk is None:
+                    raise RuntimeError("datasets.load_from_disk is unavailable. Please ensure `datasets` is installed correctly.")
+                loaded = load_from_disk(self.dataset_path)
+                # loaded can be Dataset or DatasetDict
+                if isinstance(loaded, DatasetDict):
+                    if self.dataset_split not in loaded:
+                        raise KeyError(f"Split '{self.dataset_split}' not found in dataset at {self.dataset_path}. Available: {list(loaded.keys())}")
+                    self.dataset = loaded[self.dataset_split]
+                else:
+                    # If it's a single Dataset, treat it as the requested split
+                    self.dataset = loaded
+                logger.info(f"Loaded dataset from disk: {self.dataset_path}, split: {self.dataset_split}, streaming={self.is_streaming}")
+            else:
+                self.dataset = load_dataset(
+                    self.dataset_path,
+                    name=self.dataset_config_name,
+                    split=self.dataset_split,
+                    streaming=self.is_streaming
+                )
             if self.is_streaming:
                 self.dataset_iterator = iter(self.dataset)
                 # For IterableDataset, we can't easily get the length.
@@ -44,6 +94,13 @@ class HuggingFaceDatasetEnv(gym.Env):
                 logger.info(f"Loaded IterableDataset: {self.dataset_path}, split: {self.dataset_split}")
             else:
                 self.dataset_list = list(self.dataset) # Convert to list for easier iteration and shuffling if needed
+                # Apply optional filter on samples
+                if self.filter_is_core_user is not None:
+                    want = bool(self.filter_is_core_user)
+                    before = len(self.dataset_list)
+                    self.dataset_list = [s for s in self.dataset_list if bool(s.get("is_core_user", False)) == want]
+                    after = len(self.dataset_list)
+                    logger.info(f"Filtered dataset by is_core_user={want}: {before} -> {after}")
                 self.dataset_iterator = None # Will be created in reset
                 self.current_data_idx = -1
                 self.num_samples = len(self.dataset_list)
@@ -91,7 +148,14 @@ class HuggingFaceDatasetEnv(gym.Env):
     def _get_next_sample(self) -> Optional[Dict]:
         if self.is_streaming:
             try:
-                return next(self.dataset_iterator)
+                # In streaming mode, loop until we find a matching sample if filtering is enabled
+                while True:
+                    sample = next(self.dataset_iterator)
+                    if self.filter_is_core_user is None:
+                        return sample
+                    want = bool(self.filter_is_core_user)
+                    if bool(sample.get("is_core_user", False)) == want:
+                        return sample
             except StopIteration:
                 logger.info("Streaming dataset iterator exhausted.")
                 return None
@@ -178,6 +242,66 @@ class HuggingFaceDatasetEnv(gym.Env):
         info = {"sample": self.current_sample} # Pass the whole sample for potential use in reward or logging
         return observation, info
 
+    def get_belief_tensor(self, belief_inputs: Optional[Dict[str, Any]], device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
+        """
+        A minimal tensorizer to match EpisodeRunner._get_post_transition_data() expectations.
+        This enables offline z_transition supervision by providing population_z (K=3 categorical or K=1 scalar).
+        """
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bi = belief_inputs if isinstance(belief_inputs, dict) else {}
+        pop_dim = int(getattr(self, "population_belief_dim", 3))
+        pop_dim = max(1, pop_dim)
+        pz_raw = bi.get("population_z")
+        if pz_raw is None:
+            pz_raw = bi.get("z_t")
+
+        # population_z
+        if pop_dim == 1:
+            # scalar in [-1,1]
+            try:
+                if isinstance(pz_raw, torch.Tensor):
+                    z = float(pz_raw.detach().flatten()[0].item())
+                elif isinstance(pz_raw, (list, tuple)) and len(pz_raw) > 0:
+                    z = float(pz_raw[0])
+                else:
+                    z = float(pz_raw) if pz_raw is not None else 0.0
+            except Exception:
+                z = 0.0
+            z = float(max(-1.0, min(1.0, z)))
+            pz = [z]
+        else:
+            # categorical simplex (default K=3)
+            pz = pz_raw if pz_raw is not None else [1.0 / float(pop_dim) for _ in range(pop_dim)]
+            try:
+                pz = [float(x) for x in list(pz)[:pop_dim]]
+            except Exception:
+                pz = [1.0 / float(pop_dim) for _ in range(pop_dim)]
+            s = float(sum(max(0.0, x) for x in pz))
+            if s <= 0:
+                pz = [1.0 / float(pop_dim) for _ in range(pop_dim)]
+            else:
+                pz = [max(0.0, x) / s for x in pz]
+
+        # neighbor stance counts (optional; keep zeros)
+        nb = bi.get("neighbor_stance_counts") or [0, 0, 0]
+        try:
+            nb = [int(x) for x in list(nb)[:3]]
+        except Exception:
+            nb = [0, 0, 0]
+
+        is_core = bi.get("is_core_user", False)
+        try:
+            is_core = bool(is_core)
+        except Exception:
+            is_core = False
+
+        return {
+            "population_z": torch.tensor(pz, dtype=torch.float32, device=device),
+            "neighbor_stance_counts": torch.tensor(nb, dtype=torch.float32, device=device),
+            "is_core_user": torch.tensor([1 if is_core else 0], dtype=torch.int64, device=device),
+        }
+
     def step(self, action: Any, extra_info: Optional[Dict[str, Any]] = None) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
         """
         Execute one step in the environment.
@@ -225,24 +349,28 @@ class HuggingFaceDatasetEnv(gym.Env):
         logger.info("=" * 80)
 
         # --- Reward Calculation ---
-        # Task-Specific (TS) reward: 基于正确性
+        # 权重（如果某项权重为 0，则跳过该项的昂贵计算，尤其是 TF-IDF 相似度）
+        al_weight = float(getattr(self.reward_args, "al_weight", 0.3))
+        ts_weight = float(getattr(self.reward_args, "ts_weight", 0.5))
+        cc_weight = float(getattr(self.reward_args, "cc_weight", 0.2))
+
+        # Task-Specific (TS) reward: 基于正确性（对 stance_id/boxed-id 监督最常用）
         is_correct = self._evaluate_answer(llm_answer_str, self.current_ground_truth_answer)
         reward_ts = 1.0 if is_correct else 0.0
-        
-        # Action Likelihood (AL) reward: 基于动作似然性
-        reward_al = self._calculate_action_likelihood_reward(extra_info)
-        
-        # Collaborative Contribution (CC) reward: 基于协作贡献
-        reward_cc = self._calculate_collaborative_contribution_reward(
-            llm_answer_str, extra_info, is_correct
-        )
-        
-        # 根据配置权重计算总奖励
-        al_weight = getattr(self.reward_args, 'al_weight', 0.3)
-        ts_weight = getattr(self.reward_args, 'ts_weight', 0.5)
-        cc_weight = getattr(self.reward_args, 'cc_weight', 0.2)
-        
-        total_reward = al_weight * reward_al + ts_weight * reward_ts + cc_weight * reward_cc
+
+        # Action Likelihood (AL) reward: 仅当权重>0 时计算
+        reward_al = 0.0
+        if al_weight > 0:
+            reward_al = self._calculate_action_likelihood_reward(extra_info)
+
+        # Collaborative Contribution (CC) reward: 仅当权重>0 时计算
+        reward_cc = 0.0
+        if cc_weight > 0:
+            reward_cc = self._calculate_collaborative_contribution_reward(
+                llm_answer_str, extra_info, is_correct
+            )
+
+        total_reward = al_weight * float(reward_al) + ts_weight * float(reward_ts) + cc_weight * float(reward_cc)
         
         # 显示奖励信息
         logger.info(f"🎯 REWARD BREAKDOWN:")
@@ -311,6 +439,71 @@ class HuggingFaceDatasetEnv(gym.Env):
             "llm_answer": llm_answer_str,
             "ground_truth_answer": self.current_ground_truth_answer
         }
+
+        # Optional: emit belief/z supervision fields for offline transition training
+        if self.emit_belief_fields and isinstance(self.current_sample, dict):
+            # stage index
+            st = self.current_sample.get("stage_t", self.current_sample.get("t", 0))
+            try:
+                st = int(st)
+            except Exception:
+                st = 0
+            info["t"] = int(st)
+
+            pop_dim = int(getattr(self, "population_belief_dim", 3))
+            pop_dim = max(1, pop_dim)
+
+            # z supervision fields
+            z_t = self.current_sample.get("z_t")
+            z_target = self.current_sample.get("z_target")
+            z_mask = self.current_sample.get("z_mask", 0.0)
+            if pop_dim == 1:
+                # scalar regression target
+                try:
+                    if isinstance(z_target, torch.Tensor):
+                        zt = float(z_target.detach().flatten()[0].item())
+                    elif isinstance(z_target, (list, tuple)) and len(z_target) > 0:
+                        zt = float(z_target[0])
+                    else:
+                        zt = float(z_target) if z_target is not None else 0.0
+                except Exception:
+                    zt = 0.0
+                info["z_target"] = [float(max(-1.0, min(1.0, zt)))]
+            else:
+                if isinstance(z_target, (list, tuple)) and len(z_target) >= pop_dim:
+                    info["z_target"] = [float(x) for x in list(z_target)[:pop_dim]]
+            if z_mask is not None:
+                try:
+                    info["z_mask"] = float(z_mask)
+                except Exception:
+                    info["z_mask"] = 0.0
+
+            # Provide belief_inputs_{pre,post} so EpisodeRunner can call get_belief_tensor() and fill batch z_t / belief_pre_population_z
+            if pop_dim == 1:
+                # z_t / z_target can be scalar in dataset; keep as scalar and let get_belief_tensor() handle it.
+                info["belief_inputs_pre"] = {
+                    "population_z": z_t,
+                    "is_core_user": bool(self.current_sample.get("is_core_user", False)),
+                    "neighbor_stance_counts": [0, 0, 0],
+                }
+                info["belief_inputs_post"] = {
+                    "population_z": z_target,
+                    "is_core_user": bool(self.current_sample.get("is_core_user", False)),
+                    "neighbor_stance_counts": [0, 0, 0],
+                }
+            else:
+                if isinstance(z_t, (list, tuple)) and len(z_t) >= pop_dim:
+                    info["belief_inputs_pre"] = {
+                        "population_z": [float(x) for x in list(z_t)[:pop_dim]],
+                        "is_core_user": bool(self.current_sample.get("is_core_user", False)),
+                        "neighbor_stance_counts": [0, 0, 0],
+                    }
+                if isinstance(z_target, (list, tuple)) and len(z_target) >= pop_dim:
+                    info["belief_inputs_post"] = {
+                        "population_z": [float(x) for x in list(z_target)[:pop_dim]],
+                        "is_core_user": bool(self.current_sample.get("is_core_user", False)),
+                        "neighbor_stance_counts": [0, 0, 0],
+                    }
         
         # 为数据集级别episode添加额外信息
         if self.use_dataset_episode:
@@ -692,7 +885,7 @@ class HuggingFaceDatasetEnv(gym.Env):
         # This info is used by the runner to setup the batch scheme.
         return {
             "episode_limit": self.episode_limit,
-            "n_actions": 1,  # Placeholder - action space is text
+            "n_actions": int(self.n_actions),  # For discrete-action training (shapes only)
             "obs_shape": (self.max_question_length,), # For scheme vshape
             "state_shape": (1,), # Placeholder for scheme vshape
             # Any other info needed by the runner or learner
