@@ -93,6 +93,8 @@ class EpisodeRunner:
         # Statistics tracking
         self.train_stats = {}
         self.test_stats = {}
+        # store raw env step infos for the most recent episode (useful for task-specific evaluation)
+        self.last_env_infos: List[Dict[str, Any]] = []
         
         # Episode management
         self.episode_limit = 1  # Single step per episode for LLM environments
@@ -192,6 +194,7 @@ class EpisodeRunner:
             
             terminated = False
             _next_obs = current_obs
+            self.last_env_infos = []
 
             # 多步 episode：循环直到 env 返回 terminated 或达到 episode_limit
             while (not terminated) and (self.t < self.episode_limit):
@@ -219,6 +222,9 @@ class EpisodeRunner:
                 _next_obs, reward_total_float, terminated, _truncated, env_step_info = self.env.step(
                     action_for_env_step, extra_info=step_extra_info
                 )
+                # cache for evaluation
+                if isinstance(env_step_info, dict):
+                    self.last_env_infos.append(env_step_info)
 
                 reward_ts = env_step_info.get("reward_ts", 0.0)
                 reward_al = env_step_info.get("reward_al", 0.0)

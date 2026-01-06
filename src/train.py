@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Any
+from typing import Dict, Any, List
 import wandb
 
 # Import necessary components
@@ -165,6 +165,7 @@ def setup_experiment(config: SimpleNamespace):
                 "group": "agents",
                 "dtype": torch.int,
             },
+            
             "reward": {"vshape": (1,)},
             "terminated": {"vshape": (1,), "dtype": torch.uint8},
             "belief_states": {"vshape": (config.belief_dim,), "group": "agents"},
@@ -219,6 +220,18 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         # Train learner
         if episode_batch is not None:
             train_stats = learner.train(episode_batch, t_env, episode)
+
+            # === High-signal fixed metrics (core reward + secondary belief loss) ===
+            # These are written to metrics.jsonl and TensorBoard regardless of console verbosity.
+            try:
+                if isinstance(train_stats, dict):
+                    if "reward_mean" in train_stats:
+                        logger.log_stat("train/reward_mean", float(train_stats["reward_mean"]), t_env)
+                    # z(t)->z(t+1) transition supervision (secondary users belief)
+                    if "loss_z_transition" in train_stats:
+                        logger.log_stat("train/loss_z_transition", float(train_stats["loss_z_transition"]), t_env)
+            except Exception as e:
+                logger.warning(f"Failed to log fixed train metrics: {e}")
             
             # Log training statistics
             if episode % log_interval == 0:
@@ -239,7 +252,7 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             
             # Test periodically
             if episode % test_interval == 0 and episode > 0:
-                test_stats = run_test(runner, logger)
+                test_stats = run_test(runner, logger, config)
                 logger.info(f"Test results at episode {episode}:")
                 for key, value in test_stats.items():
                     logger.info(f"  {key}: {value}")
@@ -247,6 +260,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 # Log to wandb if enabled
                 if hasattr(config, 'wandb') and config.wandb.use_wandb:
                     log_to_wandb(test_stats, episode, 'test/')
+
+                # Also write the key test metrics to TensorBoard/metrics.jsonl
+                try:
+                    for k in ("test_return_mean", "core_action_type_acc", "core_stance_acc", "core_text_sim", "secondary_z_kl"):
+                        if k in test_stats:
+                            logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
+                except Exception as e:
+                    logger.warning(f"Failed to log test metrics: {e}")
         
         episode += 1
         # For multi-step environments, count the actual number of env steps executed
@@ -267,31 +288,123 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     total_time = time.time() - begin_time
     logger.info(f"Total training time: {total_time:.2f} seconds")
 
-def run_test(runner, logger):
-    """Run test episodes"""
+def _safe_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> float:
+    """
+    KL(p || q) with safety normalization and epsilon.
+    p, q: 1D arrays
+    """
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = np.clip(p, 0.0, None)
+    q = np.clip(q, 0.0, None)
+    sp = float(p.sum())
+    sq = float(q.sum())
+    if sp <= 0:
+        p = np.full_like(p, 1.0 / max(1, p.size))
+    else:
+        p = p / sp
+    if sq <= 0:
+        q = np.full_like(q, 1.0 / max(1, q.size))
+    else:
+        q = q / sq
+    return float(np.sum(p * (np.log(p + eps) - np.log(q + eps))))
+
+
+def run_test(runner, logger, config: SimpleNamespace):
+    """Run test episodes (task-specific evaluation for social-media simulation)."""
     logger.info("Running test episodes...")
     
-    test_episodes = 10
-    test_stats = {"test_return": [], "test_success": []}
+    test_episodes = int(getattr(config, "test_nepisode", 10))
+    test_episodes = max(1, test_episodes)
+
+    returns: List[float] = []
+    # core-user metrics
+    core_action_type_acc: List[float] = []
+    core_stance_acc: List[float] = []
+    core_text_sim: List[float] = []
+    core_valid_steps: List[int] = []
+    # secondary-user belief metrics
+    z_kl_list: List[float] = []
+    z_eval_steps: int = 0
     
     for _ in range(test_episodes):
         episode_batch = runner.run(test_mode=True)
         if episode_batch is not None:
-            # Calculate episode statistics
-            episode_return = episode_batch["reward"].sum().item()
-            episode_success = 1 if episode_return > 0 else 0
-            
-            test_stats["test_return"].append(episode_return)
-            test_stats["test_success"].append(episode_success)
+            # === return ===
+            episode_return = float(episode_batch["reward"].sum().item())
+            returns.append(episode_return)
+
+            # === task-specific evaluation from env infos ===
+            env_infos = getattr(runner, "last_env_infos", None)
+            if not isinstance(env_infos, list) or not env_infos:
+                continue
+
+            # core: use per-step signals that env already provides
+            # - reward_action_type: 1/0
+            # - reward_ts: stance match 1/0
+            # - reward_text: similarity 0..1
+            # Only count steps that have next-step supervision (gt_t < n_stages).
+            valid = 0
+            sum_at = 0.0
+            sum_st = 0.0
+            sum_txt = 0.0
+
+            for info in env_infos:
+                try:
+                    gt_t = int(info.get("gt_t", -1))
+                except Exception:
+                    gt_t = -1
+                try:
+                    n_stages = int(getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13))
+                except Exception:
+                    n_stages = 13
+                if gt_t < 0 or gt_t >= n_stages:
+                    continue
+
+                valid += 1
+                sum_at += float(info.get("reward_action_type", 0.0))
+                sum_st += float(info.get("reward_ts", 0.0))
+                sum_txt += float(info.get("reward_text", 0.0))
+
+                # secondary: stage boundary evaluation (z_mask == 1)
+                try:
+                    z_mask = float(info.get("z_mask", 0.0))
+                except Exception:
+                    z_mask = 0.0
+                if z_mask > 0.5 and ("z_pred" in info) and ("z_target" in info):
+                    z_eval_steps += 1
+                    z_kl_list.append(_safe_kl(np.array(info["z_target"]), np.array(info["z_pred"])))
+
+            if valid > 0:
+                core_valid_steps.append(valid)
+                core_action_type_acc.append(sum_at / valid)
+                core_stance_acc.append(sum_st / valid)
+                core_text_sim.append(sum_txt / valid)
     
     # Calculate averages
-    avg_return = np.mean(test_stats["test_return"]) if test_stats["test_return"] else 0
-    success_rate = np.mean(test_stats["test_success"]) if test_stats["test_success"] else 0
+    avg_return = float(np.mean(returns)) if returns else 0.0
+    # Keep legacy "success" definition, but based on return.
+    success_rate = float(np.mean([1.0 if r > 0 else 0.0 for r in returns])) if returns else 0.0
+
+    core_at = float(np.mean(core_action_type_acc)) if core_action_type_acc else 0.0
+    core_st = float(np.mean(core_stance_acc)) if core_stance_acc else 0.0
+    core_txt = float(np.mean(core_text_sim)) if core_text_sim else 0.0
+    avg_core_steps = float(np.mean(core_valid_steps)) if core_valid_steps else 0.0
+
+    z_kl = float(np.mean(z_kl_list)) if z_kl_list else 0.0
     
     return {
         "test_return_mean": avg_return,
         "test_success_rate": success_rate,
-        "test_episodes": len(test_stats["test_return"])
+        "test_episodes": len(returns),
+        # core user evaluation (next-step prediction)
+        "core_action_type_acc": core_at,
+        "core_stance_acc": core_st,
+        "core_text_sim": core_txt,
+        "core_eval_steps_mean": avg_core_steps,
+        # secondary belief evaluation
+        "secondary_z_kl": z_kl,
+        "secondary_z_eval_steps": int(z_eval_steps),
     }
 
 def setup_wandb(config: SimpleNamespace, logger):
