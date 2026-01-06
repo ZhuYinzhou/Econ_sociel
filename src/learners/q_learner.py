@@ -67,6 +67,11 @@ class ECONLearner:
         self.lambda_sd = getattr(args, "lambda_sd", 0.1)
         self.lambda_m = getattr(args, "lambda_m", 0.1)
         self.lambda_belief = getattr(args.loss, "belief_weight", 0.1) if hasattr(args, 'loss') else 0.1
+        # latent z supervision
+        self.z_loss_weight = getattr(args, "z_loss_weight", 0.0)
+        # innovation: z(t)->z(t+1) transition loss via BeliefEncoder.population_update_head
+        self.z_transition_loss_weight = getattr(args, "z_transition_loss_weight", 0.0)
+        self.z_head: Optional[nn.Module] = None
         
         # BNE协调参数
         self.bne_max_iterations = getattr(args, "bne_max_iterations", 5)
@@ -107,6 +112,13 @@ class ECONLearner:
         else:
             self.encoder_params = []
             self.target_belief_encoder = None
+
+        # Initialize latent z head: map group representation -> z ∈ Δ^3
+        if self.z_loss_weight and self.z_loss_weight > 0 and self.belief_encoder is not None:
+            belief_dim = getattr(args, "belief_dim", 128)
+            self.z_head = nn.Linear(belief_dim, 3).to(self.device)
+            self.encoder_params.extend(list(self.z_head.parameters()))
+            self.logger.info("Initialized z_head for edge-population latent z supervision.")
             
         # Initialize Target MAC
         self.target_mac = copy.deepcopy(self.mac)
@@ -369,6 +381,71 @@ class ECONLearner:
         )
 
         # ===========================================
+        # Latent z Supervision (edge users macro dist)
+        # ===========================================
+        z_loss = torch.tensor(0.0, device=self.device)
+        if self.z_head is not None and "z_target" in batch.scheme and "z_mask" in batch.scheme:
+            # group_representation_stage2: (bs, seq, belief_dim)
+            z_logits = self.z_head(group_representation_stage2)  # (bs, seq, 3)
+            z_logp = F.log_softmax(z_logits, dim=-1)
+            z_target = batch["z_target"][:, :-1].to(self.device)  # (bs, seq, 3)
+            z_mask = batch["z_mask"][:, :-1].to(self.device)      # (bs, seq, 1)
+            # also respect filled mask
+            z_mask = z_mask * mask.unsqueeze(-1)
+            # normalize target for numerical stability
+            z_target = torch.clamp(z_target, min=0.0)
+            z_sum = z_target.sum(dim=-1, keepdim=True)
+            z_target = torch.where(z_sum > 0, z_target / z_sum, torch.full_like(z_target, 1.0 / 3.0))
+
+            # KL(target || pred) = sum target * (log target - log pred)
+            # Use torch.kl_div with log-prob input
+            kl = F.kl_div(z_logp, z_target, reduction="none").sum(dim=-1, keepdim=True)  # (bs, seq, 1)
+            denom = torch.clamp(z_mask.sum(), min=1.0)
+            z_loss = (kl * z_mask).sum() / denom
+            encoder_loss = encoder_loss + self.z_loss_weight * z_loss
+
+        # ===========================================
+        # Innovation: z(t)->z(t+1) transition supervision via BeliefEncoder head
+        # ===========================================
+        z_tr_loss = torch.tensor(0.0, device=self.device)
+        try:
+            if (
+                self.z_transition_loss_weight
+                and self.z_transition_loss_weight > 0
+                and self.belief_encoder is not None
+                and hasattr(self.belief_encoder, "compute_loss")
+                and "z_target" in batch.scheme
+                and "z_mask" in batch.scheme
+                and ("z_t" in batch.scheme or "belief_pre_population_z" in batch.scheme)
+            ):
+                z_t_seq = batch["z_t"][:, :-1].to(self.device) if "z_t" in batch.scheme else batch["belief_pre_population_z"][:, :-1].to(self.device)
+                z_target_seq = batch["z_target"][:, :-1].to(self.device)
+                z_mask_seq = batch["z_mask"][:, :-1].to(self.device) * mask.unsqueeze(-1)
+                stage_t_seq = batch["stage_t"][:, :-1].to(self.device) if "stage_t" in batch.scheme else None
+
+                # group_representation_stage2: (bs, seq, belief_dim)
+                gr_seq = group_representation_stage2
+
+                bs, seq_len, k = z_t_seq.shape
+                z_t_flat = z_t_seq.reshape(bs * seq_len, k)
+                z_target_flat = z_target_seq.reshape(bs * seq_len, k)
+                z_mask_flat = z_mask_seq.reshape(bs * seq_len)
+                gr_flat = gr_seq.reshape(bs * seq_len, -1)
+                st_flat = stage_t_seq.reshape(bs * seq_len, -1) if stage_t_seq is not None else None
+
+                z_tr_loss = self.belief_encoder.compute_loss(
+                    z_t_flat,
+                    z_target_flat,
+                    z_mask_flat,
+                    group_repr=gr_flat,
+                    stage_t=st_flat,
+                    loss_type=getattr(self.args, "z_transition_loss_type", "kl"),
+                )
+                encoder_loss = encoder_loss + self.z_transition_loss_weight * z_tr_loss
+        except Exception as e:
+            self.logger.warning(f"z_transition_loss skipped due to error: {e}")
+
+        # ===========================================
         # Network Optimization
         # ===========================================
 
@@ -408,6 +485,10 @@ class ECONLearner:
             "q_total_stage2_mean": local_q_values_stage2.mean().item(),
             "reward_mean": rewards_flat.mean().item(),
         }
+        if self.z_head is not None:
+            train_stats["loss_z"] = z_loss.item()
+        if self.z_transition_loss_weight and self.z_transition_loss_weight > 0:
+            train_stats["loss_z_transition"] = z_tr_loss.item()
         
         # Add individual loss components
         for key, value in loss_components.items():

@@ -18,13 +18,21 @@ import json
 class LLMConfig:
     """Configuration for LLM parameters."""
     api_key: str
-    model_name: str = "meta-llama/Llama-3.1-70b-chat-hf"
+    # Default to an OpenAI-style model name; can be overridden by config/args
+    model_name: str = "gpt-4.1"
     belief_dim: int = 64
     debug: bool = False
     max_retries: int = 6
     max_workers: int = 5
-    base_url: str = "https://api.together.xyz/v1/chat/completions"
-    embeddings_base_url: str = "https://api.together.xyz/v1/embeddings"
+    # OpenAI-compatible base URL root (NOT the full endpoint).
+    # Endpoints are derived as:
+    # - {base_url}/chat/completions
+    # - {base_url}/embeddings
+    base_url: str = "https://pro.xiaoai.plus/v1"
+    embeddings_base_url: Optional[str] = None
+    # If your provider supports extra non-standard fields (e.g. repetition_penalty),
+    # keep this enabled. If it errors, set False to send only OpenAI-standard params.
+    allow_nonstandard_params: bool = True
     timeout: float = 60.0  # 增加默认超时时间
     retry_delay: float = 2.0  # 重试延迟
     request_delay: float = 0.1  # 请求间延迟
@@ -101,18 +109,47 @@ class APIHandler:
             config: LLM configuration
         """
         self.config = config
-        if not hasattr(self.config, 'embeddings_base_url') or self.config.embeddings_base_url is None:
-            self.config.embeddings_base_url = "https://api.together.xyz/v1/embeddings"
+        # Default embeddings endpoint to the same provider unless overridden.
+        if (not hasattr(self.config, "embeddings_base_url")) or (self.config.embeddings_base_url is None):
+            self.config.embeddings_base_url = self.config.base_url
         self.sleep_times = [2 ** i for i in range(config.max_retries)]  # Exponential backoff
+
+    def _chat_completions_url(self) -> str:
+        return str(self.config.base_url).rstrip("/") + "/chat/completions"
+
+    def _embeddings_url(self) -> str:
+        return str(self.config.embeddings_base_url).rstrip("/") + "/embeddings"
+
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
+        # Keep raw text for debugging
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"_raw_text": resp.text, "_status_code": resp.status_code}
+        # Raise for explicit HTTP errors (but still return parsed body for logging)
+        if resp.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}", response=resp)
+        return data
     
-    def generate_with_references(self,
-                               model: str,
-                               messages: List[Dict],
-                               references: List[str] = [],
-                               max_tokens: int = 2048,
-                               temperature: float = 0.7,
-                               top_p: Optional[float] = None,
-                               repetition_penalty: Optional[float] = None) -> Optional[str]:
+    def generate_with_references(
+        self,
+        model: str,
+        messages: List[Dict],
+        references: List[str] = [],
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        # OpenAI-compatible optional params
+        response_format: Optional[Dict[str, Any]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+    ) -> Optional[str]:
         """
         Generate response with reference integration.
         
@@ -137,17 +174,27 @@ class APIHandler:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            repetition_penalty=repetition_penalty
+            repetition_penalty=repetition_penalty,
+            response_format=response_format,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
         )
     
-    def generate_together(self,
-                         model: str,
-                         messages: List[Dict],
-                         max_tokens: int = 2048,
-                         temperature: float = 0.7,
-                         top_p: Optional[float] = None,
-                         repetition_penalty: Optional[float] = None,
-                         streaming: bool = False) -> Optional[str]:
+    # Backward-compatible name. This now sends an OpenAI-compatible Chat Completions request.
+    def generate_together(
+        self,
+        model: str,
+        messages: List[Dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        streaming: bool = False,
+        # OpenAI-compatible optional params
+        response_format: Optional[Dict[str, Any]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+    ) -> Optional[str]:
         """
         Generate response using Together API.
         
@@ -170,36 +217,55 @@ class APIHandler:
                 if self.config.debug:
                     logger.debug(f"Sending messages ({len(messages)}) to {model}")
                 
-                payload = {
+                payload: Dict[str, Any] = {
                     "model": model,
                     "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature if temperature > 1e-4 else 0,
+                    "max_tokens": int(max_tokens),
+                    "temperature": float(temperature) if float(temperature) > 1e-4 else 0.0,
                 }
                 
                 if top_p is not None:
-                    payload["top_p"] = top_p
-                if repetition_penalty is not None:
-                    payload["repetition_penalty"] = repetition_penalty
+                    payload["top_p"] = float(top_p)
+                if response_format is not None:
+                    # OpenAI: {"type":"json_object"} etc.
+                    payload["response_format"] = response_format
+                if presence_penalty is not None:
+                    payload["presence_penalty"] = float(presence_penalty)
+                if frequency_penalty is not None:
+                    payload["frequency_penalty"] = float(frequency_penalty)
+                # Non-standard: keep for providers that accept it (Together-like)
+                if repetition_penalty is not None and bool(getattr(self.config, "allow_nonstandard_params", True)):
+                    payload["repetition_penalty"] = float(repetition_penalty)
                 
                 if streaming:
+                    # Keep legacy streaming helper (may not work for all providers).
                     return self._stream_response(payload)
-                
-                response = requests.post(
-                    self.config.base_url,
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.config.api_key}"},
-                    timeout=self.config.timeout
-                )
-                
-                if "error" in response.json():
-                    error_data = response.json()["error"]
-                    logger.error(f"API Error: {error_data}")
-                    if error_data.get("type") == "invalid_request_error":
-                        logger.info("Input + output exceeds max_position_id.")
-                        return None
-                
-                output = response.json()["choices"][0]["message"]["content"].strip()
+
+                url = self._chat_completions_url()
+                # Some providers may not support OpenAI "response_format".
+                # If it fails with a client error, retry once without response_format.
+                try:
+                    data = self._post_json(url, payload)
+                except requests.exceptions.HTTPError as he:
+                    status = None
+                    body = ""
+                    try:
+                        if he.response is not None:
+                            status = he.response.status_code
+                            body = he.response.text
+                    except Exception:
+                        pass
+                    if payload.get("response_format") is not None and status in (400, 422):
+                        logger.warning(f"Provider rejected response_format, retrying without it. status={status} body={body[:200]}")
+                        payload.pop("response_format", None)
+                        data = self._post_json(url, payload)
+                    else:
+                        raise
+                if isinstance(data, dict) and "error" in data:
+                    logger.error(f"API Error: {data.get('error')}")
+                    return None
+                # OpenAI response: choices[0].message.content
+                output = str(data["choices"][0]["message"]["content"]).strip()
                 break
                 
             except Exception as e:
@@ -225,25 +291,15 @@ class APIHandler:
             A list of embeddings (each embedding is a list of floats), or None if failed.
         """
         embeddings_list = None
-        payload = {
-            "input": input_texts,
-            "model": model
-        }
+        payload = {"input": input_texts, "model": model}
 
         for sleep_time in self.sleep_times:
             try:
                 if self.config.debug:
                     logger.debug(f"Requesting embeddings for {len(input_texts) if isinstance(input_texts, list) else 1} text(s) from {model}")
-                
-                response = requests.post(
-                    self.config.embeddings_base_url, # Use the new embeddings URL
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.config.api_key}"},
-                    timeout=self.config.timeout
-                )
-                response.raise_for_status() # Raise HTTPError for bad responses (4XX or 5XX)
-                
-                response_data = response.json()
+
+                url = self._embeddings_url()
+                response_data = self._post_json(url, payload)
                 
                 if "data" not in response_data or not isinstance(response_data["data"], list):
                     logger.error(f"API Error: 'data' field is missing or not a list in embeddings response: {response_data}")
@@ -264,11 +320,20 @@ class APIHandler:
                 break # Successful API call
                 
             except requests.exceptions.HTTPError as http_err:
-                logger.error(f"HTTP error occurred during embedding generation: {http_err} - {response.text}")
-                if response.status_code == 429: # Rate limit
+                # best-effort extract response body
+                body = ""
+                status = None
+                try:
+                    if http_err.response is not None:
+                        status = http_err.response.status_code
+                        body = http_err.response.text
+                except Exception:
+                    pass
+                logger.error(f"HTTP error occurred during embedding generation: {http_err} - {body}")
+                if status == 429: # Rate limit
                      logger.info(f"Rate limit hit. Retrying in {sleep_time}s...")
                      time.sleep(sleep_time)
-                elif response.status_code >= 500: # Server-side error
+                elif status is not None and status >= 500: # Server-side error
                     logger.info(f"Server error. Retrying in {sleep_time}s...")
                     time.sleep(sleep_time)
                 else: # Other client-side errors (4xx)
@@ -329,7 +394,7 @@ Responses from models:"""
 class ImprovedLLMWrapper:
     def __init__(self,
                  api_key: str,
-                 model_name: str = "meta-llama/Llama-3.1-70b-chat-hf",
+                 model_name: str = "gpt-4.1",
                  belief_dim: int = 64,
                  encoding_dim: int = 384,
                  debug: bool = False,
@@ -337,7 +402,10 @@ class ImprovedLLMWrapper:
                  t_max: float = 2.0,
                  rp_min: float = 1.0,
                  rp_max: float = 1.5,
-                 timeout: float = 60.0):
+                 timeout: float = 60.0,
+                 base_url: Optional[str] = None,
+                 embeddings_base_url: Optional[str] = None,
+                 allow_nonstandard_params: bool = True):
         """
       
         """
@@ -347,7 +415,10 @@ class ImprovedLLMWrapper:
             belief_dim=belief_dim,
             debug=debug,
             timeout=timeout,
-            retry_delay=2.0
+            retry_delay=2.0,
+            base_url=(base_url or LLMConfig.base_url),
+            embeddings_base_url=embeddings_base_url,
+            allow_nonstandard_params=bool(allow_nonstandard_params),
         )
         
         self.model_name = model_name
@@ -522,7 +593,9 @@ class ImprovedLLMWrapper:
                          temperature: Optional[float] = None,
                          repetition_penalty: Optional[float] = None,
                          top_p: Optional[float] = None,
-                         llm_model_name: Optional[str] = None) -> str:
+                         llm_model_name: Optional[str] = None,
+                         # OpenAI-compatible: request strict JSON output when supported by provider
+                         response_format: Optional[Dict[str, Any]] = None) -> str:
        
         final_temp = temperature
         final_rp = repetition_penalty
@@ -558,7 +631,8 @@ class ImprovedLLMWrapper:
             max_tokens=max_tokens,
             temperature=final_temp,
             top_p=final_top_p,
-            repetition_penalty=final_rp
+            repetition_penalty=final_rp,
+            response_format=response_format,
         )
         
         return response_content if response_content is not None else "Error: Could not generate response."

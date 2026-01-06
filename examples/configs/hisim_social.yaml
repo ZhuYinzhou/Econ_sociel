@@ -1,0 +1,102 @@
+# HiSim social-media simulation config (core+edge users)
+# 用于“13 个 stage × 300 核心用户逐个发帖”的多步 episode 社交仿真
+
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# 你可以先用很小的 t_max 做 smoke run
+t_max: 5000
+test_interval: 2000
+test_nepisode: 2
+
+n_agents: 3
+belief_dim: 128
+text_embed_dim: 1024
+batch_size_run: 1
+# 社交媒体任务：动作类型为 5 类（post/retweet/reply/like/do_nothing）
+# 注意：env.step 实际消费的是 LLM 输出 JSON；这里的 n_actions 主要用于 buffer/selector 的占位形状与兼容。
+n_actions: 5
+max_seq_length: 1024
+
+# 注意：llm_model_name 仅用于 HuggingFace tokenizer（不要填 OpenAI 模型名）。
+# 建议保持为本地可用的 tokenizer（如 gpt2），避免下载失败时退化成极简 tokenizer。
+llm_model_name: "gpt2"
+# 不要把 key 写进仓库：用环境变量或命令行 --api-key 覆盖
+together_api_key: "${TOGETHER_API_KEY}"
+coordinator_model: "gpt-4.1"
+executor_model: "gpt-4.1"
+commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
+
+# OpenAI-compatible JSON mode (if provider supports response_format); env 侧也有 JSON 修复，因此此项可选
+llm_response_format_json: true
+
+env: "hisim_social_env"
+env_args:
+  hisim_data_root: "/home/zhuyinzhou/MAS/HiSim/data"
+  topic: "metoo"
+  event: "e1"
+  max_question_length: 1024
+  max_answer_length: 512
+
+  # 仿真设置
+  n_stages: 13
+  max_neighbor_posts: 8
+  max_population_texts: 20
+
+  # Profile/Memory 模块（prompt 控制）
+  max_user_history_lines: 40
+  max_recent_self_posts: 6
+
+  # Innovation: 用信念网络模拟次要用户（edge users）
+  use_secondary_belief_sim: true
+  # 需求：700 次要用户（可先调小做 smoke run）
+  secondary_sim_max_users: 700
+  secondary_sim_use_micro_texts: true
+
+  # 可选：启动时校验用户规模（不符合则报错/告警）
+  expected_core_users: 300
+  expected_edge_users: 700
+  strict_user_counts: false
+
+  # 边缘用户 latent z / ABM baseline（后续可替换为可学习模块）
+  z_alpha: 0.03
+  z_decay: 0.995
+
+  # reward：先做一个可运行的 imitation-style reward
+  reward_w_stance: 0.7
+  reward_w_text: 0.3
+
+# Innovation: z(t)->z(t+1) 监督（BeliefEncoder.population_update_head）
+z_transition_loss_weight: 1.0
+z_transition_loss_type: "kl"
+
+# 可选：同时让 BeliefEncoder 预测次要用户 action_type 分布（无监督/弱监督时可先关掉）
+use_secondary_action_head: false
+
+train:
+  episodes_per_task: 1
+  buffer_size: 32
+  batch_size: 8
+  update_interval: 10
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: true
+
+logging:
+  use_tensorboard: true
+  log_interval: 1
+  save_model: true
+  save_model_interval: 2000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-social-sim"
+
+

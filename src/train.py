@@ -134,37 +134,44 @@ def setup_experiment(config: SimpleNamespace):
     runner = r_REGISTRY[config.runner](args=config, logger=logger)
     
     # Setup schemes and groups
-    scheme = {
-        "state": {"vshape": runner.env_info["state_shape"]},
-        "obs": {
-            "vshape": runner.env_info["obs_shape"],
-            "group": "agents"
-        },
-        "actions": {
-            "vshape": (1,),
-            "group": "agents",
-            "dtype": torch.long
-        },
-        "avail_actions": {
-            "vshape": (runner.env_info["n_actions"],),
-            "group": "agents",
-            "dtype": torch.int
-        },
-        "reward": {"vshape": (1,)},
-        "terminated": {"vshape": (1,), "dtype": torch.uint8},
-        "llm_responses": {
-            "vshape": (config.text_embed_dim,),
-            "group": "agents"
-        },
-        "strategy": {"vshape": (config.text_embed_dim,)},
-        "commitment": {"vshape": (config.text_embed_dim,)},
-        "belief_states": {
-            "vshape": (config.belief_dim,),
-            "group": "agents"
+    # Prefer runner-provided scheme/groups (supports tokenized obs, extra fields, etc.)
+    try:
+        if hasattr(runner, "_build_scheme") and callable(getattr(runner, "_build_scheme")):
+            scheme = runner._build_scheme()
+        else:
+            scheme = None
+        if hasattr(runner, "_build_groups") and callable(getattr(runner, "_build_groups")):
+            groups = runner._build_groups()
+        else:
+            groups = None
+    except Exception as e:
+        logger.warning(f"Failed to build scheme/groups from runner, fallback to default: {e}")
+        scheme, groups = None, None
+
+    if scheme is None:
+        scheme = {
+            "state": {"vshape": runner.env_info["state_shape"]},
+            "obs": {
+                "vshape": runner.env_info["obs_shape"],
+                "group": "agents",
+            },
+            "actions": {
+                "vshape": (1,),
+                "group": "agents",
+                "dtype": torch.long,
+            },
+            "avail_actions": {
+                "vshape": (runner.env_info["n_actions"],),
+                "group": "agents",
+                "dtype": torch.int,
+            },
+            "reward": {"vshape": (1,)},
+            "terminated": {"vshape": (1,), "dtype": torch.uint8},
+            "belief_states": {"vshape": (config.belief_dim,), "group": "agents"},
         }
-    }
-    
-    groups = {"agents": config.n_agents}
+
+    if groups is None:
+        groups = {"agents": config.n_agents}
     
     # Initialize MAC
     mac = mac_REGISTRY[config.mac](scheme, groups, config)
@@ -242,7 +249,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     log_to_wandb(test_stats, episode, 'test/')
         
         episode += 1
-        t_env += getattr(config, 'episode_length', 1)
+        # For multi-step environments, count the actual number of env steps executed
+        try:
+            steps = int(getattr(runner, "t", 1))
+            if steps <= 0:
+                steps = int(getattr(config, "episode_length", 1))
+        except Exception:
+            steps = int(getattr(config, "episode_length", 1))
+        t_env += steps
     
     # Final save
     save_path = Path(config.logging.checkpoint_path) / "final"

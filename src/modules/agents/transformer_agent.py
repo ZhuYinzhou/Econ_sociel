@@ -5,6 +5,9 @@ from typing import Dict, List, Tuple, Optional, Any
 import math
 from modules.llm.llm_wrapper import ImprovedLLMWrapper
 import logging
+import json
+import re
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -265,19 +268,30 @@ class LLMTransformerAgent(nn.Module):
             'repetition_penalty': (self.p_min + self.p_max) / 2
         }
         
-    def forward(self, inputs: torch.Tensor, hidden_state: Optional[torch.Tensor] = None,
-               mask: Optional[torch.Tensor] = None, test_mode: bool = False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        test_mode: bool = False,
+        # 兼容旧签名：hidden_state 不再使用，统一返回 None
+        hidden_state: Optional[torch.Tensor] = None,
+        # 社交媒体任务：允许外部覆盖采样参数（温度/重复惩罚）
+        temperature: Optional[Any] = None,
+        repetition_penalty: Optional[Any] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
         """
         前向传播，生成动作概率、置信状态和提示嵌入。
         
         Args:
             inputs: 代表 τ_i^t 和 o_i^t 的输入张量
-            hidden_state: 可选的隐藏状态（在 Transformer 中不使用）
             mask: 可选的注意力掩码
             test_mode: 是否处于测试模式
+            hidden_state: (兼容参数) 不再使用
+            temperature: 可选覆盖温度（float / tensor），形状支持 (bs,) / (bs,1) / 标量
+            repetition_penalty: 可选覆盖重复惩罚（float / tensor），形状支持 (bs,) / (bs,1) / 标量
             
         Returns:
-            包含各种输出的字典和新的隐藏状态（实际不使用）
+            (outputs_dict, hidden_state=None)
         """
         # 通过置信网络获取置信状态, prompt embedding e_i, 和局部 Q值 Q_i^t
         # 'inputs' 参数现在被理解为 local_history_obs
@@ -289,11 +303,54 @@ class LLMTransformerAgent(nn.Module):
         temp_logit = belief_outputs['temp_logit'] # 原始温度 logit
         penalty_logit = belief_outputs['penalty_logit'] # 原始惩罚 logit
         
-        # 更新缓存的提示嵌入 (张量形式)
-        if not test_mode:
-             # 在训练模式下，使用网络生成的prompt_embedding的第一个样本（如果batch_size > 1）
-             # 或者如果总是batch_size=1，直接使用它
-            self.current_prompt_embedding_tensor = prompt_embedding[0].detach().clone() if prompt_embedding.shape[0] > 0 else self.current_prompt_embedding_tensor
+        # 覆盖采样参数：temperature / repetition_penalty
+        # 优先级：显式 override > test_mode 固定值 > 网络输出
+        bs = int(belief_state.shape[0]) if isinstance(belief_state, torch.Tensor) else 1
+
+        def _coerce_param(v: Any, *, default_val: float, lo: float, hi: float) -> torch.Tensor:
+            if v is None:
+                t = torch.full((bs, 1), float(default_val), device=self.device, dtype=belief_state.dtype)
+            elif isinstance(v, torch.Tensor):
+                t = v.to(self.device, dtype=belief_state.dtype)
+                if t.ndim == 0:
+                    t = t.view(1, 1).expand(bs, 1)
+                elif t.ndim == 1:
+                    t = t.view(-1, 1)
+                elif t.ndim == 2 and t.shape[1] == 1:
+                    pass
+                else:
+                    # 尝试 squeeze 到 (bs,1)
+                    t = t.reshape(bs, 1)
+            else:
+                t = torch.full((bs, 1), float(v), device=self.device, dtype=belief_state.dtype)
+            return torch.clamp(t, min=float(lo), max=float(hi))
+
+        if temperature is not None or repetition_penalty is not None:
+            temp_t = _coerce_param(
+                temperature,
+                default_val=float(prompt_embedding[:, 0].mean().item()) if bs > 0 else float((self.T_min + self.T_max) / 2),
+                lo=float(self.T_min),
+                hi=float(self.T_max),
+            )
+            pen_t = _coerce_param(
+                repetition_penalty,
+                default_val=float(prompt_embedding[:, 1].mean().item()) if bs > 0 else float((self.p_min + self.p_max) / 2),
+                lo=float(self.p_min),
+                hi=float(self.p_max),
+            )
+            prompt_embedding = torch.cat([temp_t, pen_t], dim=1)  # (bs,2)
+        elif test_mode:
+            # 测试模式默认用中值（与先前行为一致）
+            temp_t = torch.full((bs, 1), float((self.T_min + self.T_max) / 2), device=self.device, dtype=belief_state.dtype)
+            pen_t = torch.full((bs, 1), float((self.p_min + self.p_max) / 2), device=self.device, dtype=belief_state.dtype)
+            prompt_embedding = torch.cat([temp_t, pen_t], dim=1)
+
+        # 更新缓存的提示嵌入 (张量形式)：使用当前 forward 实际采用的 prompt_embedding
+        if prompt_embedding is not None and isinstance(prompt_embedding, torch.Tensor) and prompt_embedding.numel() >= 2:
+            try:
+                self.current_prompt_embedding_tensor = prompt_embedding[0].detach().clone()
+            except Exception:
+                pass
 
 
         # ECON 中的动作是 prompt_embedding e_i
@@ -303,20 +360,6 @@ class LLMTransformerAgent(nn.Module):
         # 或者 Q_i^t 本身就是针对 e_i 的价值评估。
         action_q_values = self.output_network(belief_state) # 这可能是用于辅助任务或不同的动作空间
         
-        # 在测试模式下，可以覆盖生成的 prompt_embedding
-        if test_mode:
-            # 使用默认的或预设的测试参数
-            # 注意：这里我们之前用了固定的0.7, 0.9。如果BeliefNetwork在测试时也应该运行，
-            # 那么是否覆盖取决于测试策略。
-            # 为保持与先前行为一致，此处可以设置固定的测试值。
-            # 但理想情况下，test_mode应允许网络生成其值，除非明确要覆盖。
-            test_temp = torch.tensor([(self.T_min + self.T_max) / 2], device=self.device)
-            test_penalty = torch.tensor([(self.p_min + self.p_max) / 2], device=self.device)
-            prompt_embedding = torch.cat([test_temp, test_penalty], dim=0).unsqueeze(0) # (1, 2)
-            if belief_state.shape[0] > 1: # 如果是batch输入
-                prompt_embedding = prompt_embedding.repeat(belief_state.shape[0], 1)
-
-
         outputs = {
             "action_q_values": action_q_values, # 可能是辅助输出
             "belief_state": belief_state,       # b_i
@@ -325,9 +368,8 @@ class LLMTransformerAgent(nn.Module):
             "raw_prompt_embed_params": torch.cat([temp_logit, penalty_logit], dim=1) # 保存原始 logits, 用于可能的后续分析或损失计算
         }
         
-        # TransformerAgent 通常返回 (outputs_dict, hidden_state)
-        # 此处 hidden_state 对于基于 Transformer 的 BeliefNetwork 不是必需的，返回 None 或 belief_state
-        return outputs, belief_state # 或者 (outputs, None)
+        # 统一 hidden_state 返回为 None（Transformer 不需要 recurrent hidden）
+        return outputs, None
     
     def generate_answer(self, question: str, strategy: str, 
                        belief_state: Optional[torch.Tensor] = None, # 可选，因为agent内部会生成
@@ -361,50 +403,134 @@ class LLMTransformerAgent(nn.Module):
         # 假设 ImprovedLLMWrapper 有一个 repetition_penalty 参数。
         self.current_prompt_embedding['repetition_penalty'] = final_penalty
 
-        # 创建优化的executor prompt，强调箱式答案格式
-        executor_prompt = f"""You are a mathematical problem-solving expert. Your task is to solve the given problem step by step and provide your final answer in the exact format specified.
+        # 社交媒体仿真：executor prompt 要求输出严格 JSON（action_type + stance_id + post_text）
+        # 注意：环境 observation 本身已包含 persona/neighbor/population 信息与 stance_id 映射。
+        # 这里做“最后一道闸门”，确保输出格式可被 env 解析。
+        executor_prompt = f"""You are simulating a Twitter-like social media user in a multi-agent system.
 
-Problem: {question}
+Context (observation):
+{question}
 
-Strategy to follow: {strategy}
+Coordinator hint (optional):
+{strategy}
 
-Instructions:
-1. Read and understand the problem carefully
-2. Follow the provided strategy step by step
-3. Show your work and reasoning clearly
-4. Perform all calculations accurately
-5. Double-check your final answer
-6. Present your final answer in this EXACT format: \\boxed{{your_numerical_answer}}
+TASK:
+- Choose EXACTLY ONE action for the current user at the current stage.
 
-Important: Your response MUST end with \\boxed{{answer}} where 'answer' is only the final numerical result (no units, no extra text inside the box).
+OUTPUT FORMAT (STRICT):
+- Output JSON ONLY (no markdown, no extra text).
+- Keys must be exactly:
+  - "action_type": one of ["post","retweet","reply","like","do_nothing"]
+  - "stance_id": integer stance class id
+  - "post_text": string tweet content
 
-Example format: "First I calculate... Then I find... Therefore, the answer is \\boxed{{42}}"
+RULES:
+- If action_type in ["post","retweet","reply"]:
+  - "stance_id" is REQUIRED and must be a valid integer id as specified in the context.
+  - "post_text" is REQUIRED and should be a single tweet (concise, realistic).
+- If action_type in ["like","do_nothing"]:
+  - "stance_id" MUST be null (or 0 if you cannot output null).
+  - "post_text" MUST be an empty string.
+- Do NOT include any other keys.
 
-Your solution:"""
+Return JSON only:"""
 
         answer = self.llm_wrapper.generate_response(
             prompt=executor_prompt,
             strategy=None,  # Strategy is already included in the prompt
             temperature=final_temp,
             repetition_penalty=final_penalty,
-            max_tokens=400  # Reasonable length for mathematical solutions
+            max_tokens=int(getattr(self.args, "max_answer_tokens", 256)),
+            # For social-media simulation, optionally request strict JSON from OpenAI-compatible providers.
+            response_format={"type": "json_object"} if bool(getattr(self.args, "llm_response_format_json", False)) else None,
         )
         
-        # 验证答案格式并在必要时修复
-        if answer and "\\boxed{" not in answer:
-            logger.warning(f"Executor answer lacks \\boxed{{}} format: {answer[:100]}...")
-            # 尝试提取数字并添加boxed格式
-            import re
-            numbers = re.findall(r'\b\d+(?:\.\d+)?\b', answer)
-            if numbers:
-                last_number = numbers[-1]
-                answer += f" \\boxed{{{last_number}}}"
-                logger.info(f"Added \\boxed{{{last_number}}} to executor answer")
-            else:
-                answer += " \\boxed{0}"  # 最后的fallback
-                logger.warning("No numbers found in executor answer, using \\boxed{0}")
-        
-        return answer
+        # 轻量校验/修复：确保返回可解析 JSON（env 侧也有解析，但这里尽量提高成功率）
+        fixed = self._ensure_social_json(answer)
+        return fixed
+
+    def _ensure_social_json(self, s: Any) -> str:
+        """尽量把模型输出修复为 {"action_type": str, "stance_id": int|None, "post_text": str} 的 JSON 字符串。"""
+        allowed_actions = {"post", "retweet", "reply", "like", "do_nothing"}
+        stance_actions = {"post", "retweet", "reply"}
+
+        def _coerce_action_type(obj: Dict[str, Any]) -> str:
+            at = str(obj.get("action_type") or obj.get("action") or "").strip().lower()
+            if not at:
+                # backward-compat: stance/text implies "post"
+                if ("stance_id" in obj) or ("post_text" in obj) or ("text" in obj) or ("tweet" in obj):
+                    at = "post"
+                else:
+                    at = "do_nothing"
+            if at not in allowed_actions:
+                at = "do_nothing"
+            return at
+
+        def _coerce_stance_id(v: Any) -> Optional[int]:
+            if v is None:
+                return None
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        def _coerce_post_text(obj: Dict[str, Any]) -> str:
+            return str(obj.get("post_text") or obj.get("text") or obj.get("tweet") or "")
+
+        def _normalize(obj: Dict[str, Any]) -> str:
+            at = _coerce_action_type(obj)
+            if at in stance_actions:
+                sid = _coerce_stance_id(obj.get("stance_id"))
+                txt = _coerce_post_text(obj)
+                if sid is None:
+                    sid = 0
+                return json.dumps({"action_type": at, "stance_id": int(sid), "post_text": str(txt)}, ensure_ascii=False)
+            # like / do_nothing: no stance expressed
+            return json.dumps({"action_type": at, "stance_id": None, "post_text": ""}, ensure_ascii=False)
+
+        try:
+            if isinstance(s, dict):
+                return _normalize(s)
+        except Exception:
+            pass
+
+        ss = str(s or "").strip()
+        if not ss:
+            return json.dumps({"action_type": "do_nothing", "stance_id": None, "post_text": ""}, ensure_ascii=False)
+
+        # try parse as json directly
+        try:
+            obj = json.loads(ss)
+            if isinstance(obj, dict):
+                return _normalize(obj)
+        except Exception:
+            pass
+
+        # try extract a json object substring
+        m = re.search(r"\{[\s\S]*\}", ss)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, dict):
+                    return _normalize(obj)
+            except Exception:
+                pass
+
+        # fallback: extract stance_id integer if present
+        sid = 0
+        mid = re.search(r"stance_id\s*[:=]\s*(-?\d+)", ss)
+        if mid:
+            try:
+                sid = int(mid.group(1))
+            except Exception:
+                sid = 0
+
+        # use remaining text as tweet content (truncate)
+        txt = ss
+        if len(txt) > 800:
+            txt = txt[:800]
+        # fallback implies stance-only, treat as post
+        return json.dumps({"action_type": "post", "stance_id": int(sid), "post_text": str(txt)}, ensure_ascii=False)
         
     def save_models(self, path: str):
         """
@@ -413,8 +539,9 @@ Your solution:"""
         Args:
             path: 保存路径
         """
-        torch.save(self.belief_network.state_dict(), f"{path}/belief_network.th")
-        torch.save(self.output_network.state_dict(), f"{path}/output_network.th")
+        os.makedirs(path, exist_ok=True)
+        # 统一保存整个 agent，包含 belief_network/output_network 及其它参数
+        torch.save(self.state_dict(), f"{path}/agent.th")
     
     def load_models(self, path: str):
         """
@@ -423,15 +550,25 @@ Your solution:"""
         Args:
             path: 加载路径
         """
-        self.belief_network.load_state_dict(torch.load(f"{path}/belief_network.th"))
-        self.output_network.load_state_dict(torch.load(f"{path}/output_network.th"))
+        agent_path = f"{path}/agent.th"
+        if os.path.exists(agent_path):
+            self.load_state_dict(torch.load(agent_path, map_location=self.device))
+            return
+        # 兼容旧 checkpoint 命名
+        bn = f"{path}/belief_network.th"
+        on = f"{path}/output_network.th"
+        if os.path.exists(bn):
+            self.belief_network.load_state_dict(torch.load(bn, map_location=self.device))
+        if os.path.exists(on):
+            self.output_network.load_state_dict(torch.load(on, map_location=self.device))
     
     def cuda(self):
         """
         将模型参数移动到 CUDA 设备上。
         """
-        self.belief_network.cuda()
-        self.output_network.cuda()
+        # 统一用 self.to(self.device)
+        self.to(self.device)
+        return self
         
     def init_hidden(self):
         """

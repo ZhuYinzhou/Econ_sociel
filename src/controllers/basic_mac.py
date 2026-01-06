@@ -81,7 +81,27 @@ class LLMBasicMAC:
             n_agents=args.n_agents,
             n_heads=args.arch.attention_heads if hasattr(args, 'arch') and hasattr(args.arch, 'attention_heads') else 4,
             key_dim=args.arch.key_dim if hasattr(args, 'arch') and hasattr(args.arch, 'key_dim') else 64,
-            device=self.device
+            device=self.device,
+            # --- HiSim social extensions (all optional; default values keep backward compatibility) ---
+            population_belief_dim=getattr(args, "population_belief_dim", 3),
+            use_population_token=getattr(args, "use_population_token", True),
+            n_stages=getattr(getattr(args, "env_args", object()), "n_stages", 13),
+            use_stage_token=getattr(args, "use_stage_token", False),
+            # --- population belief update head options ---
+            use_population_update_head=getattr(args, "use_population_update_head", True),
+            population_update_hidden_dim=getattr(args, "population_update_hidden_dim", 128),
+            population_update_use_group_repr=getattr(args, "population_update_use_group_repr", True),
+            population_update_use_stage=getattr(args, "population_update_use_stage", False),
+            population_update_residual_mixing=getattr(args, "population_update_residual_mixing", True),
+            population_update_mixing_init=getattr(args, "population_update_mixing_init", 0.5),
+            population_update_mixing_learnable=getattr(args, "population_update_mixing_learnable", True),
+            # --- optional: secondary user action belief head ---
+            secondary_action_dim=getattr(args, "secondary_action_dim", 5),
+            use_secondary_action_head=getattr(args, "use_secondary_action_head", False),
+            secondary_action_hidden_dim=getattr(args, "secondary_action_hidden_dim", 128),
+            secondary_action_use_group_repr=getattr(args, "secondary_action_use_group_repr", True),
+            secondary_action_use_stage=getattr(args, "secondary_action_use_stage", False),
+            secondary_action_use_population=getattr(args, "secondary_action_use_population", True),
         )
 
         # Initialize Commitment Embedder
@@ -285,24 +305,113 @@ class LLMBasicMAC:
         # Extract and reshape outputs for each agent
         belief_states = agent_outs.get('belief_state', torch.zeros(batch_size * self.n_agents, self.args.belief_dim, device=self.device))
         prompt_embeddings = agent_outs.get('prompt_embedding', torch.zeros(batch_size * self.n_agents, 2, device=self.device))
+        # local scalar Q_i^t
         q_values = agent_outs.get('q_value', torch.zeros(batch_size * self.n_agents, 1, device=self.device))
+        # optional discrete-action Q-values (for multinomial selector), shape expected: (bs*n_agents, n_actions)
+        action_q_values = agent_outs.get('action_q_values')
         
         # Reshape from (batch_size * n_agents, feature_dim) to (batch_size, n_agents, feature_dim)
         belief_states = belief_states.view(batch_size, self.n_agents, -1)
         prompt_embeddings = prompt_embeddings.view(batch_size, self.n_agents, -1)
         q_values = q_values.view(batch_size, self.n_agents, -1)
+        if isinstance(action_q_values, torch.Tensor):
+            action_q_values = action_q_values.view(batch_size, self.n_agents, -1)
         
         # Generate group representation using BeliefEncoder
-        group_representation = self.belief_encoder(belief_states)  # (batch, belief_dim)
+        # 对 HiSim social：显式注入 population belief（边缘用户 latent z）与 stage_t
+        population_belief = None
+        stage_t = None
+        try:
+            # 这些字段由 EpisodeRunner 写入 EpisodeBatch（global fields）
+            if hasattr(ep_batch, "scheme"):
+                if "belief_pre_population_z" in ep_batch.scheme:
+                    population_belief = ep_batch["belief_pre_population_z"][:, t]  # (bs, 3)
+                elif "z_t" in ep_batch.scheme:
+                    population_belief = ep_batch["z_t"][:, t]  # (bs, 3)
+                if "stage_t" in ep_batch.scheme:
+                    stage_t = ep_batch["stage_t"][:, t]  # (bs, 1) or (bs,)
+        except Exception as e:
+            logger.warning(f"Failed to fetch population_belief/stage_t from batch at t={t}: {e}")
+            population_belief = None
+            stage_t = None
+
+        try:
+            group_representation = self.belief_encoder(
+                belief_states,
+                population_belief=population_belief,
+                stage_t=stage_t,
+            )  # (batch, belief_dim)
+        except Exception as e:
+            # 回退：不注入 population/stage（保持可运行）
+            logger.warning(f"BeliefEncoder forward with population_belief failed, fallback to vanilla: {e}")
+            group_representation = self.belief_encoder(belief_states)
+
+        # ===== Innovation hook: belief about secondary users (used for env-side simulation) =====
+        secondary_z_next = None
+        secondary_action_probs = None
+        try:
+            if population_belief is not None and hasattr(self.belief_encoder, "predict_next_population_belief"):
+                secondary_z_next = self.belief_encoder.predict_next_population_belief(
+                    population_belief,
+                    group_repr=group_representation,
+                    stage_t=stage_t,
+                    return_logits=False,
+                )  # (bs, K)
+        except Exception as e:
+            logger.debug(f"Secondary z_next prediction skipped: {e}")
+            secondary_z_next = None
+
+        try:
+            if population_belief is not None and getattr(self.belief_encoder, "secondary_action_head", None) is not None:
+                secondary_action_probs = self.belief_encoder.predict_secondary_action_probs(
+                    z_t=population_belief,
+                    group_repr=group_representation,
+                    stage_t=stage_t,
+                    return_logits=False,
+                )  # (bs, A)
+        except Exception as e:
+            logger.debug(f"Secondary action probs prediction skipped: {e}")
+            secondary_action_probs = None
         
-        # Prepare outputs for compatibility with the rest of the system
-        agent_outputs = q_values  # (batch_size, n_agents, 1)
+        # Prepare outputs for action selector:
+        # MultinomialActionSelector expects agent_inputs: (bs, n_agents, n_avail_actions)
+        try:
+            avail_actions_t = ep_batch["avail_actions"][:, t]  # (bs, n_agents, n_avail)
+            n_avail = int(avail_actions_t.shape[-1])
+        except Exception:
+            avail_actions_t = None
+            n_avail = 1
+
+        # Default: use scalar q_values if we only have 1 action
+        agent_outputs = q_values  # (bs, n_agents, 1)
+
+        # Prefer action_q_values if it exists and can be aligned to n_avail
+        if isinstance(action_q_values, torch.Tensor):
+            aq = action_q_values
+            if aq.ndim == 2:
+                aq = aq.unsqueeze(0)
+            # align last dim to n_avail (slice/pad) to avoid shape mismatch
+            if aq.shape[-1] > n_avail:
+                aq = aq[..., :n_avail]
+            elif aq.shape[-1] < n_avail:
+                pad = torch.full((batch_size, self.n_agents, n_avail - aq.shape[-1]), -1e9, device=aq.device, dtype=aq.dtype)
+                aq = torch.cat([aq, pad], dim=-1)
+            agent_outputs = aq
+        else:
+            # If config/action-space says multiple actions but agent didn't output per-action values,
+            # repeat scalar q_values to match n_avail so selector doesn't crash.
+            if n_avail > 1 and isinstance(q_values, torch.Tensor) and q_values.shape[-1] == 1:
+                agent_outputs = q_values.repeat(1, 1, n_avail)
         
         info_dict = {
             "belief_states": belief_states,
             "prompt_embeddings": prompt_embeddings,
             "q_values": q_values,
+            "action_q_values": action_q_values if isinstance(action_q_values, torch.Tensor) else None,
             "group_repr": group_representation,
+            # optional: for env-side secondary user simulation
+            "secondary_z_next": secondary_z_next,
+            "secondary_action_probs": secondary_action_probs,
             "hidden_states": hidden_states
         }
         

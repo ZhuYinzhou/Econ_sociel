@@ -1,0 +1,18 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs / outputs (keep if you intentionally version them)
+*.log
+
+

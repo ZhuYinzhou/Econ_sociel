@@ -1,0 +1,30 @@
+{
+  "topics": [
+    "blm"
+  ],
+  "label2id_size": 3,
+  "num_examples": 13,
+  "skipped_missing_stage": 0,
+  "skipped_missing_target": 104,
+  "skipped_missing_label": 13,
+  "skipped_no_neighbors": 13,
+  "skipped_neighbors_not_in_macro": 0,
+  "skipped_neighbors_no_posts_tp1": 13,
+  "skipped_neighbors_no_labels_tp1": 0,
+  "num_candidates_core": 10,
+  "num_candidates_noncore": 30,
+  "num_examples_core": 13,
+  "num_examples_noncore": 0,
+  "skipped_user_scope": 0,
+  "core_user_count_role_desc": 300,
+  "core_user_count_history": 300,
+  "core_user_count_intersection": 300,
+  "core_user_definition": "role_desc_keys",
+  "core_user_history_nonempty_files": 233,
+  "population_scope": "secondary",
+  "use_population_observation": true,
+  "population_text_source": "micro",
+  "population_micro_user_scope": "all",
+  "population_micro_sampling": "random",
+  "max_population_tweets_total": 10
+}
