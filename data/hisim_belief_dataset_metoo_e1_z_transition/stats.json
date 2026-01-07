@@ -1,0 +1,9 @@
+{
+  "topics": [
+    "metoo"
+  ],
+  "label2id_size": 3,
+  "num_examples": 13,
+  "export_z_transition_dataset": true,
+  "z_transition_definition": "secondary_users_stage_label_dist: z_t and z_target are distributions over [Neutral,Oppose,Support] computed from per-user stage majority label"
+}

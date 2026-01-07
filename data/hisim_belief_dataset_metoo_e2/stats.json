@@ -1,0 +1,31 @@
+{
+  "topics": [
+    "metoo"
+  ],
+  "label2id_size": 3,
+  "num_examples": 1673,
+  "skipped_missing_stage": 0,
+  "skipped_missing_target": 11197,
+  "skipped_missing_label": 130,
+  "skipped_no_neighbors": 2050,
+  "skipped_neighbors_not_in_macro": 0,
+  "skipped_neighbors_no_posts_tp1": 130,
+  "skipped_neighbors_no_labels_tp1": 0,
+  "num_candidates_core": 300,
+  "num_candidates_noncore": 700,
+  "num_examples_core": 1673,
+  "num_examples_noncore": 0,
+  "skipped_user_scope": 0,
+  "core_user_count_role_desc": 300,
+  "core_user_count_history": 300,
+  "core_user_count_intersection": 300,
+  "core_user_definition": "role_desc_keys",
+  "core_user_history_nonempty_files": 250,
+  "population_scope": "secondary",
+  "use_population_observation": true,
+  "population_text_source": "micro",
+  "population_micro_user_scope": "all",
+  "population_micro_sampling": "time",
+  "max_population_tweets_total": 200,
+  "export_z_transition_dataset": true
+}

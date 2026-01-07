@@ -1,0 +1,56 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "question": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "answer": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "topic": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "event": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "t": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "stage_t": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "is_core_user": {
+      "dtype": "bool",
+      "_type": "Value"
+    },
+    "z_t": {
+      "dtype": "float64",
+      "_type": "Value"
+    },
+    "z_target": {
+      "dtype": "float64",
+      "_type": "Value"
+    },
+    "z_mask": {
+      "dtype": "float64",
+      "_type": "Value"
+    },
+    "labeled_secondary_users_t": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "labeled_secondary_users_tp1": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

@@ -277,11 +277,11 @@ class HuggingFaceDatasetEnv(gym.Env):
                 pz = [float(x) for x in list(pz)[:pop_dim]]
             except Exception:
                 pz = [1.0 / float(pop_dim) for _ in range(pop_dim)]
-            s = float(sum(max(0.0, x) for x in pz))
-            if s <= 0:
-                pz = [1.0 / float(pop_dim) for _ in range(pop_dim)]
-            else:
-                pz = [max(0.0, x) / s for x in pz]
+        s = float(sum(max(0.0, x) for x in pz))
+        if s <= 0:
+            pz = [1.0 / float(pop_dim) for _ in range(pop_dim)]
+        else:
+            pz = [max(0.0, x) / s for x in pz]
 
         # neighbor stance counts (optional; keep zeros)
         nb = bi.get("neighbor_stance_counts") or [0, 0, 0]
@@ -501,9 +501,9 @@ class HuggingFaceDatasetEnv(gym.Env):
                 if isinstance(z_target, (list, tuple)) and len(z_target) >= pop_dim:
                     info["belief_inputs_post"] = {
                         "population_z": [float(x) for x in list(z_target)[:pop_dim]],
-                        "is_core_user": bool(self.current_sample.get("is_core_user", False)),
-                        "neighbor_stance_counts": [0, 0, 0],
-                    }
+                    "is_core_user": bool(self.current_sample.get("is_core_user", False)),
+                    "neighbor_stance_counts": [0, 0, 0],
+                }
         
         # 为数据集级别episode添加额外信息
         if self.use_dataset_episode:

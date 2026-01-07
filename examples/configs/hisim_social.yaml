@@ -37,11 +37,16 @@ llm_response_format_json: true
 
 env: "hisim_social_env"
 env_args:
-  hisim_data_root: "/home/zhuyinzhou/MAS/HiSim/data"
+  # 原始 HiSim 数据根目录（包含 hisim_with_tweet/ 与 user_data/）
+  hisim_data_root: "/data/zhuyinzhou/HiSim/data"
   topic: "metoo"
   event: "e1"
   max_question_length: 1024
   max_answer_length: 512
+
+  # 关键：对齐 stance label -> id 的映射，保证与离线 belief 训练阶段一致
+  # 指向由 convert_hisim_to_econ_dataset.py 输出的 label2id.json
+  label2id_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1/label2id.json"
 
   # 仿真设置
   n_stages: 13

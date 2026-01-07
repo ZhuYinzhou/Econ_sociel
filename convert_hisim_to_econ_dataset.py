@@ -313,6 +313,22 @@ def _stage_label(stage_items: List[Any]) -> Optional[str]:
     return Counter(labels).most_common(1)[0][0]
 
 
+def _stage_label_dist(stage_items: List[Any]) -> Dict[str, int]:
+    """
+    stage 内 stance_label 的分布（label -> count）。
+    用于构造 target_distribution（比单一多数标签更稳定）。
+    """
+    counter: Counter = Counter()
+    for it in stage_items:
+        d = _as_mapping(it)
+        if not d:
+            continue
+        lab = _extract_label(d)
+        if lab:
+            counter[_normalize_label(lab)] += 1
+    return dict(counter)
+
+
 def _stage_texts(stage_items: List[Any], max_tweets: int) -> List[str]:
     texts: List[str] = []
     for it in stage_items:
@@ -363,6 +379,9 @@ class BuildArgs:
     population_label_counter: Dict[str, int]
     label2id: Dict[str, int]
     is_core_user: bool
+    # - neighbor_tp1: predict neighbors' stance at stage t+1 (belief about others)
+    # - self_tp1: predict the user's OWN stance at stage t+1 (Scheme C for non-core users without network)
+    target_mode: Literal["neighbor_tp1", "self_tp1"] = "neighbor_tp1"
 
 
 def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
@@ -430,7 +449,10 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
             lines.append(f"- [{u}] {txt}")
         lines.append("")
 
-    lines.append("Task: Predict the MOST LIKELY stance label of the user's social neighbors at stage t+1.This represents the user's belief about how others will shift their stance.")
+    if getattr(args, "target_mode", "neighbor_tp1") == "self_tp1":
+        lines.append("Task: Predict the user's OWN MOST LIKELY stance label at stage t+1.")
+    else:
+        lines.append("Task: Predict the MOST LIKELY stance label of the user's social neighbors at stage t+1. This represents the user's belief about how others will shift their stance.")
     lines.append("Valid labels:")
     lines.append(label_spec)
     lines.append("")
@@ -536,6 +558,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
     force_k: int = 3,
     export_z_transition_dataset: bool = True,
     z_transition_out_dir: str = "",
+    noncore_target_mode: str = "self",
 ) -> None:
     """
     主转换入口：扫描 hisim_data_root 下的宏观数据，生成信念网络训练样本，并保存为 HF dataset。
@@ -624,6 +647,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "population_micro_sampling": population_micro_sampling,
         "max_population_tweets_total": int(max_population_tweets_total),
         "export_z_transition_dataset": bool(export_z_transition_dataset),
+        "noncore_target_mode": str(noncore_target_mode),
     }
 
     z_stats = {
@@ -983,71 +1007,92 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         stats["skipped_missing_target"] += 1
                         continue
 
-                    # neighbors
-                    if neighbor_mode == "following":
-                        neighbors = list(following_dict.get(str(user), []))
+                    # === target definition ===
+                    # Core users: predict neighbors at t+1 (belief about others).
+                    # Non-core users: default to predict SELF at t+1 (Scheme C), because follower_dict often only covers core.
+                    noncore_tm = str(noncore_target_mode or "self").strip().lower()
+                    target_mode = "neighbor_tp1" if is_core_user else ("self_tp1" if noncore_tm in ("self", "self_tp1", "own", "user") else "neighbor_tp1")
+
+                    neighbors: List[str] = []
+                    target_counter: Dict[int, int] = {}
+                    target_label: Optional[str] = None
+
+                    if target_mode == "self_tp1":
+                        # Predict user's own stance at t+1 (supervised by stage_tp1 label distribution)
+                        target_counter_raw = _stage_label_dist(stage_tp1)
+                        if not target_counter_raw:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        target_counter = {label2id[lab]: int(cnt) for lab, cnt in target_counter_raw.items() if lab in label2id}
+                        if not target_counter:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        target_label = _stage_label(stage_tp1)
+                        if not target_label:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        if target_label not in label2id:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        target_id = label2id[target_label]
                     else:
-                        neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
-
-                    # limit and filter to users existing in macro
-                    if max_neighbor_users > 0 and len(neighbors) > max_neighbor_users:
-                        neighbors = neighbors[:max_neighbor_users]
-                    neighbors = [nb for nb in neighbors if nb in macro]
-
-                    if not neighbors:
-                        stats["skipped_missing_target"] += 1
-                        stats["skipped_no_neighbors"] += 1
-                        continue
-
-                    # 统计：邻居中有多少不在 macro（被过滤掉）
-                    # 注意：上面已做过 neighbors = [nb for nb in neighbors if nb in macro]
-                    # 这里通过比较过滤前后长度来统计
-                    # （如果你后续把过滤逻辑挪动了，这里也要相应调整）
-                    # 由于这里拿不到过滤前列表，改为在过滤前先记录长度
-                    # ----
-                    # 在当前结构下，简单用一个近似：如果 neighbors 非空但全都没能提供 tp1 label，
-                    # 通常是“t+1 没发帖”或“没有标签”。下面会分别计数。
-
-                    target_counter_raw = _neighbor_stage_label_dist(macro, neighbors, t)
-                    if not target_counter_raw:
-                        # 判断是“没发帖”还是“发帖但无标签”
-                        any_posts_tp1 = False
-                        for nb in neighbors:
-                            nb_dict = macro.get(nb)
-                            if not isinstance(nb_dict, dict):
-                                continue
-                            nb_tp1 = nb_dict.get(t + 1) or []
-                            if isinstance(nb_tp1, list) and len(nb_tp1) > 0:
-                                any_posts_tp1 = True
-                                break
-                        if not any_posts_tp1:
-                            stats["skipped_neighbors_no_posts_tp1"] += 1
+                        # neighbors
+                        if neighbor_mode == "following":
+                            neighbors = list(following_dict.get(str(user), []))
                         else:
+                            neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
+
+                        # limit and filter to users existing in macro
+                        if max_neighbor_users > 0 and len(neighbors) > max_neighbor_users:
+                            neighbors = neighbors[:max_neighbor_users]
+                        neighbors = [nb for nb in neighbors if nb in macro]
+
+                        if not neighbors:
+                            stats["skipped_missing_target"] += 1
+                            stats["skipped_no_neighbors"] += 1
+                            continue
+
+                        # 在当前结构下，简单用一个近似：如果 neighbors 非空但全都没能提供 tp1 label，
+                        # 通常是“t+1 没发帖”或“没有标签”。下面会分别计数。
+                        target_counter_raw = _neighbor_stage_label_dist(macro, neighbors, t)
+                        if not target_counter_raw:
+                            # 判断是“没发帖”还是“发帖但无标签”
+                            any_posts_tp1 = False
+                            for nb in neighbors:
+                                nb_dict = macro.get(nb)
+                                if not isinstance(nb_dict, dict):
+                                    continue
+                                nb_tp1 = nb_dict.get(t + 1) or []
+                                if isinstance(nb_tp1, list) and len(nb_tp1) > 0:
+                                    any_posts_tp1 = True
+                                    break
+                            if not any_posts_tp1:
+                                stats["skipped_neighbors_no_posts_tp1"] += 1
+                            else:
+                                stats["skipped_neighbors_no_labels_tp1"] += 1
+                            stats["skipped_missing_label"] += 1
+                            continue
+
+                        # 映射到 label id 空间
+                        target_counter = {
+                            label2id[lab]: cnt
+                            for lab, cnt in target_counter_raw.items()
+                            if lab in label2id
+                        }
+
+                        if not target_counter:
+                            stats["skipped_missing_label"] += 1
                             stats["skipped_neighbors_no_labels_tp1"] += 1
-                        stats["skipped_missing_label"] += 1
-                        continue
+                            continue
 
-                    # 映射到 label id 空间
-                    target_counter = {
-                        label2id[lab]: cnt
-                        for lab, cnt in target_counter_raw.items()
-                        if lab in label2id
-                    }
-
-                    if not target_counter:
-                        stats["skipped_missing_label"] += 1
-                        stats["skipped_neighbors_no_labels_tp1"] += 1
-                        continue
-                              
-
-                    target_label = _neighbor_stage_label(macro, neighbors, t)
-                    if not target_label:
-                        stats["skipped_missing_label"] += 1
-                        continue
-                    if target_label not in label2id:
-                        stats["skipped_missing_label"] += 1
-                        continue
-                    target_id = label2id[target_label]
+                        target_label = _neighbor_stage_label(macro, neighbors, t)
+                        if not target_label:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        if target_label not in label2id:
+                            stats["skipped_missing_label"] += 1
+                            continue
+                        target_id = label2id[target_label]
 
                     persona = role_desc.get(str(user), "")
                     user_history = _load_user_history_snippet(topic, str(user)) if is_core_user else ""
@@ -1058,23 +1103,24 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
                     neighbor_texts: List[Tuple[str, str]] = []
                     neighbor_label_counter: Counter = Counter()
-                    for nb in neighbors:
-                        nb_dict = macro.get(nb)
-                        if not isinstance(nb_dict, dict):
-                            continue
-                        nb_stage = nb_dict.get(t) or []
-                        if not isinstance(nb_stage, list) or not nb_stage:
-                            continue
-                        nb_lab = _stage_label(nb_stage)
-                        if nb_lab:
-                            neighbor_label_counter[nb_lab] += 1
-                        # take at most 1-2 texts per neighbor to control length
-                        nb_texts = _stage_texts(nb_stage, max_tweets=2)
-                        for txt in nb_texts:
-                            if txt:
-                                neighbor_texts.append((str(nb), txt))
-                        if max_neighbor_tweets_total > 0 and len(neighbor_texts) >= max_neighbor_tweets_total:
-                            break
+                    if neighbors:
+                        for nb in neighbors:
+                            nb_dict = macro.get(nb)
+                            if not isinstance(nb_dict, dict):
+                                continue
+                            nb_stage = nb_dict.get(t) or []
+                            if not isinstance(nb_stage, list) or not nb_stage:
+                                continue
+                            nb_lab = _stage_label(nb_stage)
+                            if nb_lab:
+                                neighbor_label_counter[nb_lab] += 1
+                            # take at most 1-2 texts per neighbor to control length
+                            nb_texts = _stage_texts(nb_stage, max_tweets=2)
+                            for txt in nb_texts:
+                                if txt:
+                                    neighbor_texts.append((str(nb), txt))
+                            if max_neighbor_tweets_total > 0 and len(neighbor_texts) >= max_neighbor_tweets_total:
+                                break
 
                     pop = population_cache.get(t, {}) if use_population_observation else {}
                     pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
@@ -1095,6 +1141,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         population_label_counter=pop_label_counter,
                         label2id=label2id,
                         is_core_user=is_core_user,
+                        target_mode=target_mode,
                     )
 
                     ex = _build_example_from_states(bargs, target_label=target_label, target_id=target_id, target_distribution=target_counter)
@@ -1337,6 +1384,13 @@ def main():
         default="",
         help="z_transition 数据集输出目录（留空则不单独输出；你也可以直接用 --out-dir 的目录）。",
     )
+    parser.add_argument(
+        "--noncore-target-mode",
+        type=str,
+        default="self",
+        choices=["self", "neighbor"],
+        help="noncore 用户的监督目标：self=预测用户自身在 t+1 的 stance（推荐）；neighbor=预测邻居在 t+1 的 stance（需要 noncore 有邻居图）。",
+    )
 
     args = parser.parse_args()
 
@@ -1369,6 +1423,7 @@ def main():
         force_k=int(args.force_k),
         export_z_transition_dataset=bool(args.export_z_transition_dataset),
         z_transition_out_dir=str(args.z_transition_out_dir or ""),
+        noncore_target_mode=str(args.noncore_target_mode or "self"),
     )
 
 
