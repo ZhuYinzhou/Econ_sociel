@@ -21,6 +21,12 @@ coordinator_model: "gpt-4.1"
 executor_model: "gpt-4.1"
 llm_model_name: "gpt2"
 
+# === Stage1/2: offline supervised classification for BeliefNetwork ===
+train_belief_supervised: true
+# Stage1/2: do NOT train BeliefEncoder (only train the agent's stance classifier / belief network)
+freeze_belief_encoder_in_supervised: true
+use_mixer: false
+
 # ===== 必要默认超参（train.py 不会自动继承 src/config/config.yaml）=====
 lr: 0.001
 belief_net_lr: 0.001

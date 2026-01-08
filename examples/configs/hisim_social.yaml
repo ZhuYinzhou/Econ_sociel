@@ -23,6 +23,9 @@ max_seq_length: 1024
 # hisim_social_env 需要 env.step 接收 JSON 动作；直接使用执行器 0 的输出（transformer_agent.py 内置 JSON 修复器）
 env_action_source: "llm_response_0"
 
+# 社交媒体在线仿真必须启用在线 LLM rollout（否则只会走离散动作占位，env 无法得到 JSON）
+enable_llm_rollout: true
+
 # 注意：llm_model_name 仅用于 HuggingFace tokenizer（不要填 OpenAI 模型名）。
 # 建议保持为本地可用的 tokenizer（如 gpt2），避免下载失败时退化成极简 tokenizer。
 llm_model_name: "gpt2"
@@ -75,6 +78,8 @@ env_args:
   population_belief_mode: "scalar"
 
   # reward：先做一个可运行的 imitation-style reward
+  # action_type（post/retweet/reply/like/do_nothing）匹配的奖励权重（和 stance/text 一起会在 env 内归一化）
+  reward_w_action_type: 0.2
   reward_w_stance: 0.7
   reward_w_text: 0.3
   # A: 缺失的 t+1 监督不计入 reward（避免把缺失当 do_nothing）

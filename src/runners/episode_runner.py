@@ -425,6 +425,35 @@ class EpisodeRunner:
             "filled": torch.tensor([1], dtype=torch.long, device=self.args.device)
         }
 
+        # === offline supervised ground-truth label (HF dataset) ===
+        # Prefer HuggingFaceDatasetEnv: env_info["ground_truth_answer"] like "\\boxed{2}"
+        try:
+            import re
+
+            def _parse_boxed_int(s: Any) -> Optional[int]:
+                if not isinstance(s, str):
+                    return None
+                m = re.search(r"\\boxed\{\s*([-+]?\d+)\s*\}", s)
+                if not m:
+                    # tolerate "boxed{2}" without backslash
+                    m = re.search(r"boxed\{\s*([-+]?\d+)\s*\}", s)
+                return int(m.group(1)) if m else None
+
+            gt = None
+            if isinstance(env_info, dict):
+                gt = _parse_boxed_int(env_info.get("ground_truth_answer"))
+                if gt is None:
+                    gt = _parse_boxed_int(env_info.get("ground_truth"))
+                # social env style: directly provides gt stance id
+                if gt is None:
+                    v = env_info.get("gt_stance_id")
+                    if isinstance(v, int):
+                        gt = int(v)
+            if gt is not None:
+                post_data_dict["gt_action"] = torch.tensor([gt], dtype=torch.int64, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to parse gt_action from env_info: {e}")
+
         # === belief inputs (explicit, tensorized) ===
         # env_info may contain: belief_inputs_pre / belief_inputs_post (dict)
         try:
@@ -491,13 +520,42 @@ class EpisodeRunner:
             if processed_commitment_embedding is not None:
                  post_data_dict["commitment_embedding"] = processed_commitment_embedding
         
-        if q_values_per_agent is not None: # Expected shape (n_agents, 1) or (1, n_agents, 1)
-            if q_values_per_agent.shape == (self.n_agents, 1):
-                post_data_dict["q_values"] = q_values_per_agent.to(self.args.device) # Shape: (n_agents, 1)
-            elif q_values_per_agent.shape == (1, self.n_agents, 1):
-                post_data_dict["q_values"] = q_values_per_agent.squeeze(0).to(self.args.device) # Remove batch dim: (n_agents, 1)
-            else:
-                self.logger.warning(f"Unexpected q_values_per_agent shape: {q_values_per_agent.shape}. Expected ({self.n_agents}, 1) or (1, {self.n_agents}, 1). Not adding to batch.")
+        if q_values_per_agent is not None:  # expected (n_agents,1); accept common variants and normalize
+            try:
+                qv = q_values_per_agent
+                if isinstance(qv, torch.Tensor):
+                    # Common variants observed in this codebase:
+                    # - (bs, n_agents) coming from BasicMAC ("q_values" is often (bs,n_agents))
+                    # - (n_agents,) scalar per agent
+                    # - (n_agents,1)
+                    # - (1,n_agents,1)
+                    if qv.ndim == 1 and qv.shape[0] == self.n_agents:
+                        qv = qv.view(self.n_agents, 1)
+                    elif qv.ndim == 2:
+                        if qv.shape == (self.n_agents, 1):
+                            pass
+                        elif qv.shape == (1, self.n_agents):
+                            qv = qv.view(self.n_agents, 1)
+                        elif qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
+                            qv = qv.view(self.n_agents, 1)
+                        else:
+                            # if it's (bs, n_agents) with bs==1, squeeze to (n_agents,1)
+                            if qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
+                                qv = qv.squeeze(0).view(self.n_agents, 1)
+                    elif qv.ndim == 3 and qv.shape == (1, self.n_agents, 1):
+                        qv = qv.squeeze(0)
+
+                    if isinstance(qv, torch.Tensor) and qv.shape == (self.n_agents, 1):
+                        post_data_dict["q_values"] = qv.to(self.args.device)
+                    else:
+                        self.logger.warning(
+                            f"Unexpected q_values_per_agent shape: {getattr(q_values_per_agent, 'shape', None)} "
+                            f"(normalized={getattr(qv, 'shape', None)}). Expected ({self.n_agents}, 1). Not adding to batch."
+                        )
+                else:
+                    self.logger.warning(f"Unexpected q_values_per_agent type: {type(q_values_per_agent)}. Not adding to batch.")
+            except Exception as e:
+                self.logger.warning(f"Failed to normalize q_values_per_agent: {e}")
 
         if prompt_embeddings_per_agent is not None: # Expected shape (n_agents, 2) or (1, n_agents, 2)
             if prompt_embeddings_per_agent.shape == (self.n_agents, 2):
@@ -604,6 +662,9 @@ class EpisodeRunner:
             "commitment_embedding": {"vshape": (commitment_dim,), "dtype": torch.float32},
             "group_representation": {"vshape": (belief_dim,), "dtype": torch.float32}
             ,
+            # === offline supervised label (global) ===
+            # For HuggingFaceDatasetEnv stance-id training: ground-truth \\boxed{<id>} parsed to int.
+            "gt_action": {"vshape": (1,), "dtype": torch.int64},
             # latent z supervision (global)
             "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},

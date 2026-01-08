@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Any, List
+from collections import deque
 try:
     import wandb  # type: ignore
 except Exception:  # pragma: no cover
@@ -44,6 +45,8 @@ def parse_args():
     parser.add_argument('--n_agents', type=int, help='Number of agents')
     parser.add_argument('--experiment_name', type=str, help='Experiment name')
     parser.add_argument('--log_dir', type=str, help='Log directory')
+    parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint root directory (overrides config.logging.checkpoint_path)')
+    parser.add_argument('--final_save_dir', type=str, help='Final model output directory (overrides default <checkpoint_dir>/final)')
     parser.add_argument('--api_key', type=str, help='Together API key')
     parser.add_argument('--seed', type=int, help='Random seed')
     parser.add_argument('--env', type=str, help='Environment name')
@@ -99,6 +102,15 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
     if args.log_dir:
         if hasattr(config, 'logging'):
             config.logging.log_path = args.log_dir
+
+    if getattr(args, "checkpoint_dir", None):
+        if not hasattr(config, 'logging'):
+            config.logging = SimpleNamespace()
+        config.logging.checkpoint_path = str(args.checkpoint_dir)
+
+    if getattr(args, "final_save_dir", None):
+        # Dedicated final output dir; used by run_training() at the very end.
+        config.final_save_dir = str(args.final_save_dir)
     
     if args.api_key:
         # Set API key in both places for compatibility
@@ -131,7 +143,18 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
 
 def setup_experiment(config: SimpleNamespace):
     """Setup experiment environment and components"""
-    logger = get_logger()
+    # Respect config logging settings so TensorBoard points to the expected directory.
+    log_dir = "logs"
+    exp_name = None
+    use_tb = True
+    try:
+        if hasattr(config, "logging"):
+            log_dir = str(getattr(config.logging, "log_path", log_dir) or log_dir)
+            exp_name = getattr(config.logging, "experiment_name", exp_name)
+            use_tb = bool(getattr(config.logging, "use_tensorboard", use_tb))
+    except Exception:
+        pass
+    logger = get_logger(log_dir=log_dir, experiment_name=exp_name, use_tensorboard=use_tb)
     logger.info("Setting up experiment environment...")
     
     # Set random seed
@@ -204,6 +227,14 @@ def setup_experiment(config: SimpleNamespace):
     
     # Initialize learner
     learner = le_REGISTRY[config.learner](mac=mac, scheme=scheme, logger=logger, args=config)
+    # Ensure model components are moved to the intended device.
+    # Some runners/envs place tensors on CUDA when enabled; without this, we can hit CPU/GPU mismatch.
+    if use_cuda:
+        try:
+            learner.cuda()
+            logger.info("Moved learner/MAC components to CUDA.")
+        except Exception as e:
+            logger.warning(f"Failed to move learner to CUDA: {e}")
 
     # Optional: resume/load checkpoint
     load_path = str(getattr(config, "load_model_path", "") or "").strip()
@@ -235,6 +266,29 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     last_commitment = None
     last_total_loss = None
     patience_counter = 0
+
+    # ===== Sliding window moving average (for noisy per-episode stats) =====
+    # Default window=200; you can override via config.logging.moving_avg_window
+    try:
+        _logging_cfg = getattr(config, "logging", SimpleNamespace())
+        moving_avg_window = int(getattr(_logging_cfg, "moving_avg_window", 200))
+    except Exception:
+        moving_avg_window = 200
+    moving_avg_window = max(1, moving_avg_window)
+    ma_buffers: Dict[str, deque] = {
+        "loss_total": deque(maxlen=moving_avg_window),
+        "belief_sup_acc": deque(maxlen=moving_avg_window),
+        "reward_mean": deque(maxlen=moving_avg_window),
+    }
+
+    def _ma_update(name: str, value: float) -> float:
+        """Update moving average buffer and return current mean."""
+        buf = ma_buffers.get(name)
+        if buf is None:
+            buf = deque(maxlen=moving_avg_window)
+            ma_buffers[name] = buf
+        buf.append(float(value))
+        return float(np.mean(buf)) if len(buf) > 0 else float(value)
     
     # Get early stopping thresholds from configuration
     early_stopping = getattr(config, 'early_stopping', SimpleNamespace())
@@ -298,8 +352,27 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             # These are written to metrics.jsonl and TensorBoard regardless of console verbosity.
             try:
                 if isinstance(train_stats, dict):
+                    # core losses
+                    for k in ("loss_total", "loss_belief", "loss_encoder", "loss_mixer"):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
                     if "reward_mean" in train_stats:
                         logger.log_stat("train/reward_mean", float(train_stats["reward_mean"]), t_env)
+                    # Stage1/2 supervised accuracy (if present)
+                    if "belief_sup_acc" in train_stats:
+                        logger.log_stat("train/belief_sup_acc", float(train_stats["belief_sup_acc"]), t_env)
+
+                    # sliding moving averages (smoothed curves)
+                    if "loss_total" in train_stats:
+                        ma_loss = _ma_update("loss_total", float(train_stats["loss_total"]))
+                        logger.log_stat(f"train/loss_total_ma{moving_avg_window}", ma_loss, t_env)
+                    if "belief_sup_acc" in train_stats:
+                        ma_acc = _ma_update("belief_sup_acc", float(train_stats["belief_sup_acc"]))
+                        logger.log_stat(f"train/belief_sup_acc_ma{moving_avg_window}", ma_acc, t_env)
+                    if "reward_mean" in train_stats:
+                        ma_r = _ma_update("reward_mean", float(train_stats["reward_mean"]))
+                        logger.log_stat(f"train/reward_mean_ma{moving_avg_window}", ma_r, t_env)
+
                     # z(t)->z(t+1) transition supervision (secondary users belief)
                     if "loss_z_transition" in train_stats:
                         logger.log_stat("train/loss_z_transition", float(train_stats["loss_z_transition"]), t_env)
@@ -353,7 +426,11 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         t_env += steps
     
     # Final save
-    save_path = Path(config.logging.checkpoint_path) / "final"
+    final_dir = str(getattr(config, "final_save_dir", "") or "").strip()
+    if final_dir:
+        save_path = Path(final_dir)
+    else:
+        save_path = Path(config.logging.checkpoint_path) / "final"
     save_path.mkdir(parents=True, exist_ok=True)
     learner.save_models(str(save_path))
     logger.info("Training completed. Final model saved.")
@@ -400,6 +477,16 @@ def run_test(runner, logger, config: SimpleNamespace):
     z_kl_list: List[float] = []
     z_eval_steps: int = 0
     
+    def _is_boxed_int(s: Any) -> bool:
+        """Return True if string contains a \\boxed{<int>} (allows whitespace)."""
+        try:
+            import re
+            if not isinstance(s, str):
+                return False
+            return re.search(r"\\boxed\{\s*[-+]?\d+\s*\}", s) is not None
+        except Exception:
+            return False
+
     for _ in range(test_episodes):
         episode_batch = runner.run(test_mode=True)
         if episode_batch is not None:
@@ -412,6 +499,17 @@ def run_test(runner, logger, config: SimpleNamespace):
             if not isinstance(env_infos, list) or not env_infos:
                 continue
 
+            # Decide evaluation schema:
+            # - Legacy social-sim envs may emit gt_t/gt_available/reward_action_type/reward_text.
+            # - HuggingFaceDatasetEnv emits is_correct/reward_ts/reward_al/reward_cc (+ optional z_*).
+            use_legacy_schema = False
+            for info in env_infos:
+                if not isinstance(info, dict):
+                    continue
+                if ("gt_t" in info) or ("gt_available" in info) or ("reward_action_type" in info) or ("reward_text" in info):
+                    use_legacy_schema = True
+                    break
+
             # core: use per-step signals that env already provides
             # - reward_action_type: 1/0
             # - reward_ts: stance match 1/0
@@ -423,29 +521,48 @@ def run_test(runner, logger, config: SimpleNamespace):
             sum_txt = 0.0
 
             for info in env_infos:
-                try:
-                    gt_t = int(info.get("gt_t", -1))
-                except Exception:
-                    gt_t = -1
-                # A: only evaluate steps with usable supervision
-                try:
-                    gt_av = int(info.get("gt_available", 1))
-                except Exception:
-                    gt_av = 1
-                try:
-                    # Use runtime env n_stages if available (curriculum may change it)
-                    n_stages = int(getattr(getattr(runner, "env", None), "n_stages", getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13)))
-                except Exception:
-                    n_stages = 13
-                if gt_av <= 0:
-                    continue
-                if gt_t < 0 or gt_t >= n_stages:
+                if not isinstance(info, dict):
                     continue
 
-                valid += 1
-                sum_at += float(info.get("reward_action_type", 0.0))
-                sum_st += float(info.get("reward_ts", 0.0))
-                sum_txt += float(info.get("reward_text", 0.0))
+                if use_legacy_schema:
+                    try:
+                        gt_t = int(info.get("gt_t", -1))
+                    except Exception:
+                        gt_t = -1
+                    # A: only evaluate steps with usable supervision
+                    try:
+                        gt_av = int(info.get("gt_available", 1))
+                    except Exception:
+                        gt_av = 1
+                    try:
+                        # Use runtime env n_stages if available (curriculum may change it)
+                        n_stages = int(getattr(getattr(runner, "env", None), "n_stages", getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13)))
+                    except Exception:
+                        n_stages = 13
+                    if gt_av <= 0:
+                        continue
+                    if gt_t < 0 or gt_t >= n_stages:
+                        continue
+
+                    valid += 1
+                    sum_at += float(info.get("reward_action_type", 0.0))
+                    sum_st += float(info.get("reward_ts", 0.0))
+                    sum_txt += float(info.get("reward_text", 0.0))
+                else:
+                    # HuggingFaceDatasetEnv schema: treat each step as valid.
+                    valid += 1
+                    # "action type" here means output format is usable (\\boxed{<id>}).
+                    sum_at += 1.0 if _is_boxed_int(info.get("llm_answer", "")) else 0.0
+                    # stance correctness: prefer reward_ts; fallback to is_correct
+                    try:
+                        sum_st += float(info.get("reward_ts", 1.0 if info.get("is_correct", False) else 0.0))
+                    except Exception:
+                        sum_st += 0.0
+                    # no explicit reward_text; use reward_al as a proxy (often 0 when al_weight=0)
+                    try:
+                        sum_txt += float(info.get("reward_al", 0.0))
+                    except Exception:
+                        sum_txt += 0.0
 
                 # secondary: stage boundary evaluation (z_mask == 1)
                 try:

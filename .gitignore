@@ -16,3 +16,6 @@ env/
 *.log
 
 
+
+# Experiment outputs (do not commit)
+logs/**/metrics.jsonl

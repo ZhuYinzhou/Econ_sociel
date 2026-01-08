@@ -1,3 +1,0 @@
-{"time": "2025-07-09T13:54:58.322813", "step": 0, "metric": "train_mean_reward", "value": 0.8434241319262639, "window_size": 100}
-{"time": "2025-07-09T13:54:58.323185", "step": 0, "metric": "train_response_diversity", "value": 1.0, "window_size": 100}
-{"time": "2025-07-09T13:54:58.323486", "step": 0, "metric": "train_return", "value": 0.8434241319262639, "window_size": 100}

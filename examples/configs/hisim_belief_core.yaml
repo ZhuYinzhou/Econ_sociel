@@ -3,9 +3,9 @@ mac: "basic_mac"
 learner: "q_learner"
 
 # Offline belief training (core users only) on a HuggingFace dataset saved via save_to_disk().
-t_max: 200000
-test_interval: 20000
-test_nepisode: 32
+t_max: 50000  #test 2000
+test_interval: 5000  #test 200
+test_nepisode: 200 #32
 
 # 这里的 n_agents 是“并行的执行器/信念网络副本数”，不是用户数
 n_agents: 3
@@ -16,6 +16,14 @@ batch_size_run: 1
 # 注意：实际环境可用动作数量仍由 env_args.n_actions=3 控制（只做 stance_id 分类）。
 n_actions: 5
 env_action_source: "discrete_action_boxed"
+
+# === Stage1/2: offline supervised classification for BeliefNetwork ===
+# Train discrete stance-id head with cross-entropy on gt_action parsed from dataset answer (\\boxed{id})
+train_belief_supervised: true
+# Stage1/2: do NOT train BeliefEncoder (only train the agent's stance classifier / belief network)
+freeze_belief_encoder_in_supervised: true
+# Not needed in supervised mode; saves compute/memory
+use_mixer: false
 
 # ===== 必要默认超参（train.py 不会自动继承 src/config/config.yaml）=====
 lr: 0.001
@@ -89,7 +97,7 @@ logging:
   use_tensorboard: true
   log_interval: 50
   save_model: true
-  save_model_interval: 20000
+  save_model_interval: 20000 #test 2000
   checkpoint_path: "./models"
   log_path: "./logs"
   experiment_name: "hisim-belief-core"

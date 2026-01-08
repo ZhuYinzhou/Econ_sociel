@@ -72,6 +72,16 @@ class ECONLearner:
         # innovation: z(t)->z(t+1) transition loss via BeliefEncoder.population_update_head
         self.z_transition_loss_weight = getattr(args, "z_transition_loss_weight", 0.0)
         self.z_head: Optional[nn.Module] = None
+        # Encoder-only mode (for pure supervised z-transition training on offline datasets)
+        self.train_encoder_only: bool = bool(getattr(args, "train_encoder_only", False))
+        # Belief-network supervised mode (for offline stance-id classification on HF datasets)
+        self.train_belief_supervised: bool = bool(getattr(args, "train_belief_supervised", False))
+        # Stage1/2 option: explicitly freeze BeliefEncoder so supervised training does NOT update it
+        # (also reduces accidental grads / optimizer coupling)
+        self.freeze_belief_encoder_in_supervised: bool = bool(
+            getattr(args, "freeze_belief_encoder_in_supervised", False)
+        )
+        self.belief_supervised_optimizer: Optional[Adam] = None
         
         # BNE协调参数
         self.bne_max_iterations = getattr(args, "bne_max_iterations", 5)
@@ -106,9 +116,19 @@ class ECONLearner:
             self.logger.info("BeliefEncoder is disabled.")
         
         if self.belief_encoder is not None:
-            self.encoder_params = list(self.belief_encoder.parameters())
+            # Stage1/2: hard-freeze encoder weights if requested
+            if self.train_belief_supervised and self.freeze_belief_encoder_in_supervised:
+                try:
+                    for p in self.belief_encoder.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Froze BeliefEncoder parameters for supervised belief training (Stage1/2).")
+                except Exception as e:
+                    self.logger.warning(f"Failed to freeze BeliefEncoder params in supervised mode: {e}")
+
+            # Track only trainable params for optimizers/clipping
+            self.encoder_params = [p for p in self.belief_encoder.parameters() if p.requires_grad]
             self.target_belief_encoder = copy.deepcopy(self.belief_encoder)
-            self.logger.info(f"BeliefEncoder has {len(self.encoder_params)} parameters.")
+            self.logger.info(f"BeliefEncoder trainable params: {len(self.encoder_params)}")
         else:
             self.encoder_params = []
             self.target_belief_encoder = None
@@ -162,6 +182,20 @@ class ECONLearner:
                 weight_decay=getattr(args, "weight_decay", 0.0)
             )
 
+        # Optimizer for belief supervised training (includes discrete action head + belief network)
+        if self.train_belief_supervised:
+            try:
+                agent = getattr(self.mac, "agent", None)
+                if agent is not None and hasattr(agent, "parameters"):
+                    self.belief_supervised_optimizer = Adam(
+                        params=filter(lambda p: p.requires_grad, agent.parameters()),
+                        lr=getattr(args, "belief_net_lr", args.lr),
+                        weight_decay=getattr(args, "weight_decay", 0.0),
+                    )
+                    self.logger.info("Initialized belief_supervised_optimizer for offline classification training.")
+            except Exception as e:
+                self.logger.warning(f"Failed to init belief_supervised_optimizer: {e}")
+
         if self.mixer is None:
             self.logger.warning("ECONLearner: Mixer is None. Global Q-value calculation and related losses will be skipped during training.")
         if self.belief_encoder is None:
@@ -183,7 +217,200 @@ class ECONLearner:
         terminated = batch["terminated"][:, :-1].float().to(self.device)
         mask = batch["filled"][:, :-1].float().to(self.device)
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        
+
+        # ==============================
+        # Belief supervised (offline classification) mode
+        # ==============================
+        # Train discrete action head to match gt_action (stance_id) on HF datasets.
+        if self.train_belief_supervised:
+            if "gt_action" not in batch.scheme:
+                self.logger.warning("train_belief_supervised=True but gt_action not in batch.scheme; skipping.")
+                return {"status": "skipped_no_gt_action"}
+            if self.belief_supervised_optimizer is None:
+                self.logger.warning("train_belief_supervised=True but belief_supervised_optimizer is None; skipping.")
+                return {"status": "skipped_no_supervised_optimizer"}
+
+            if hasattr(self.mac, 'init_hidden'):
+                self.mac.init_hidden(batch.batch_size)
+
+            # Supervised CE over timesteps
+            total_loss = torch.tensor(0.0, device=self.device)
+            total_correct = 0.0
+            total_count = 0.0
+            for t in range(batch.max_seq_length - 1):
+                # logits aligned to env avail_actions via BasicMAC.forward output
+                agent_logits, _info = self.mac.forward(batch, t, train_mode=True)
+                # agent_logits: (bs, n_agents, n_classes)
+                if not isinstance(agent_logits, torch.Tensor) or agent_logits.ndim != 3:
+                    continue
+                bs, na, nc = agent_logits.shape
+
+                # target: global gt_action at this timestep
+                y = batch["gt_action"][:, t].to(self.device)  # (bs, 1) or (bs,)
+                if y.ndim > 1:
+                    y = y.view(bs)
+                # clamp to valid range (robust)
+                y = torch.clamp(y.long(), min=0, max=max(0, int(nc) - 1))
+
+                # expand to per-agent targets
+                y_exp = y.unsqueeze(1).expand(bs, na).reshape(-1)  # (bs*na,)
+                logits_flat = agent_logits.reshape(bs * na, nc)
+
+                # weight by filled mask if available
+                m_t = mask[:, t]
+                if m_t.ndim > 1:
+                    m_t = m_t.view(bs)
+                w = m_t.float().unsqueeze(1).expand(bs, na).reshape(-1)  # (bs*na,)
+                # CE per sample then masked average
+                ce = F.cross_entropy(logits_flat, y_exp, reduction="none")  # (bs*na,)
+                denom = torch.clamp(w.sum(), min=1.0)
+                loss_t = (ce * w).sum() / denom
+                total_loss = total_loss + loss_t
+
+                # accuracy (masked)
+                pred = logits_flat.argmax(dim=-1)
+                total_correct += float(((pred == y_exp).float() * w).sum().item())
+                total_count += float(w.sum().item())
+
+            # mean over timesteps (avoid dependence on seq_len)
+            steps = max(1, int(batch.max_seq_length - 1))
+            total_loss = total_loss / float(steps)
+
+            self.belief_supervised_optimizer.zero_grad()
+            total_loss.backward()
+            # clip agent grads
+            try:
+                agent = getattr(self.mac, "agent", None)
+                if agent is not None and hasattr(agent, "parameters"):
+                    torch.nn.utils.clip_grad_norm_(list(agent.parameters()), 10.0)
+            except Exception:
+                pass
+            self.belief_supervised_optimizer.step()
+
+            acc = (total_correct / max(1.0, total_count)) if total_count > 0 else 0.0
+            return {
+                "status": "belief_supervised",
+                "loss_total": float(total_loss.item()),
+                # keep keys consistent for TB
+                "loss_belief": float(total_loss.item()),
+                "loss_encoder": 0.0,
+                "loss_mixer": 0.0,
+                "belief_sup_acc": float(acc),
+                "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+            }
+
+        # ==============================
+        # Encoder-only supervised mode
+        # ==============================
+        # Used for stage-3 z(t)->z(t+1) training: avoid TD/mixer/belief losses and only train encoder heads.
+        if self.train_encoder_only:
+            if self.belief_encoder is None:
+                self.logger.warning("train_encoder_only=True but belief_encoder is None; skipping.")
+                return {"status": "skipped_encoder_none"}
+
+            # Collect group representations from MAC forward (no mixer needed)
+            if hasattr(self.mac, 'init_hidden'):
+                self.mac.init_hidden(batch.batch_size)
+
+            group_repr_list = []
+            # batch.max_seq_length includes final dummy step; we train on [: -1]
+            for t in range(batch.max_seq_length - 1):
+                _, mac_info_t = self.mac.forward(batch, t, train_mode=True)
+                gr = mac_info_t.get("group_repr")
+                if gr is None:
+                    # fallback: recompute from belief states if present
+                    bs_t = mac_info_t.get("belief_states")
+                    if bs_t is not None and callable(getattr(self.belief_encoder, "__call__", None)):
+                        try:
+                            gr = self.belief_encoder(bs_t)
+                        except Exception:
+                            gr = None
+                if gr is None:
+                    # last resort: zeros (keeps run alive but training signal weak)
+                    gr = torch.zeros(batch.batch_size, getattr(self.args, "belief_dim", 128), device=self.device)
+                group_repr_list.append(gr)
+
+            group_representation_seq = torch.stack(group_repr_list, dim=1)  # (bs, seq, belief_dim)
+
+            # Encoder supervised losses
+            encoder_loss = torch.tensor(0.0, device=self.device)
+            z_loss = torch.tensor(0.0, device=self.device)
+            z_tr_loss = torch.tensor(0.0, device=self.device)
+
+            # Optional: z head supervision (group_repr -> z_target)
+            if self.z_head is not None and "z_target" in batch.scheme and "z_mask" in batch.scheme:
+                z_logits = self.z_head(group_representation_seq)  # (bs, seq, 3)
+                z_logp = F.log_softmax(z_logits, dim=-1)
+                z_target = batch["z_target"][:, :-1].to(self.device)  # (bs, seq, K)
+                z_mask = batch["z_mask"][:, :-1].to(self.device)      # (bs, seq, 1)
+                z_mask = z_mask * mask.unsqueeze(-1)
+                # normalize target if it is distribution-like
+                z_target = torch.clamp(z_target, min=0.0)
+                z_sum = z_target.sum(dim=-1, keepdim=True)
+                # if K==3, normalize; otherwise keep as-is
+                if z_target.shape[-1] == 3:
+                    z_target = torch.where(z_sum > 0, z_target / z_sum, torch.full_like(z_target, 1.0 / 3.0))
+                kl = F.kl_div(z_logp, z_target, reduction="none").sum(dim=-1, keepdim=True)
+                denom = torch.clamp(z_mask.sum(), min=1.0)
+                z_loss = (kl * z_mask).sum() / denom
+                encoder_loss = encoder_loss + self.z_loss_weight * z_loss
+
+            # Main: z(t)->z(t+1) transition supervision via BeliefEncoder head
+            try:
+                if (
+                    self.z_transition_loss_weight
+                    and self.z_transition_loss_weight > 0
+                    and hasattr(self.belief_encoder, "compute_loss")
+                    and "z_target" in batch.scheme
+                    and "z_mask" in batch.scheme
+                    and ("z_t" in batch.scheme or "belief_pre_population_z" in batch.scheme)
+                ):
+                    z_t_seq = batch["z_t"][:, :-1].to(self.device) if "z_t" in batch.scheme else batch["belief_pre_population_z"][:, :-1].to(self.device)
+                    z_target_seq = batch["z_target"][:, :-1].to(self.device)
+                    z_mask_seq = batch["z_mask"][:, :-1].to(self.device) * mask.unsqueeze(-1)
+                    stage_t_seq = batch["stage_t"][:, :-1].to(self.device) if "stage_t" in batch.scheme else None
+
+                    bs, seq_len, k = z_t_seq.shape
+                    z_t_flat = z_t_seq.reshape(bs * seq_len, k)
+                    z_target_flat = z_target_seq.reshape(bs * seq_len, k)
+                    z_mask_flat = z_mask_seq.reshape(bs * seq_len)
+                    gr_flat = group_representation_seq.reshape(bs * seq_len, -1)
+                    st_flat = stage_t_seq.reshape(bs * seq_len, -1) if stage_t_seq is not None else None
+
+                    z_tr_loss = self.belief_encoder.compute_loss(
+                        z_t_flat,
+                        z_target_flat,
+                        z_mask_flat,
+                        group_repr=gr_flat,
+                        stage_t=st_flat,
+                        loss_type=getattr(self.args, "z_transition_loss_type", "kl"),
+                    )
+                    encoder_loss = encoder_loss + self.z_transition_loss_weight * z_tr_loss
+            except Exception as e:
+                self.logger.warning(f"train_encoder_only: z_transition_loss skipped due to error: {e}")
+
+            # Optimize encoder params only
+            if self.encoder_optimizer:
+                self.encoder_optimizer.zero_grad()
+                encoder_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.encoder_params, 10.0)
+                self.encoder_optimizer.step()
+
+            train_stats = {
+                "status": "encoder_only",
+                "loss_total": float(encoder_loss.item()),
+                "loss_encoder": float(encoder_loss.item()),
+                "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+            }
+            if self.z_head is not None:
+                train_stats["loss_z"] = float(z_loss.item())
+            if self.z_transition_loss_weight and self.z_transition_loss_weight > 0:
+                train_stats["loss_z_transition"] = float(z_tr_loss.item())
+            return train_stats
+
+        # ==============================
+        # Full RL/mixer mode (default)
+        # ==============================
         if self.mixer is None:
             self.logger.warning("Mixer is None, training will be skipped.")
             return {"status": "skipped_mixer_none"}
@@ -322,10 +549,10 @@ class ECONLearner:
         )
         q_total_target_next_flat = target_mixer_results_next["Q_tot"].detach()
 
-        # Prepare reward and termination data
-        rewards_flat = rewards.reshape(bs_x_seq_len, 1)
-        terminated_flat = terminated.reshape(bs_x_seq_len, 1)
-        mask_flat = mask.reshape(bs_x_seq_len, 1)
+        # Prepare reward/termination/mask as 1D vectors (N,) to avoid accidental (N,N) broadcasting
+        rewards_flat = rewards.reshape(bs_x_seq_len)
+        terminated_flat = terminated.reshape(bs_x_seq_len)
+        mask_flat = mask.reshape(bs_x_seq_len)
 
         # Calculate target Q-values
         target_q_total_flat = rewards_flat + self.gamma * (1 - terminated_flat) * q_total_target_next_flat
@@ -448,26 +675,33 @@ class ECONLearner:
         # ===========================================
         # Network Optimization
         # ===========================================
+        # IMPORTANT:
+        # Do NOT step one optimizer before backpropagating other losses from the same forward graph.
+        # Optimizer.step() modifies parameters in-place and can break autograd when retain_graph=True.
+        total_loss = belief_loss + encoder_loss + total_mix_loss
 
-        # 1. Optimize BeliefNetworks
         if self.belief_optimizer:
             self.belief_optimizer.zero_grad()
-            belief_loss.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(self.belief_net_params, 10.0)
-            self.belief_optimizer.step()
-
-        # 2. Optimize BeliefEncoder
         if self.encoder_optimizer:
             self.encoder_optimizer.zero_grad()
-            encoder_loss.backward(retain_graph=True)
-            torch.nn.utils.clip_grad_norm_(self.encoder_params, 10.0)
-            self.encoder_optimizer.step()
-
-        # 3. Optimize Mixer
         if self.mixer_optimizer:
             self.mixer_optimizer.zero_grad()
-            total_mix_loss.backward()
+
+        total_loss.backward()
+
+        # Clip gradients per parameter group (optional but keeps previous behavior)
+        if getattr(self, "belief_net_params", None):
+            torch.nn.utils.clip_grad_norm_(self.belief_net_params, 10.0)
+        if getattr(self, "encoder_params", None):
+            torch.nn.utils.clip_grad_norm_(self.encoder_params, 10.0)
+        if getattr(self, "mixer_params", None):
             torch.nn.utils.clip_grad_norm_(self.mixer_params, 10.0)
+
+        if self.belief_optimizer:
+            self.belief_optimizer.step()
+        if self.encoder_optimizer:
+            self.encoder_optimizer.step()
+        if self.mixer_optimizer:
             self.mixer_optimizer.step()
 
         # Update target networks periodically
@@ -477,7 +711,7 @@ class ECONLearner:
 
         # Prepare training statistics
         train_stats = {
-            "loss_total": (belief_loss + encoder_loss + total_mix_loss).item(),
+            "loss_total": total_loss.item(),
             "loss_belief": belief_loss.item(),
             "loss_encoder": encoder_loss.item(),
             "loss_mixer": total_mix_loss.item(),
@@ -520,6 +754,7 @@ class ECONLearner:
         batch_size, seq_len, n_agents, belief_dim = belief_states_stage1.shape
         
         # 初始化Stage 2的状态为Stage 1的状态
+        # NOTE: avoid inplace ops on tensors that require grad (breaks autograd).
         belief_states_current = belief_states_stage1.clone()
         prompt_embeddings_current = prompt_embeddings_stage1.clone()
         local_q_values_current = local_q_values_stage1.clone()
@@ -528,36 +763,44 @@ class ECONLearner:
         # BNE迭代更新
         for iteration in range(self.bne_max_iterations):
             belief_states_prev = belief_states_current.clone()
-            
-            # 为每个时间步计算BNE更新
+
+            # 为每个时间步计算BNE更新（out-of-place 组装，避免 inplace）
+            new_beliefs_ts = []
+            new_prompt_ts = []
+            new_q_ts = []
+            new_group_ts = []
             for t in range(seq_len):
                 # 当前时间步的状态
                 current_beliefs_t = belief_states_current[:, t]  # (batch, n_agents, belief_dim)
                 current_group_repr_t = group_representation_current[:, t]  # (batch, group_dim)
-                
+
                 # 计算agent间的互动影响
                 agent_interactions = self._calculate_agent_interactions(
                     current_beliefs_t, current_group_repr_t
                 )
-                
+
                 # 更新belief states (BNE step)
                 updated_beliefs_t = self._update_beliefs_bne(
                     current_beliefs_t, agent_interactions, batch, t
                 )
-                
+
                 # 重新计算prompt embeddings和Q values
                 updated_prompt_emb_t, updated_q_vals_t = self._recompute_agent_outputs(
                     updated_beliefs_t, batch, t
                 )
-                
+
                 # 更新group representation
                 updated_group_repr_t = self.belief_encoder(updated_beliefs_t)
-                
-                # 存储更新的状态
-                belief_states_current[:, t] = updated_beliefs_t
-                prompt_embeddings_current[:, t] = updated_prompt_emb_t
-                local_q_values_current[:, t] = updated_q_vals_t
-                group_representation_current[:, t] = updated_group_repr_t
+
+                new_beliefs_ts.append(updated_beliefs_t)
+                new_prompt_ts.append(updated_prompt_emb_t)
+                new_q_ts.append(updated_q_vals_t)
+                new_group_ts.append(updated_group_repr_t)
+
+            belief_states_current = torch.stack(new_beliefs_ts, dim=1)
+            prompt_embeddings_current = torch.stack(new_prompt_ts, dim=1)
+            local_q_values_current = torch.stack(new_q_ts, dim=1)
+            group_representation_current = torch.stack(new_group_ts, dim=1)
             
             # 检查收敛性
             belief_change = torch.norm(belief_states_current - belief_states_prev).item()
@@ -606,27 +849,16 @@ class ECONLearner:
         Returns:
             updated beliefs: (batch, n_agents, belief_dim)
         """
-        batch_size, n_agents, belief_dim = beliefs.shape
-        
-        # BNE更新：每个agent考虑其他agent的影响
-        updated_beliefs = beliefs.clone()
-        
-        for i in range(n_agents):
-            # 当前agent的belief
-            current_belief_i = beliefs[:, i]  # (batch, belief_dim)
-            
-            # 其他agents对agent i的影响
-            other_agents_influence = torch.zeros_like(current_belief_i)
-            for j in range(n_agents):
-                if i != j:
-                    interaction_weight = interactions[:, i, j].unsqueeze(-1)  # (batch, 1)
-                    other_agents_influence += interaction_weight * beliefs[:, j]
-            
-            # BNE更新规则：当前belief + 其他agents的加权影响
-            bne_update_rate = 0.1  # 学习率，可以作为超参数
-            updated_beliefs[:, i] = current_belief_i + bne_update_rate * other_agents_influence
-        
-        return updated_beliefs
+        # Vectorized BNE update (no in-place writes; keeps autograd happy)
+        # interactions: (batch, n_agents, n_agents), beliefs: (batch, n_agents, belief_dim)
+        # influence_all[i] = sum_j w_ij * b_j
+        influence_all = torch.bmm(interactions, beliefs)  # (batch, n_agents, belief_dim)
+        # remove self influence to match the original i!=j loop
+        diag_w = interactions.diagonal(dim1=1, dim2=2).unsqueeze(-1)  # (batch, n_agents, 1)
+        other_influence = influence_all - diag_w * beliefs
+
+        bne_update_rate = float(getattr(self, "bne_update_rate", 0.1))
+        return beliefs + bne_update_rate * other_influence
 
     def _recompute_agent_outputs(self, updated_beliefs: torch.Tensor, 
                                batch: EpisodeBatch, t: int) -> Tuple[torch.Tensor, torch.Tensor]:

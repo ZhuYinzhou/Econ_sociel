@@ -220,10 +220,21 @@ class LLMTransformerAgent(nn.Module):
         self.device = torch.device("cuda" if use_cuda else "cpu")
         
         # 温度和 top_p 范围 (从 args 或 BeliefNetwork 的默认值获取)
-        self.T_min = getattr(args.sampling, 'temperature_min', 0.1)
-        self.T_max = getattr(args.sampling, 'temperature_max', 2.0)
-        self.p_min = getattr(args.sampling, 'p_min', 0.1)
-        self.p_max = getattr(args.sampling, 'p_max', 0.9)
+        # NOTE: 旧/精简配置可能没有 sampling 节点；这里提供向后兼容默认值
+        sampling_cfg = getattr(args, "sampling", None)
+        if sampling_cfg is None:
+            try:
+                from types import SimpleNamespace
+                sampling_cfg = SimpleNamespace()
+                # 尽量写回 args，方便其他模块统一读取
+                setattr(args, "sampling", sampling_cfg)
+            except Exception:
+                sampling_cfg = None
+
+        self.T_min = getattr(sampling_cfg, 'temperature_min', 0.1) if sampling_cfg is not None else 0.1
+        self.T_max = getattr(sampling_cfg, 'temperature_max', 2.0) if sampling_cfg is not None else 2.0
+        self.p_min = getattr(sampling_cfg, 'p_min', 0.1) if sampling_cfg is not None else 0.1
+        self.p_max = getattr(sampling_cfg, 'p_max', 0.9) if sampling_cfg is not None else 0.9
         
         # 初始化个体置信网络
         # 输入应该是tokenized观察的长度，而不是state_shape

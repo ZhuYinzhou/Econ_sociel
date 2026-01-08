@@ -19,6 +19,18 @@ class LLMBasicMAC:
     def __init__(self, scheme: Dict, groups: Dict, args: Any):
         self.n_agents = args.n_agents
         self.args = args
+        # ---- Backward-compatible defaults for minimal YAML configs ----
+        # Many configs only override a small subset of keys; BasicMAC historically assumed
+        # defaults from src/config/config.yaml. Provide safe fallbacks here.
+        if not hasattr(self.args, "agent_output_type"):
+            self.args.agent_output_type = "q_values"
+        if not hasattr(self.args, "action_selector"):
+            self.args.action_selector = "multinomial"
+        if not hasattr(self.args, "use_causal_mask"):
+            self.args.use_causal_mask = False
+        if not hasattr(self.args, "max_seq_length"):
+            # Prefer env max_question_length when available
+            self.args.max_seq_length = getattr(getattr(self.args, "env_args", object()), "max_question_length", 1024)
         # Correctly access use_cuda attribute
         use_cuda = hasattr(args, 'system') and hasattr(args.system, 'use_cuda') and args.system.use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
@@ -150,7 +162,7 @@ class LLMBasicMAC:
         )
         
         # Create causal attention mask if needed
-        if self.args.use_causal_mask:
+        if bool(getattr(self.args, "use_causal_mask", False)):
             mask = torch.triu(
                 torch.ones(self.args.max_seq_length, self.args.max_seq_length),
                 diagonal=1
@@ -337,6 +349,8 @@ class LLMBasicMAC:
         belief_states = belief_states.view(batch_size, self.n_agents, -1)
         prompt_embeddings = prompt_embeddings.view(batch_size, self.n_agents, -1)
         q_values = q_values.view(batch_size, self.n_agents, -1)
+        # For learner: prefer scalar q-values shaped (bs, n_agents) when possible
+        q_values_scalar = q_values.squeeze(-1) if isinstance(q_values, torch.Tensor) and q_values.shape[-1] == 1 else q_values
         if isinstance(action_q_values, torch.Tensor):
             action_q_values = action_q_values.view(batch_size, self.n_agents, -1)
         
@@ -358,16 +372,33 @@ class LLMBasicMAC:
             population_belief = None
             stage_t = None
 
+        # Stage1/2 supervised mode: optionally freeze encoder and avoid building a grad graph
+        freeze_enc_sup = bool(getattr(self.args, "freeze_belief_encoder_in_supervised", False))
+        is_sup = bool(getattr(self.args, "train_belief_supervised", False))
+        use_no_grad = bool(train_mode and is_sup and freeze_enc_sup)
+
         try:
-            group_representation = self.belief_encoder(
-                belief_states,
-                population_belief=population_belief,
-                stage_t=stage_t,
-            )  # (batch, belief_dim)
+            if use_no_grad:
+                with torch.no_grad():
+                    group_representation = self.belief_encoder(
+                        belief_states,
+                        population_belief=population_belief,
+                        stage_t=stage_t,
+                    )  # (batch, belief_dim)
+            else:
+                group_representation = self.belief_encoder(
+                    belief_states,
+                    population_belief=population_belief,
+                    stage_t=stage_t,
+                )  # (batch, belief_dim)
         except Exception as e:
             # 回退：不注入 population/stage（保持可运行）
             logger.warning(f"BeliefEncoder forward with population_belief failed, fallback to vanilla: {e}")
-            group_representation = self.belief_encoder(belief_states)
+            if use_no_grad:
+                with torch.no_grad():
+                    group_representation = self.belief_encoder(belief_states)
+            else:
+                group_representation = self.belief_encoder(belief_states)
 
         # ===== Innovation hook: belief about secondary users (used for env-side simulation) =====
         secondary_z_next = None
@@ -429,7 +460,8 @@ class LLMBasicMAC:
         info_dict = {
             "belief_states": belief_states,
             "prompt_embeddings": prompt_embeddings,
-            "q_values": q_values,
+            # NOTE: keep learner-facing q_values as (bs, n_agents) if available
+            "q_values": q_values_scalar,
             "action_q_values": action_q_values if isinstance(action_q_values, torch.Tensor) else None,
             "group_repr": group_representation,
             # optional: for env-side secondary user simulation
@@ -678,6 +710,42 @@ Final Answer (max 50 tokens):"""
                 except Exception as e:
                     logger.debug(f"Skipping {name}.cuda() due to error: {e}")
 
+    # ---- PyTorch-like state sync helpers (for target MAC updates) ----
+    def state_dict(self) -> Dict[str, Any]:
+        """
+        Provide a minimal state dict so learners can sync target networks via:
+        target_mac.load_state_dict(mac.state_dict()).
+        """
+        sd: Dict[str, Any] = {}
+        try:
+            if getattr(self, "agent", None) is not None and hasattr(self.agent, "state_dict"):
+                sd["agent"] = self.agent.state_dict()
+        except Exception as e:
+            logger.warning(f"Failed to get agent state_dict: {e}")
+        try:
+            if getattr(self, "belief_encoder", None) is not None and hasattr(self.belief_encoder, "state_dict"):
+                sd["belief_encoder"] = self.belief_encoder.state_dict()
+        except Exception as e:
+            logger.warning(f"Failed to get belief_encoder state_dict: {e}")
+        return sd
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
+        """Load state produced by state_dict()."""
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"LLMBasicMAC.load_state_dict expects dict, got: {type(state_dict)}")
+        if "agent" in state_dict and getattr(self, "agent", None) is not None and hasattr(self.agent, "load_state_dict"):
+            try:
+                self.agent.load_state_dict(state_dict["agent"], strict=strict)
+            except TypeError:
+                # some modules don't support strict kw
+                self.agent.load_state_dict(state_dict["agent"])
+        if "belief_encoder" in state_dict and getattr(self, "belief_encoder", None) is not None and hasattr(self.belief_encoder, "load_state_dict"):
+            try:
+                self.belief_encoder.load_state_dict(state_dict["belief_encoder"], strict=strict)
+            except TypeError:
+                self.belief_encoder.load_state_dict(state_dict["belief_encoder"])
+        return self
+
     def save_models(self, path: str):
         """Save all model components."""
         self.agent.save_models(path)
@@ -712,6 +780,16 @@ Final Answer (max 50 tokens):"""
         """Create a minimal tokenizer."""
         # Create a simple character-level tokenizer as fallback
         class MinimalTokenizer:
+            class _Encoding(dict):
+                """Minimal BatchEncoding-like container supporting both dict and attribute access."""
+                @property
+                def input_ids(self):
+                    return self["input_ids"]
+
+                @property
+                def attention_mask(self):
+                    return self.get("attention_mask", None)
+
             def __init__(self):
                 # Create a basic vocabulary
                 self.vocab = {chr(i): i for i in range(32, 127)}  # ASCII printable characters
@@ -722,27 +800,70 @@ Final Answer (max 50 tokens):"""
                 self.eos_token_id = 3
                 self.vocab_size = len(self.vocab)
                 
-            def __call__(self, text, max_length=None, padding=True, truncation=True, return_tensors="pt"):
+            def __call__(
+                self,
+                text,
+                max_length=None,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                add_special_tokens=True,
+                return_attention_mask=False,
+                **kwargs,
+            ):
                 if isinstance(text, str):
                     text = [text]
                 
                 # Simple tokenization by character
                 tokenized = []
+                attn_masks = []
                 for t in text:
-                    tokens = [self.vocab.get(c, 1) for c in t[:max_length-1 if max_length else None]]
-                    tokens.append(3)  # EOS token
+                    # reserve 1 position for EOS if max_length is provided
+                    if max_length is not None and max_length > 0:
+                        t = t[: max(0, max_length - 1)]
+
+                    tokens = [self.vocab.get(c, 1) for c in t]
+                    if add_special_tokens:
+                        tokens.append(self.eos_token_id)  # EOS token
                     
                     if max_length and padding:
                         if len(tokens) < max_length:
                             tokens.extend([0] * (max_length - len(tokens)))  # PAD tokens
                         tokens = tokens[:max_length]
+                    elif max_length and truncation:
+                        tokens = tokens[:max_length]
                     
                     tokenized.append(tokens)
+                    if return_attention_mask:
+                        attn_masks.append([0 if tok == self.pad_token_id else 1 for tok in tokens])
                 
                 if return_tensors == "pt":
                     import torch
-                    return {"input_ids": torch.tensor(tokenized)}
-                return tokenized
+                    enc = self._Encoding({"input_ids": torch.tensor(tokenized, dtype=torch.long)})
+                    if return_attention_mask:
+                        enc["attention_mask"] = torch.tensor(attn_masks, dtype=torch.long)
+                    return enc
+                enc = self._Encoding({"input_ids": tokenized})
+                if return_attention_mask:
+                    enc["attention_mask"] = attn_masks
+                return enc
+
+            def encode(self, text, add_special_tokens=True, max_length=None, truncation=False, **kwargs):
+                """HF-like encode() used by _truncate_to_tokens."""
+                enc = self(
+                    text,
+                    max_length=max_length,
+                    padding=False,
+                    truncation=truncation,
+                    return_tensors=None,
+                    add_special_tokens=add_special_tokens,
+                    return_attention_mask=False,
+                )
+                # enc["input_ids"] is a list of lists when text is str (we normalize to list)
+                ids = enc["input_ids"]
+                if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+                    return ids[0]
+                return ids
                 
             def decode(self, token_ids, skip_special_tokens=True):
                 # Simple decode implementation

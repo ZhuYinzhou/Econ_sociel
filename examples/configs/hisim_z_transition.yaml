@@ -37,6 +37,17 @@ stage2_weight: 0.0            # 降低/关闭 BNE 影响（该任务主要训练
 bne_max_iterations: 1
 bne_convergence_threshold: 0.001
 
+# === 关键：阶段3只做 encoder 监督训练（跳过 mixer/TD/belief loss）===
+train_encoder_only: true
+# 可选：进一步节省算力（encoder-only 模式下不会用到 mixer）
+use_mixer: false
+# 可选：冻结 belief_network（encoder-only 下不会 step belief_optimizer，但保留为 0 更清晰）
+belief_net_lr: 0.0
+# 可选：冻结 mixer（如果仍启用 use_mixer）
+mixer_lr: 0.0
+# 可选：完全不做 BNE 更新（encoder-only 本来也不跑 BNE）
+bne_max_iterations: 0
+
 arch:
   entity_dim: 256
   attention_heads: 4

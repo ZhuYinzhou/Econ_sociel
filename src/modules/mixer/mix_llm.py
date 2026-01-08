@@ -323,13 +323,26 @@ class LLMQMixer(nn.Module):
         """
         loss_components = {}
 
+        # ---- shape hygiene (avoid accidental broadcasting to (N,N)) ----
+        # We expect 1D vectors of length N for TD computations.
+        if isinstance(mask_flat, torch.Tensor) and mask_flat.ndim > 1:
+            mask_flat = mask_flat.view(-1)
+        if isinstance(rewards_total, torch.Tensor) and rewards_total.ndim > 1:
+            rewards_total = rewards_total.view(-1)
+        if isinstance(terminated, torch.Tensor) and terminated.ndim > 1:
+            terminated = terminated.view(-1)
+        if isinstance(target_Q_tot, torch.Tensor) and target_Q_tot.ndim > 1:
+            target_Q_tot = target_Q_tot.view(-1)
+        if isinstance(Q_tot, torch.Tensor) and Q_tot.ndim > 1:
+            Q_tot = Q_tot.view(-1)
+
         # 1. Global TD Loss: L_TD^tot(φ)
         # td_target = r_tot + γ * target_Q_tot (if not terminated)
         # td_target = r_tot (if terminated)
         td_target = rewards_total + gamma * target_Q_tot * (1 - terminated.float())
         
         # Inside LLMQMixer.calculate_mix_loss, assuming mask_flat (bs*seq, 1) is passed
-        td_error_tot = (Q_tot - td_target.detach()) # Q_tot should be (bs*seq,) or (bs*seq, 1)
+        td_error_tot = (Q_tot - td_target.detach()) # expected (N,)
         # Ensure mask_flat is correctly shaped and broadcastable with td_error_tot
         masked_td_error_tot = td_error_tot * mask_flat 
         loss_td_tot = (masked_td_error_tot**2).sum() / mask_flat.sum().clamp(min=1e-6) # clamp for stability
@@ -360,6 +373,11 @@ class LLMQMixer(nn.Module):
         # Total Mix Loss
         total_mix_loss = loss_td_tot + lambda_sd * loss_sd + lambda_m * loss_q_consistency
         loss_components["L_mix_total"] = total_mix_loss
+
+        # Final safety: avoid silently propagating NaNs
+        if not torch.isfinite(total_mix_loss):
+            logger.warning(f"[LLMQMixer] total_mix_loss is not finite: {total_mix_loss}. "
+                           f"Shapes: Q_tot={tuple(Q_tot.shape)}, td_target={tuple(td_target.shape)}, mask={tuple(mask_flat.shape)}")
         
         return total_mix_loss, loss_components
 
