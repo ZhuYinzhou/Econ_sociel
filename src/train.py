@@ -4,12 +4,13 @@
 import os
 import sys
 import time
+import copy
 import torch
 import argparse
 import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from collections import deque
 try:
     import wandb  # type: ignore
@@ -279,16 +280,56 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         "loss_total": deque(maxlen=moving_avg_window),
         "belief_sup_acc": deque(maxlen=moving_avg_window),
         "reward_mean": deque(maxlen=moving_avg_window),
+        # supervised diagnostics
+        "belief_sup_soft_available_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_soft_used_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_soft_p1_mean": deque(maxlen=moving_avg_window),
+        "belief_sup_grad_norm": deque(maxlen=moving_avg_window),
+        "belief_sup_entropy": deque(maxlen=moving_avg_window),
+        "belief_sup_maxprob": deque(maxlen=moving_avg_window),
+        "belief_sup_logit_abs_mean": deque(maxlen=moving_avg_window),
+        "belief_sup_logit_std": deque(maxlen=moving_avg_window),
+        "belief_sup_pred0_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_pred1_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_pred2_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_gt0_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_gt1_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_gt2_frac": deque(maxlen=moving_avg_window),
+    }
+
+    ma_skipped: Dict[str, int] = {
+        "loss_total": 0,
+        "belief_sup_acc": 0,
+        "reward_mean": 0,
+        "belief_sup_soft_available_frac": 0,
+        "belief_sup_soft_used_frac": 0,
+        "belief_sup_soft_p1_mean": 0,
+        "belief_sup_grad_norm": 0,
+        "belief_sup_entropy": 0,
+        "belief_sup_maxprob": 0,
+        "belief_sup_logit_abs_mean": 0,
+        "belief_sup_logit_std": 0,
+        "belief_sup_pred0_frac": 0,
+        "belief_sup_pred1_frac": 0,
+        "belief_sup_pred2_frac": 0,
+        "belief_sup_gt0_frac": 0,
+        "belief_sup_gt1_frac": 0,
+        "belief_sup_gt2_frac": 0,
     }
 
     def _ma_update(name: str, value: float) -> float:
-        """Update moving average buffer and return current mean."""
+        """Update moving average buffer with finite values only; return current mean (or NaN if empty)."""
         buf = ma_buffers.get(name)
         if buf is None:
             buf = deque(maxlen=moving_avg_window)
             ma_buffers[name] = buf
-        buf.append(float(value))
-        return float(np.mean(buf)) if len(buf) > 0 else float(value)
+        v = float(value)
+        # Do NOT let a single NaN/Inf poison the whole moving average curve
+        if not np.isfinite(v):
+            ma_skipped[name] = int(ma_skipped.get(name, 0)) + 1
+            return float(np.mean(buf)) if len(buf) > 0 else float("nan")
+        buf.append(v)
+        return float(np.mean(buf)) if len(buf) > 0 else v
     
     # Get early stopping thresholds from configuration
     early_stopping = getattr(config, 'early_stopping', SimpleNamespace())
@@ -300,6 +341,53 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     # Training loop
     episode = 0
     t_env = 0
+
+    # ===== Stage1/2: supervised mini-batch replay (critical for stability) =====
+    # The runner returns an EpisodeBatch with batch_size_run (often 1). If we train on it directly,
+    # supervised learning degenerates into single-sample SGD (effective_count ~= n_agents), which is
+    # extremely unstable and prone to fast collapse for imbalanced labels.
+    #
+    # Here we keep a small replay of recent EpisodeBatch samples (size=train.buffer_size) and,
+    # every train.update_interval episodes, sample train.batch_size of them to form a true mini-batch.
+    supervised_mode = bool(getattr(config, "train_belief_supervised", False))
+    # store tuples: (gt_label:int|None, EpisodeBatch)
+    supervised_replay = []
+    try:
+        _train_cfg = getattr(config, "train", SimpleNamespace())
+        supervised_batch_size = int(getattr(_train_cfg, "batch_size", 16))
+        supervised_buffer_size = int(getattr(_train_cfg, "buffer_size", 128))
+        supervised_update_interval = int(getattr(_train_cfg, "update_interval", 1))
+        # optional: enforce at least K samples of label-1 in each supervised batch (if available in replay)
+        supervised_min_label1 = int(getattr(_train_cfg, "supervised_min_label1_per_batch", 0))
+    except Exception:
+        supervised_batch_size = 16
+        supervised_buffer_size = 128
+        supervised_update_interval = 1
+        supervised_min_label1 = 0
+    supervised_batch_size = max(1, supervised_batch_size)
+    supervised_buffer_size = max(supervised_batch_size, supervised_buffer_size)
+    supervised_update_interval = max(1, supervised_update_interval)
+    supervised_min_label1 = max(0, supervised_min_label1)
+
+    def _concat_episode_batches(batches):
+        if not batches:
+            return None
+        b0 = batches[0]
+        from components.episode_buffer import EpisodeBatch
+        out = EpisodeBatch(
+            scheme=b0.scheme,
+            groups=b0.groups,
+            batch_size=len(batches),
+            max_seq_length=b0.max_seq_length,
+            device=b0.device,
+        )
+        for k in out.data.keys():
+            try:
+                out.data[k] = torch.cat([b.data[k] for b in batches], dim=0)
+            except Exception:
+                # keep default zeros for this key if concat fails
+                pass
+        return out
 
     # ===== B: curriculum schedule (optional) =====
     # config.curriculum example:
@@ -346,7 +434,64 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         
         # Train learner
         if episode_batch is not None:
-            train_stats = learner.train(episode_batch, t_env, episode)
+            if supervised_mode:
+                # Push into supervised replay (also extract gt_action label for stratified sampling)
+                gt_label = None
+                try:
+                    gt_t = episode_batch.data.get("gt_action", None)
+                    # gt_action shape: (bs, T, 1); runner batch_size_run is usually 1
+                    if isinstance(gt_t, torch.Tensor) and gt_t.numel() > 0:
+                        gt_label = int(gt_t.view(-1)[0].item())
+                except Exception:
+                    gt_label = None
+                supervised_replay.append((gt_label, episode_batch))
+                if len(supervised_replay) > supervised_buffer_size:
+                    supervised_replay = supervised_replay[-supervised_buffer_size:]
+
+                # Only train when we have enough and on update_interval
+                if len(supervised_replay) >= supervised_batch_size and (episode % supervised_update_interval == 0):
+                    import random
+                    # sample without replacement for a more diverse mini-batch
+                    if supervised_min_label1 > 0:
+                        # True "at least K": first ensure K label-1 samples, then fill remaining from the
+                        # *entire remaining pool* (which may include more label-1).
+                        n = len(supervised_replay)
+                        one_idx = [i for i, (lab, _b) in enumerate(supervised_replay) if lab == 1]
+                        k = min(int(supervised_min_label1), len(one_idx), supervised_batch_size)
+                        picked_idx = set()
+                        if k > 0:
+                            picked_idx.update(random.sample(one_idx, k))
+                        rem = supervised_batch_size - len(picked_idx)
+                        if rem > 0:
+                            pool_idx = [i for i in range(n) if i not in picked_idx]
+                            if len(pool_idx) >= rem:
+                                picked_idx.update(random.sample(pool_idx, rem))
+                            else:
+                                # fallback: if replay is tiny, sample with replacement from all
+                                picked_idx.update(random.choices(list(range(n)), k=rem))
+                        picked_list = [supervised_replay[i][1] for i in list(picked_idx)[:supervised_batch_size]]
+                        sampled_batches = picked_list
+                        label1_in_batch = float(k)
+                    else:
+                        sampled_batches = [b for (_lab, b) in random.sample(supervised_replay, supervised_batch_size)]
+                        label1_in_batch = float("nan")
+                    mb = _concat_episode_batches(sampled_batches)
+                    train_stats = learner.train(mb, t_env, episode)
+                    # annotate for visibility
+                    if isinstance(train_stats, dict):
+                        train_stats["supervised_replay_size"] = float(len(supervised_replay))
+                        train_stats["supervised_batch_size"] = float(supervised_batch_size)
+                        train_stats["supervised_min_label1_per_batch"] = float(supervised_min_label1)
+                        train_stats["supervised_label1_picked"] = float(label1_in_batch) if label1_in_batch == label1_in_batch else float("nan")
+                else:
+                    train_stats = {
+                        "status": "pending_supervised_minibatch",
+                        "supervised_replay_size": float(len(supervised_replay)),
+                        "supervised_batch_size": float(supervised_batch_size),
+                        "supervised_min_label1_per_batch": float(supervised_min_label1),
+                    }
+            else:
+                train_stats = learner.train(episode_batch, t_env, episode)
 
             # === High-signal fixed metrics (core reward + secondary belief loss) ===
             # These are written to metrics.jsonl and TensorBoard regardless of console verbosity.
@@ -361,6 +506,49 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     # Stage1/2 supervised accuracy (if present)
                     if "belief_sup_acc" in train_stats:
                         logger.log_stat("train/belief_sup_acc", float(train_stats["belief_sup_acc"]), t_env)
+                    # Stage1/2 supervised diagnostics (if present)
+                    for k in (
+                        "belief_sup_soft_available_frac",
+                        "belief_sup_soft_used_frac",
+                        "belief_sup_soft_p1_mean",
+                        "belief_sup_grad_norm",
+                        "belief_sup_effective_count",
+                        "belief_sup_entropy",
+                        "belief_sup_maxprob",
+                        "belief_sup_logit_abs_mean",
+                        "belief_sup_logit_std",
+                        "belief_sup_ce_w0",
+                        "belief_sup_ce_w1",
+                        "belief_sup_ce_w2",
+                        "belief_sup_pred0_frac",
+                        "belief_sup_pred1_frac",
+                        "belief_sup_pred2_frac",
+                        "belief_sup_gt0_frac",
+                        "belief_sup_gt1_frac",
+                        "belief_sup_gt2_frac",
+                        # per-class recall/precision (helps debug collapse / class-0 missing)
+                        "belief_sup_recall0",
+                        "belief_sup_recall1",
+                        "belief_sup_recall2",
+                        "belief_sup_precision0",
+                        "belief_sup_precision1",
+                        "belief_sup_precision2",
+                        # counts/flags (helps interpret recall/precision; avoids NaN confusion)
+                        "belief_sup_gt0_count",
+                        "belief_sup_gt1_count",
+                        "belief_sup_gt2_count",
+                        "belief_sup_pred0_count",
+                        "belief_sup_pred1_count",
+                        "belief_sup_pred2_count",
+                        "belief_sup_correct0_count",
+                        "belief_sup_correct1_count",
+                        "belief_sup_correct2_count",
+                        "belief_sup_has_gt0",
+                        "belief_sup_has_gt1",
+                        "belief_sup_has_gt2",
+                    ):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
 
                     # sliding moving averages (smoothed curves)
                     if "loss_total" in train_stats:
@@ -369,9 +557,57 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     if "belief_sup_acc" in train_stats:
                         ma_acc = _ma_update("belief_sup_acc", float(train_stats["belief_sup_acc"]))
                         logger.log_stat(f"train/belief_sup_acc_ma{moving_avg_window}", ma_acc, t_env)
+                    # Optional: moving averages for supervised diagnostics (helps when noisy)
+                    for k in (
+                        "belief_sup_soft_available_frac",
+                        "belief_sup_soft_used_frac",
+                        "belief_sup_soft_p1_mean",
+                        "belief_sup_grad_norm",
+                        "belief_sup_effective_count",
+                        "belief_sup_entropy",
+                        "belief_sup_maxprob",
+                        "belief_sup_logit_abs_mean",
+                        "belief_sup_logit_std",
+                        "belief_sup_ce_w0",
+                        "belief_sup_ce_w1",
+                        "belief_sup_ce_w2",
+                        "belief_sup_pred0_frac",
+                        "belief_sup_pred1_frac",
+                        "belief_sup_pred2_frac",
+                        "belief_sup_gt0_frac",
+                        "belief_sup_gt1_frac",
+                        "belief_sup_gt2_frac",
+                        "belief_sup_recall0",
+                        "belief_sup_recall1",
+                        "belief_sup_recall2",
+                        "belief_sup_precision0",
+                        "belief_sup_precision1",
+                        "belief_sup_precision2",
+                        "belief_sup_gt0_count",
+                        "belief_sup_gt1_count",
+                        "belief_sup_gt2_count",
+                        "belief_sup_pred0_count",
+                        "belief_sup_pred1_count",
+                        "belief_sup_pred2_count",
+                        "belief_sup_correct0_count",
+                        "belief_sup_correct1_count",
+                        "belief_sup_correct2_count",
+                        "belief_sup_has_gt0",
+                        "belief_sup_has_gt1",
+                        "belief_sup_has_gt2",
+                    ):
+                        if k in train_stats:
+                            ma_k = _ma_update(k, float(train_stats[k]))
+                            logger.log_stat(f"train/{k}_ma{moving_avg_window}", ma_k, t_env)
                     if "reward_mean" in train_stats:
                         ma_r = _ma_update("reward_mean", float(train_stats["reward_mean"]))
                         logger.log_stat(f"train/reward_mean_ma{moving_avg_window}", ma_r, t_env)
+                    # Optional: surface how often we skipped non-finite values for MA (debugging stability)
+                    try:
+                        if int(ma_skipped.get("loss_total", 0)) > 0:
+                            logger.log_stat("train/loss_total_ma_skipped_nonfinite", float(ma_skipped["loss_total"]), t_env)
+                    except Exception:
+                        pass
 
                     # z(t)->z(t+1) transition supervision (secondary users belief)
                     if "loss_z_transition" in train_stats:
@@ -409,7 +645,41 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
 
                 # Also write the key test metrics to TensorBoard/metrics.jsonl
                 try:
-                    for k in ("test_return_mean", "core_action_type_acc", "core_stance_acc", "core_text_sim", "secondary_z_kl"):
+                    for k in (
+                        "test_return_mean",
+                        "core_action_type_acc",
+                        "core_stance_acc",
+                        "core_text_sim",
+                        "secondary_z_kl",
+                        # per-class stance metrics on eval split
+                        "stance_gt0_frac",
+                        "stance_gt1_frac",
+                        "stance_gt2_frac",
+                        "stance_pred0_frac",
+                        "stance_pred1_frac",
+                        "stance_pred2_frac",
+                        "stance_recall0",
+                        "stance_recall1",
+                        "stance_recall2",
+                        "stance_precision0",
+                        "stance_precision1",
+                        "stance_precision2",
+                        "stance_gt0_count",
+                        "stance_gt1_count",
+                        "stance_gt2_count",
+                        "stance_pred0_count",
+                        "stance_pred1_count",
+                        "stance_pred2_count",
+                        "stance_correct0_count",
+                        "stance_correct1_count",
+                        "stance_correct2_count",
+                        "stance_has_gt0",
+                        "stance_has_gt1",
+                        "stance_has_gt2",
+                        "stance_has_pred0",
+                        "stance_has_pred1",
+                        "stance_has_pred2",
+                    ):
                         if k in test_stats:
                             logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
                 except Exception as e:
@@ -467,6 +737,42 @@ def run_test(runner, logger, config: SimpleNamespace):
     test_episodes = int(getattr(config, "test_nepisode", 10))
     test_episodes = max(1, test_episodes)
 
+    # Optional: evaluate on a different dataset split than training (useful for HF dataset env).
+    # Example in YAML:
+    #   eval_dataset_split: "test"
+    eval_split = str(getattr(config, "eval_dataset_split", "") or "").strip() or None
+    eval_runner = runner
+    if eval_split and hasattr(config, "env") and str(getattr(config, "env", "")).strip() == "huggingface_dataset_env":
+        try:
+            # cache per-split runner to avoid reloading dataset every eval
+            cache = getattr(runner, "_eval_runner_cache", None)
+            if cache is None:
+                cache = {}
+                setattr(runner, "_eval_runner_cache", cache)
+            if eval_split in cache:
+                eval_runner = cache[eval_split]
+            else:
+                cfg_eval = copy.deepcopy(config)
+                if hasattr(cfg_eval, "env_args") and hasattr(cfg_eval.env_args, "dataset_split"):
+                    cfg_eval.env_args.dataset_split = eval_split
+                # Optional: control evaluation sampling behavior independently from training.
+                # This helps reduce eval noise on imbalanced splits.
+                try:
+                    eval_use_rs = getattr(cfg_eval, "eval_use_random_sampling", None)
+                    if eval_use_rs is not None and hasattr(cfg_eval, "env_args"):
+                        cfg_eval.env_args.use_random_sampling = bool(eval_use_rs)
+                except Exception:
+                    pass
+                # Build a new runner/env for evaluation, but reuse the same MAC (model weights)
+                eval_runner = r_REGISTRY[cfg_eval.runner](cfg_eval, logger)
+                # reuse same scheme/groups/mac
+                eval_runner.setup(getattr(runner, "scheme", None), getattr(runner, "groups", None), getattr(runner, "preprocess", None), getattr(runner, "mac", None))
+                cache[eval_split] = eval_runner
+            logger.info(f"[Eval] Using eval_dataset_split='{eval_split}' (train split='{getattr(getattr(config, 'env_args', SimpleNamespace()), 'dataset_split', None)}').")
+        except Exception as e:
+            logger.warning(f"Failed to create eval runner for split='{eval_split}', fallback to training runner: {e}")
+            eval_runner = runner
+
     returns: List[float] = []
     # core-user metrics
     core_action_type_acc: List[float] = []
@@ -476,6 +782,12 @@ def run_test(runner, logger, config: SimpleNamespace):
     # secondary-user belief metrics
     z_kl_list: List[float] = []
     z_eval_steps: int = 0
+
+    # HF stance-id eval (per-class stats on eval split)
+    stance_k = 3
+    stance_gt_counts = [0 for _ in range(stance_k)]
+    stance_pred_counts = [0 for _ in range(stance_k)]
+    stance_correct_counts = [0 for _ in range(stance_k)]
     
     def _is_boxed_int(s: Any) -> bool:
         """Return True if string contains a \\boxed{<int>} (allows whitespace)."""
@@ -487,15 +799,29 @@ def run_test(runner, logger, config: SimpleNamespace):
         except Exception:
             return False
 
+    def _parse_boxed_int(s: Any) -> Optional[int]:
+        try:
+            import re
+            if not isinstance(s, str):
+                return None
+            m = re.search(r"\\boxed\{\s*([-+]?\d+)\s*\}", s)
+            if not m:
+                m = re.search(r"boxed\{\s*([-+]?\d+)\s*\}", s)
+            if not m:
+                return None
+            return int(m.group(1))
+        except Exception:
+            return None
+
     for _ in range(test_episodes):
-        episode_batch = runner.run(test_mode=True)
+        episode_batch = eval_runner.run(test_mode=True)
         if episode_batch is not None:
             # === return ===
             episode_return = float(episode_batch["reward"].sum().item())
             returns.append(episode_return)
 
             # === task-specific evaluation from env infos ===
-            env_infos = getattr(runner, "last_env_infos", None)
+            env_infos = getattr(eval_runner, "last_env_infos", None)
             if not isinstance(env_infos, list) or not env_infos:
                 continue
 
@@ -564,6 +890,18 @@ def run_test(runner, logger, config: SimpleNamespace):
                     except Exception:
                         sum_txt += 0.0
 
+                    # Also compute per-class stance stats on eval split (boxed ids)
+                    try:
+                        gt = _parse_boxed_int(info.get("ground_truth_answer", "")) or _parse_boxed_int(info.get("ground_truth", ""))
+                        pr = _parse_boxed_int(info.get("llm_answer", ""))
+                        if gt is not None and pr is not None and 0 <= int(gt) < stance_k and 0 <= int(pr) < stance_k:
+                            stance_gt_counts[int(gt)] += 1
+                            stance_pred_counts[int(pr)] += 1
+                            if int(gt) == int(pr):
+                                stance_correct_counts[int(gt)] += 1
+                    except Exception:
+                        pass
+
                 # secondary: stage boundary evaluation (z_mask == 1)
                 try:
                     z_mask = float(info.get("z_mask", 0.0))
@@ -591,15 +929,62 @@ def run_test(runner, logger, config: SimpleNamespace):
 
     z_kl = float(np.mean(z_kl_list)) if z_kl_list else 0.0
     
+    # Per-class stance metrics on eval split (HF schema only; best-effort)
+    stance_total_gt = float(sum(stance_gt_counts))
+    stance_total_pred = float(sum(stance_pred_counts))
+    stance_gt_frac = [float(c) / stance_total_gt if stance_total_gt > 0 else float("nan") for c in stance_gt_counts]
+    stance_pred_frac = [float(c) / stance_total_pred if stance_total_pred > 0 else float("nan") for c in stance_pred_counts]
+    stance_has_gt = [1.0 if stance_gt_counts[i] > 0 else 0.0 for i in range(stance_k)]
+    stance_has_pred = [1.0 if stance_pred_counts[i] > 0 else 0.0 for i in range(stance_k)]
+    stance_recall = [
+        (float(stance_correct_counts[i]) / float(stance_gt_counts[i])) if stance_gt_counts[i] > 0 else 0.0
+        for i in range(stance_k)
+    ]
+    stance_precision = [
+        (float(stance_correct_counts[i]) / float(stance_pred_counts[i])) if stance_pred_counts[i] > 0 else 0.0
+        for i in range(stance_k)
+    ]
+
     return {
         "test_return_mean": avg_return,
         "test_success_rate": success_rate,
         "test_episodes": len(returns),
+        # Note: string metadata is printed in console logs; TB only logs numeric stats
+        "eval_dataset_split": eval_split or str(getattr(getattr(config, "env_args", SimpleNamespace()), "dataset_split", "train")),
         # core user evaluation (next-step prediction)
         "core_action_type_acc": core_at,
         "core_stance_acc": core_st,
         "core_text_sim": core_txt,
         "core_eval_steps_mean": avg_core_steps,
+        # stance per-class metrics (eval split)
+        "stance_gt0_frac": float(stance_gt_frac[0]) if len(stance_gt_frac) > 0 else float("nan"),
+        "stance_gt1_frac": float(stance_gt_frac[1]) if len(stance_gt_frac) > 1 else float("nan"),
+        "stance_gt2_frac": float(stance_gt_frac[2]) if len(stance_gt_frac) > 2 else float("nan"),
+        "stance_pred0_frac": float(stance_pred_frac[0]) if len(stance_pred_frac) > 0 else float("nan"),
+        "stance_pred1_frac": float(stance_pred_frac[1]) if len(stance_pred_frac) > 1 else float("nan"),
+        "stance_pred2_frac": float(stance_pred_frac[2]) if len(stance_pred_frac) > 2 else float("nan"),
+        "stance_recall0": float(stance_recall[0]) if len(stance_recall) > 0 else float("nan"),
+        "stance_recall1": float(stance_recall[1]) if len(stance_recall) > 1 else float("nan"),
+        "stance_recall2": float(stance_recall[2]) if len(stance_recall) > 2 else float("nan"),
+        "stance_precision0": float(stance_precision[0]) if len(stance_precision) > 0 else float("nan"),
+        "stance_precision1": float(stance_precision[1]) if len(stance_precision) > 1 else float("nan"),
+        "stance_precision2": float(stance_precision[2]) if len(stance_precision) > 2 else float("nan"),
+        # counts + validity flags (helps interpret recall/precision)
+        "stance_gt0_count": float(stance_gt_counts[0]) if len(stance_gt_counts) > 0 else 0.0,
+        "stance_gt1_count": float(stance_gt_counts[1]) if len(stance_gt_counts) > 1 else 0.0,
+        "stance_gt2_count": float(stance_gt_counts[2]) if len(stance_gt_counts) > 2 else 0.0,
+        "stance_pred0_count": float(stance_pred_counts[0]) if len(stance_pred_counts) > 0 else 0.0,
+        "stance_pred1_count": float(stance_pred_counts[1]) if len(stance_pred_counts) > 1 else 0.0,
+        "stance_pred2_count": float(stance_pred_counts[2]) if len(stance_pred_counts) > 2 else 0.0,
+        "stance_correct0_count": float(stance_correct_counts[0]) if len(stance_correct_counts) > 0 else 0.0,
+        "stance_correct1_count": float(stance_correct_counts[1]) if len(stance_correct_counts) > 1 else 0.0,
+        "stance_correct2_count": float(stance_correct_counts[2]) if len(stance_correct_counts) > 2 else 0.0,
+        "stance_has_gt0": float(stance_has_gt[0]) if len(stance_has_gt) > 0 else 0.0,
+        "stance_has_gt1": float(stance_has_gt[1]) if len(stance_has_gt) > 1 else 0.0,
+        "stance_has_gt2": float(stance_has_gt[2]) if len(stance_has_gt) > 2 else 0.0,
+        "stance_has_pred0": float(stance_has_pred[0]) if len(stance_has_pred) > 0 else 0.0,
+        "stance_has_pred1": float(stance_has_pred[1]) if len(stance_has_pred) > 1 else 0.0,
+        "stance_has_pred2": float(stance_has_pred[2]) if len(stance_has_pred) > 2 else 0.0,
         # secondary belief evaluation
         "secondary_z_kl": z_kl,
         "secondary_z_eval_steps": int(z_eval_steps),

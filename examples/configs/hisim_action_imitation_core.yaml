@@ -1,0 +1,109 @@
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# Stage3b: Core Action Policy Imitation (offline behavior cloning)
+# Goal: learn core-user action_type (5-way) conditioned on (frozen) belief representations.
+
+t_max: 50000
+test_interval: 2000
+test_nepisode: 2000
+eval_dataset_split: "test"
+
+n_agents: 3
+belief_dim: 128
+batch_size_run: 1
+
+# 5-way action policy head
+n_actions: 5
+env_action_source: "discrete_action_boxed"
+
+# Offline only
+enable_llm_rollout: false
+together_api_key: ""
+coordinator_model: "gpt-4.1"
+executor_model: "gpt-4.1"
+llm_model_name: "gpt2"
+
+# === Supervised imitation ===
+train_belief_supervised: true
+supervised_metric_prefix: "action_sup"
+use_mixer: false
+belief_supervised_use_soft_labels: false
+belief_supervised_micro_batch_size: 4
+
+# Freeze belief modules; train only action_type_head (implemented in q_learner via train_action_imitation)
+freeze_belief_encoder_in_supervised: true
+train_action_imitation: true
+
+# ===== LRs / regularizers =====
+lr: 0.0003
+belief_net_lr: 0.0003
+encoder_lr: 0.0
+mixer_lr: 0.0
+weight_decay: 0.0
+lambda_sd: 0.0
+lambda_m: 0.0
+
+arch:
+  entity_dim: 256
+  attention_heads: 4
+  transformer_blocks: 2
+  key_dim: 64
+  mlp_hidden_size: 256
+  feedforward_size: 1024
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.00001
+
+prompt_attention_heads: 2
+commitment_embedding_dim: 1024
+
+env: "huggingface_dataset_env"
+env_args:
+  # Point this to the action imitation dataset you exported via convert_hisim_to_econ_dataset.py
+  # (must contain: question/answer (\\boxed{action_id}), is_core_user=True)
+  hf_dataset_path:
+    - "/home/zhuyinzhou/MAS/ECON/data/hisim_action_imitation_dataset_metoo_e1"
+    - "/home/zhuyinzhou/MAS/ECON/data/hisim_action_imitation_dataset_metoo_e2"
+  dataset_split: "train"
+  question_field_name: "question"
+  answer_field_name: "answer"
+  max_question_length: 512
+  max_answer_length: 32
+  dataset_streaming: false
+  use_random_sampling: true
+  verbose_step_logging: false
+  # core only (safety)
+  filter_is_core_user: "core"
+  # action imitation A=5
+  n_actions: 5
+
+# No reward / RL signals
+reward:
+  al_weight: 0.0
+  ts_weight: 0.0
+  cc_weight: 0.0
+
+train:
+  buffer_size: 256
+  batch_size: 64
+  update_interval: 1
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: false
+
+logging:
+  use_tensorboard: true
+  log_interval: 50
+  save_model: true
+  save_model_interval: 5000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-action-imitation-core"

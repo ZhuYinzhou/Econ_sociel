@@ -104,6 +104,8 @@ class LLMBasicMAC:
             population_update_hidden_dim=getattr(args, "population_update_hidden_dim", 128),
             population_update_use_group_repr=getattr(args, "population_update_use_group_repr", True),
             population_update_use_stage=getattr(args, "population_update_use_stage", False),
+            population_update_use_extra_cond=getattr(args, "population_update_use_extra_cond", False),
+            population_update_extra_cond_dim=getattr(args, "population_update_extra_cond_dim", 0),
             population_update_residual_mixing=getattr(args, "population_update_residual_mixing", True),
             population_update_mixing_init=getattr(args, "population_update_mixing_init", 0.5),
             population_update_mixing_learnable=getattr(args, "population_update_mixing_learnable", True),
@@ -223,6 +225,16 @@ class LLMBasicMAC:
             pad_token_id = 50256  # GPT2's eos_token_id
             
         mask = (inputs == pad_token_id)
+        # Safety: avoid the "all-masked" case (e.g., empty text + pad_token==eos) which can
+        # produce NaNs inside attention (all positions masked -> softmax over all -inf).
+        try:
+            if isinstance(mask, torch.Tensor) and mask.ndim == 2:
+                all_masked = mask.all(dim=1)  # (bs*n_agents,)
+                if bool(all_masked.any().item()):
+                    # Unmask a single position so downstream models always have at least one valid token
+                    mask[all_masked, 0] = False
+        except Exception:
+            pass
         
         return inputs, mask
 
@@ -273,12 +285,83 @@ class LLMBasicMAC:
                 strategy = self._get_strategy(raw_observation_text)
             
             # Get executor responses
+            # Social-mode: align credit assignment by forcing LLM to output the policy-chosen action_type (+ stance_id).
             executor_responses = []
+            forced_action_types = []
+            forced_stance_ids = []
+            action_type_names = ["post", "retweet", "reply", "like", "do_nothing"]
+            stance_actions = {"post", "retweet", "reply"}
+
+            # chosen_actions: typically (bs, n_agents) or (n_agents,)
+            ca = chosen_actions
+            try:
+                if isinstance(ca, torch.Tensor) and ca.ndim >= 2:
+                    ca0 = ca[0]
+                else:
+                    ca0 = ca
+            except Exception:
+                ca0 = ca
+
+            # stance logits from stance head (3-way) if available: (bs, n_agents, 3)
+            stance_q = agent_info.get("stance_action_q_values")
+            try:
+                if isinstance(stance_q, torch.Tensor) and stance_q.ndim >= 3:
+                    stance_q0 = stance_q[0]
+                else:
+                    stance_q0 = stance_q
+            except Exception:
+                stance_q0 = stance_q
+
             for agent_id in range(self.n_agents):
-                response = self.agent.generate_answer(
-                    question=raw_observation_text, 
-                    strategy=strategy
-                )
+                forced_at = "do_nothing"
+                forced_sid = None
+
+                # force action_type from discrete policy (5-way)
+                try:
+                    if isinstance(ca0, torch.Tensor):
+                        aid = int(ca0[agent_id].item()) if ca0.numel() > agent_id else 4
+                    elif isinstance(ca0, (list, tuple)):
+                        aid = int(ca0[agent_id]) if agent_id < len(ca0) else 4
+                    else:
+                        aid = int(ca0)
+                    if 0 <= aid < len(action_type_names):
+                        forced_at = action_type_names[aid]
+                except Exception:
+                    forced_at = "do_nothing"
+
+                # force stance_id from stance head (3-way) ONLY when action expresses stance
+                if forced_at in stance_actions:
+                    try:
+                        if isinstance(stance_q0, torch.Tensor) and stance_q0.ndim == 2 and stance_q0.shape[0] > agent_id:
+                            forced_sid = int(stance_q0[agent_id].argmax(dim=-1).item())
+                        else:
+                            forced_sid = 0
+                    except Exception:
+                        forced_sid = 0
+
+                forced_action_types.append(forced_at)
+                forced_stance_ids.append(forced_sid)
+
+                # Call executor
+                if is_social:
+                    # Be robust to agents that don't accept forced_* kwargs
+                    try:
+                        response = self.agent.generate_answer(
+                            question=raw_observation_text,
+                            strategy=strategy,
+                            forced_action_type=forced_at,
+                            forced_stance_id=forced_sid,
+                        )
+                    except TypeError:
+                        response = self.agent.generate_answer(
+                            question=raw_observation_text,
+                            strategy=strategy,
+                        )
+                else:
+                    response = self.agent.generate_answer(
+                        question=raw_observation_text,
+                        strategy=strategy,
+                    )
                 executor_responses.append(response)
 
             if is_social:
@@ -288,6 +371,8 @@ class LLMBasicMAC:
                     "strategy": strategy,
                     "llm_responses": executor_responses,
                     "executor_responses": executor_responses,
+                    "forced_action_types": forced_action_types,
+                    "forced_stance_ids": forced_stance_ids,
                     "commitment": "",
                     "commitment_text": "",
                     "commitment_embedding": None
@@ -342,8 +427,15 @@ class LLMBasicMAC:
         prompt_embeddings = agent_outs.get('prompt_embedding', torch.zeros(batch_size * self.n_agents, 2, device=self.device))
         # local scalar Q_i^t
         q_values = agent_outs.get('q_value', torch.zeros(batch_size * self.n_agents, 1, device=self.device))
-        # optional discrete-action Q-values (for multinomial selector), shape expected: (bs*n_agents, n_actions)
+        # optional discrete-action Q-values (for multinomial selector)
+        # NOTE: to avoid Stage1(stance=3) and Stage4(action_type=5) head conflicts,
+        # the agent may output multiple heads:
+        # - stance_action_q_values: (bs*n_agents, 3)
+        # - action_type_q_values: (bs*n_agents, 5)
+        # - action_q_values: backward-compat default (usually action_type)
         action_q_values = agent_outs.get('action_q_values')
+        stance_action_q_values = agent_outs.get('stance_action_q_values')
+        action_type_q_values = agent_outs.get('action_type_q_values')
         
         # Reshape from (batch_size * n_agents, feature_dim) to (batch_size, n_agents, feature_dim)
         belief_states = belief_states.view(batch_size, self.n_agents, -1)
@@ -353,6 +445,10 @@ class LLMBasicMAC:
         q_values_scalar = q_values.squeeze(-1) if isinstance(q_values, torch.Tensor) and q_values.shape[-1] == 1 else q_values
         if isinstance(action_q_values, torch.Tensor):
             action_q_values = action_q_values.view(batch_size, self.n_agents, -1)
+        if isinstance(stance_action_q_values, torch.Tensor):
+            stance_action_q_values = stance_action_q_values.view(batch_size, self.n_agents, -1)
+        if isinstance(action_type_q_values, torch.Tensor):
+            action_type_q_values = action_type_q_values.view(batch_size, self.n_agents, -1)
         
         # Generate group representation using BeliefEncoder
         # 对 HiSim social：显式注入 population belief（边缘用户 latent z）与 stage_t
@@ -439,9 +535,21 @@ class LLMBasicMAC:
         # Default: use scalar q_values if we only have 1 action
         agent_outputs = q_values  # (bs, n_agents, 1)
 
-        # Prefer action_q_values if it exists and can be aligned to n_avail
-        if isinstance(action_q_values, torch.Tensor):
-            aq = action_q_values
+        # Prefer the correct discrete head based on n_avail:
+        # - n_avail==3: stance head (Stage1/2 HF datasets)
+        # - n_avail==5: action_type head (Stage4 social simulation, if using discrete selector)
+        # Otherwise: fall back to generic action_q_values.
+        aq_src = None
+        if n_avail == 3 and isinstance(stance_action_q_values, torch.Tensor):
+            aq_src = stance_action_q_values
+        elif n_avail == 5 and isinstance(action_type_q_values, torch.Tensor):
+            aq_src = action_type_q_values
+        elif isinstance(action_q_values, torch.Tensor):
+            aq_src = action_q_values
+
+        # Prefer selected discrete-action Q-values if it exists and can be aligned to n_avail
+        if isinstance(aq_src, torch.Tensor):
+            aq = aq_src
             if aq.ndim == 2:
                 aq = aq.unsqueeze(0)
             # align last dim to n_avail (slice/pad) to avoid shape mismatch
@@ -463,6 +571,8 @@ class LLMBasicMAC:
             # NOTE: keep learner-facing q_values as (bs, n_agents) if available
             "q_values": q_values_scalar,
             "action_q_values": action_q_values if isinstance(action_q_values, torch.Tensor) else None,
+            "stance_action_q_values": stance_action_q_values if isinstance(stance_action_q_values, torch.Tensor) else None,
+            "action_type_q_values": action_type_q_values if isinstance(action_type_q_values, torch.Tensor) else None,
             "group_repr": group_representation,
             # optional: for env-side secondary user simulation
             "secondary_z_next": secondary_z_next,

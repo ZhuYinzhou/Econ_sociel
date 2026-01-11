@@ -95,6 +95,15 @@ class EpisodeRunner:
         self.test_stats = {}
         # store raw env step infos for the most recent episode (useful for task-specific evaluation)
         self.last_env_infos: List[Dict[str, Any]] = []
+
+        # ===== Debug: forced-vs-parsed alignment (Stage4 social credit assignment) =====
+        # We print ONCE (per process) when debug is enabled, to verify that env-consumed JSON
+        # matches the policy-forced action_type/stance_id.
+        self._forced_align_printed = False
+        self._forced_align_action_n = 0
+        self._forced_align_action_ok = 0
+        self._forced_align_stance_n = 0
+        self._forced_align_stance_ok = 0
         
         # Episode management
         self.episode_limit = 1  # Single step per episode for LLM environments
@@ -288,6 +297,56 @@ class EpisodeRunner:
                 if isinstance(env_step_info, dict):
                     self.last_env_infos.append(env_step_info)
 
+                # ---- Debug: forced vs parsed alignment (print once) ----
+                try:
+                    dbg = bool(getattr(getattr(self.args, "system", None), "debug", False))
+                    env_name = str(getattr(self.args, "env", "") or "").strip().lower()
+                    if dbg and (not self._forced_align_printed) and env_name == "hisim_social_env":
+                        f_at = None
+                        f_sid = None
+                        try:
+                            fat_list = mac_extra_info.get("forced_action_types")
+                            fsid_list = mac_extra_info.get("forced_stance_ids")
+                            if isinstance(fat_list, list) and len(fat_list) > 0:
+                                f_at = str(fat_list[0])
+                            if isinstance(fsid_list, list) and len(fsid_list) > 0:
+                                f_sid = fsid_list[0]
+                        except Exception:
+                            f_at = None
+                            f_sid = None
+
+                        parsed_at = env_step_info.get("action_type") if isinstance(env_step_info, dict) else None
+                        parsed_sid = env_step_info.get("pred_stance_id") if isinstance(env_step_info, dict) else None
+
+                        if f_at is not None and parsed_at is not None:
+                            self._forced_align_action_n += 1
+                            if str(f_at) == str(parsed_at):
+                                self._forced_align_action_ok += 1
+
+                        stance_actions = {"post", "retweet", "reply"}
+                        if f_at is not None and str(f_at) in stance_actions and (f_sid is not None) and (parsed_sid is not None):
+                            self._forced_align_stance_n += 1
+                            try:
+                                if int(f_sid) == int(parsed_sid):
+                                    self._forced_align_stance_ok += 1
+                            except Exception:
+                                pass
+
+                        # Print once after enough samples (or near episode end).
+                        thr = int(getattr(self.args, "forced_align_log_after", 50))
+                        thr = max(1, thr)
+                        if (self._forced_align_action_n >= thr) or bool(terminated):
+                            ar = self._forced_align_action_ok / float(max(1, self._forced_align_action_n))
+                            sr = self._forced_align_stance_ok / float(max(1, self._forced_align_stance_n)) if self._forced_align_stance_n > 0 else float("nan")
+                            sr_str = f"{sr:.3f}" if (sr == sr) else "nan"
+                            self.logger.info(
+                                f"[Debug][forced-align] action_type align: {self._forced_align_action_ok}/{self._forced_align_action_n}={ar:.3f} | "
+                                f"stance_id align (stance-actions only): {self._forced_align_stance_ok}/{self._forced_align_stance_n}={sr_str}"
+                            )
+                            self._forced_align_printed = True
+                except Exception:
+                    pass
+
                 reward_ts = env_step_info.get("reward_ts", 0.0)
                 reward_al = env_step_info.get("reward_al", 0.0)
                 reward_cc = env_step_info.get("reward_cc", 0.0)
@@ -322,6 +381,19 @@ class EpisodeRunner:
                 )
                 self.batch.update(post_data, ts=self.t)
                 self.t += 1
+                # Maintain a true global environment-step counter used by action selection schedules.
+                # Previously this runner never incremented t_env, causing epsilon schedules to stay at start.
+                try:
+                    self.t_env += 1
+                except Exception:
+                    self.t_env = int(getattr(self, "t_env", 0)) + 1
+                # Best-effort epsilon schedule update (multinomial selector supports epsilon_decay).
+                try:
+                    sel = getattr(getattr(self.mac, "action_selector", None), "epsilon_decay", None)
+                    if callable(sel):
+                        sel(int(self.t_env))
+                except Exception:
+                    pass
 
             if not test_mode:
                 self._handle_episode_end(metrics, episode_return, test_mode)
@@ -454,6 +526,32 @@ class EpisodeRunner:
         except Exception as e:
             self.logger.debug(f"Failed to parse gt_action from env_info: {e}")
 
+        # === offline supervised soft label distribution (HF dataset) ===
+        # Prefer env_info["target_distribution_prob"] which is a dict like {"0":0.2,"1":0.1,"2":0.7}
+        try:
+            if isinstance(env_info, dict) and "target_distribution_prob" in env_info:
+                na = int(self.env_info.get("n_actions", 1))
+                na = max(1, na)
+                dist = env_info.get("target_distribution_prob")
+                arr = [0.0 for _ in range(na)]
+                if isinstance(dist, dict):
+                    for k, v in dist.items():
+                        try:
+                            idx = int(k)
+                            if 0 <= idx < na:
+                                arr[idx] = float(v)
+                        except Exception:
+                            continue
+                elif isinstance(dist, (list, tuple)):
+                    for i, x in enumerate(list(dist)[:na]):
+                        try:
+                            arr[i] = float(x)
+                        except Exception:
+                            arr[i] = 0.0
+                post_data_dict["gt_action_dist"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to parse gt_action_dist from env_info: {e}")
+
         # === belief inputs (explicit, tensorized) ===
         # env_info may contain: belief_inputs_pre / belief_inputs_post (dict)
         try:
@@ -507,6 +605,46 @@ class EpisodeRunner:
                 post_data_dict["z_mask"] = torch.tensor([float(z_mask)], dtype=torch.float32, device=self.args.device)
         except Exception as e:
             self.logger.warning(f"Failed to add z supervision fields to batch: {e}")
+
+        # === optional: structured conditioning fields for z_transition (global, from env_info) ===
+        # These are passthrough fields from HuggingFaceDatasetEnv samples.
+        try:
+            if isinstance(env_info, dict):
+                if "core_stance_id_t" in env_info:
+                    post_data_dict["core_stance_id_t"] = torch.tensor([int(env_info.get("core_stance_id_t", -1))], dtype=torch.int64, device=self.args.device)
+                if "core_action_type_id_t" in env_info:
+                    post_data_dict["core_action_type_id_t"] = torch.tensor([int(env_info.get("core_action_type_id_t", -1))], dtype=torch.int64, device=self.args.device)
+                if "has_user_history" in env_info:
+                    post_data_dict["has_user_history"] = torch.tensor([int(env_info.get("has_user_history", 0))], dtype=torch.int64, device=self.args.device)
+                if "has_neighbors" in env_info:
+                    post_data_dict["has_neighbors"] = torch.tensor([int(env_info.get("has_neighbors", 0))], dtype=torch.int64, device=self.args.device)
+                if "neighbor_action_type_counts_t" in env_info:
+                    v = env_info.get("neighbor_action_type_counts_t")
+                    if isinstance(v, dict):
+                        order = ["post", "retweet", "reply", "like", "do_nothing"]
+                        arr = [float(v.get(k, 0.0)) for k in order]
+                    elif isinstance(v, (list, tuple)):
+                        arr = [float(x) for x in list(v)[:5]]
+                        if len(arr) < 5:
+                            arr = arr + [0.0] * (5 - len(arr))
+                    else:
+                        arr = [0.0, 0.0, 0.0, 0.0, 0.0]
+                    post_data_dict["neighbor_action_type_counts_t"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+                if "neighbor_stance_counts_t" in env_info:
+                    v = env_info.get("neighbor_stance_counts_t")
+                    if isinstance(v, dict):
+                        # stance order fixed to [Neutral,Oppose,Support] -> [0,1,2]
+                        order = ["Neutral", "Oppose", "Support"]
+                        arr = [float(v.get(k, 0.0)) for k in order]
+                    elif isinstance(v, (list, tuple)):
+                        arr = [float(x) for x in list(v)[:3]]
+                        if len(arr) < 3:
+                            arr = arr + [0.0] * (3 - len(arr))
+                    else:
+                        arr = [0.0, 0.0, 0.0]
+                    post_data_dict["neighbor_stance_counts_t"] = torch.tensor(arr, dtype=torch.float32, device=self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to add structured conditioning fields to batch: {e}")
 
         if commitment_embedding is not None:
             if commitment_embedding.ndim == 1: 
@@ -665,6 +803,8 @@ class EpisodeRunner:
             # === offline supervised label (global) ===
             # For HuggingFaceDatasetEnv stance-id training: ground-truth \\boxed{<id>} parsed to int.
             "gt_action": {"vshape": (1,), "dtype": torch.int64},
+            # Optional soft-label distribution over stance ids (aligned to env_info["n_actions"])
+            "gt_action_dist": {"vshape": (self.env_info.get("n_actions", 1),), "dtype": torch.float32},
             # latent z supervision (global)
             "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},
@@ -682,6 +822,13 @@ class EpisodeRunner:
             "belief_post_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
             "belief_post_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
             "belief_post_is_core_user": {"vshape": (1,), "dtype": torch.int64},
+            # === optional structured conditioning for z_transition (global) ===
+            "core_stance_id_t": {"vshape": (1,), "dtype": torch.int64},
+            "core_action_type_id_t": {"vshape": (1,), "dtype": torch.int64},
+            "has_user_history": {"vshape": (1,), "dtype": torch.int64},
+            "has_neighbors": {"vshape": (1,), "dtype": torch.int64},
+            "neighbor_action_type_counts_t": {"vshape": (5,), "dtype": torch.float32},
+            "neighbor_stance_counts_t": {"vshape": (3,), "dtype": torch.float32},
         }
         return scheme
 

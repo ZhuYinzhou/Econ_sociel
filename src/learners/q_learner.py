@@ -125,6 +125,61 @@ class ECONLearner:
                 except Exception as e:
                     self.logger.warning(f"Failed to freeze BeliefEncoder params in supervised mode: {e}")
 
+            # Stage3a: train ONLY population_update_head (+ stage_embed / mixing gate) for z_transition
+            # This keeps group_repr mapping fixed and avoids unintended updates to the whole encoder/agent.
+            if self.train_encoder_only and bool(getattr(args, "train_population_update_head_only", False)):
+                try:
+                    # 1) Freeze all encoder params first
+                    for p in self.belief_encoder.parameters():
+                        p.requires_grad = False
+
+                    # 2) Unfreeze population_update_head
+                    puh = getattr(self.belief_encoder, "population_update_head", None)
+                    if puh is None:
+                        raise RuntimeError("train_population_update_head_only=True but belief_encoder.population_update_head is None")
+                    for p in puh.parameters():
+                        p.requires_grad = True
+
+                    # 3) Unfreeze stage_embed if the head uses stage conditioning
+                    if bool(getattr(self.belief_encoder, "population_update_use_stage", False)):
+                        se = getattr(self.belief_encoder, "stage_embed", None)
+                        if se is None:
+                            raise RuntimeError(
+                                "population_update_use_stage=True but belief_encoder.stage_embed is None. "
+                                "Please ensure BeliefEncoder initializes stage_embed when stage conditioning is enabled."
+                            )
+                        for p in se.parameters():
+                            p.requires_grad = True
+
+                    # 4) Unfreeze mixing gate parameter if present (part of the update head dynamics)
+                    mix_logit = getattr(self.belief_encoder, "population_update_mix_logit", None)
+                    if isinstance(mix_logit, torch.nn.Parameter):
+                        mix_logit.requires_grad = True
+
+                    self.logger.info("Stage3a: Froze encoder except population_update_head (+stage_embed/+mix gate).")
+                except Exception as e:
+                    self.logger.warning(f"Stage3a: Failed to apply train_population_update_head_only freezing: {e}")
+
+                # Also freeze agent to avoid wasting memory on gradients (encoder-only stage doesn't need it)
+                try:
+                    agent = getattr(self.mac, "agent", None)
+                    if agent is not None and hasattr(agent, "parameters"):
+                        for p in agent.parameters():
+                            p.requires_grad = False
+                        self.logger.info("Stage3a: Froze mac.agent parameters (encoder-only head training).")
+                except Exception as e:
+                    self.logger.warning(f"Stage3a: Failed to freeze mac.agent params: {e}")
+
+            # Stage4 RL recommended freezing knobs (backward-compatible: default False)
+            # - freeze_belief_encoder_in_rl: keep representation + z_transition stable under noisy reward
+            if (not self.train_belief_supervised) and (not self.train_encoder_only) and bool(getattr(args, "freeze_belief_encoder_in_rl", False)):
+                try:
+                    for p in self.belief_encoder.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Stage4: Froze BeliefEncoder parameters in RL mode.")
+                except Exception as e:
+                    self.logger.warning(f"Stage4: Failed to freeze BeliefEncoder in RL: {e}")
+
             # Track only trainable params for optimizers/clipping
             self.encoder_params = [p for p in self.belief_encoder.parameters() if p.requires_grad]
             self.target_belief_encoder = copy.deepcopy(self.belief_encoder)
@@ -157,6 +212,48 @@ class ECONLearner:
         else:
             self.logger.error("ECONLearner: Could not find belief_network parameters in MAC structure. BeliefNetwork losses might not work.")
 
+        # Stage4 RL recommended freezing knobs for agent parts (backward-compatible defaults)
+        if (not self.train_belief_supervised) and (not self.train_encoder_only):
+            agent = getattr(self.mac, "agent", None)
+            try:
+                if bool(getattr(args, "freeze_belief_network_in_rl", False)) and agent is not None and hasattr(agent, "belief_network") and agent.belief_network is not None:
+                    for p in agent.belief_network.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Stage4: Froze agent.belief_network parameters in RL mode.")
+            except Exception as e:
+                self.logger.warning(f"Stage4: Failed to freeze belief_network in RL: {e}")
+            try:
+                if bool(getattr(args, "freeze_stance_head_in_rl", False)) and agent is not None and hasattr(agent, "stance_head") and agent.stance_head is not None:
+                    for p in agent.stance_head.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Stage4: Froze agent.stance_head parameters in RL mode.")
+            except Exception as e:
+                self.logger.warning(f"Stage4: Failed to freeze stance_head in RL: {e}")
+            try:
+                if bool(getattr(args, "freeze_action_type_head_in_rl", False)) and agent is not None and hasattr(agent, "action_type_head") and agent.action_type_head is not None:
+                    for p in agent.action_type_head.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Stage4: Froze agent.action_type_head parameters in RL mode.")
+            except Exception as e:
+                self.logger.warning(f"Stage4: Failed to freeze action_type_head in RL: {e}")
+
+        # Stage4 RL: train discrete policy heads (action_type_head / stance_head) with TD-style objectives.
+        # Without this, the action heads may never receive optimizer updates in RL mode.
+        try:
+            train_heads_rl = bool(getattr(args, "train_policy_heads_in_rl", True))
+            if train_heads_rl and (not self.train_belief_supervised) and (not self.train_encoder_only):
+                agent = getattr(self.mac, "agent", None)
+                if agent is not None:
+                    # action_type_head is the 5-way action policy (post/retweet/reply/like/do_nothing)
+                    if hasattr(agent, "action_type_head") and getattr(agent, "action_type_head") is not None:
+                        self.belief_net_params.extend(list(agent.action_type_head.parameters()))
+                    # stance_head predicts stance_id (3-way) when action expresses stance; optional in RL
+                    if bool(getattr(args, "train_stance_head_in_rl", True)):
+                        if hasattr(agent, "stance_head") and getattr(agent, "stance_head") is not None:
+                            self.belief_net_params.extend(list(agent.stance_head.parameters()))
+        except Exception as e:
+            self.logger.warning(f"Failed to include policy head params for RL training: {e}")
+
         # Initialize Optimizers
         self.belief_optimizer = None
         if self.belief_net_params:
@@ -176,6 +273,16 @@ class ECONLearner:
         
         self.mixer_optimizer = None
         if self.mixer_params and self.mixer:
+            # Optional: freeze mixer in RL (backward-compatible default False)
+            if (not self.train_belief_supervised) and (not self.train_encoder_only) and bool(getattr(args, "freeze_mixer_in_rl", False)):
+                try:
+                    for p in self.mixer.parameters():
+                        p.requires_grad = False
+                    self.logger.info("Stage4: Froze mixer parameters in RL mode.")
+                except Exception as e:
+                    self.logger.warning(f"Stage4: Failed to freeze mixer in RL: {e}")
+                self.mixer_params = [p for p in self.mixer.parameters() if p.requires_grad]
+
             self.mixer_optimizer = Adam(
                 params=filter(lambda p: p.requires_grad, self.mixer_params),
                 lr=getattr(args, "mixer_lr", args.lr),
@@ -187,6 +294,33 @@ class ECONLearner:
             try:
                 agent = getattr(self.mac, "agent", None)
                 if agent is not None and hasattr(agent, "parameters"):
+                    # Stage3b: offline action imitation (behavior cloning)
+                    # Freeze belief-related modules and only train the 5-way action_type_head.
+                    if bool(getattr(args, "train_action_imitation", False)):
+                        try:
+                            # Freeze everything in agent first (safe default)
+                            for p in agent.parameters():
+                                p.requires_grad = False
+
+                            # Unfreeze action_type_head
+                            if hasattr(agent, "action_type_head") and getattr(agent, "action_type_head") is not None:
+                                for p in agent.action_type_head.parameters():
+                                    p.requires_grad = True
+                            else:
+                                raise RuntimeError("train_action_imitation=True but agent.action_type_head is missing/None")
+
+                            # Explicitly keep belief_network + stance_head frozen (clarity)
+                            if hasattr(agent, "belief_network") and getattr(agent, "belief_network") is not None:
+                                for p in agent.belief_network.parameters():
+                                    p.requires_grad = False
+                            if hasattr(agent, "stance_head") and getattr(agent, "stance_head") is not None:
+                                for p in agent.stance_head.parameters():
+                                    p.requires_grad = False
+
+                            self.logger.info("Stage3b: Froze mac.agent except action_type_head (offline action imitation).")
+                        except Exception as e:
+                            self.logger.warning(f"Stage3b: Failed to apply train_action_imitation freezing: {e}")
+
                     self.belief_supervised_optimizer = Adam(
                         params=filter(lambda p: p.requires_grad, agent.parameters()),
                         lr=getattr(args, "belief_net_lr", args.lr),
@@ -233,51 +367,211 @@ class ECONLearner:
             if hasattr(self.mac, 'init_hidden'):
                 self.mac.init_hidden(batch.batch_size)
 
+            # Optional: micro-batch the forward pass to reduce peak GPU memory.
+            # This is important when sequence length is large and effective batch is bs*n_agents.
+            try:
+                belief_sup_micro_bs = int(getattr(self.args, "belief_supervised_micro_batch_size", 0))
+            except Exception:
+                belief_sup_micro_bs = 0
+            belief_sup_micro_bs = max(0, belief_sup_micro_bs)
+
             # Supervised CE over timesteps
+            # Optional: class weights for imbalanced stance labels (e.g., [w0,w1,w2]).
+            # This is useful when accuracy plateaus at the majority-class ratio (e.g., ~0.76).
+            ce_weight = None
+            ce_weight_list = None
+            try:
+                w = getattr(self.args, "belief_supervised_class_weights", None)
+                if isinstance(w, (list, tuple)) and len(w) > 0:
+                    ce_weight_list = [float(x) for x in w]
+                    ce_weight = torch.tensor([float(x) for x in w], device=self.device, dtype=torch.float32)
+            except Exception:
+                ce_weight = None
+                ce_weight_list = None
+
             total_loss = torch.tensor(0.0, device=self.device)
             total_correct = 0.0
             total_count = 0.0
+            # Soft-label diagnostics (for verifying Scheme-B actually takes effect)
+            soft_available_steps = 0  # timesteps where gt_action_dist has any valid mass
+            soft_used_steps = 0       # timesteps where we actually used soft CE (not fallback hard CE)
+            soft_p1_sum = 0.0         # mean mass on class-1 across valid rows (helps detect Oppose signal)
+            soft_p_count = 0
+            # debug diagnostics (helps determine if model is actually learning)
+            dbg_entropy_sum = 0.0
+            dbg_entropy_count = 0
+            dbg_maxprob_sum = 0.0
+            dbg_maxprob_count = 0
+            dbg_logit_abs_sum = 0.0
+            dbg_logit_std_sum = 0.0
+            dbg_logit_count = 0
+            # debug: predicted/gt class distribution (helps detect majority-class collapse / argmax tie-to-0)
+            pred_counts = None  # type: ignore
+            gt_counts = None  # type: ignore
+            # debug: per-class correctness (helps diagnose "class-0 never predicted" vs "class-0 always wrong")
+            correct_counts = None  # type: ignore
+            # Zero grads once; we will backward through micro-batches and step once.
+            self.belief_supervised_optimizer.zero_grad()
+
             for t in range(batch.max_seq_length - 1):
-                # logits aligned to env avail_actions via BasicMAC.forward output
-                agent_logits, _info = self.mac.forward(batch, t, train_mode=True)
-                # agent_logits: (bs, n_agents, n_classes)
-                if not isinstance(agent_logits, torch.Tensor) or agent_logits.ndim != 3:
-                    continue
-                bs, na, nc = agent_logits.shape
+                bs_total = int(batch.batch_size)
+                if belief_sup_micro_bs <= 0 or belief_sup_micro_bs >= bs_total:
+                    spans = [(0, bs_total)]
+                else:
+                    spans = [(i, min(i + belief_sup_micro_bs, bs_total)) for i in range(0, bs_total, belief_sup_micro_bs)]
 
-                # target: global gt_action at this timestep
-                y = batch["gt_action"][:, t].to(self.device)  # (bs, 1) or (bs,)
-                if y.ndim > 1:
-                    y = y.view(bs)
-                # clamp to valid range (robust)
-                y = torch.clamp(y.long(), min=0, max=max(0, int(nc) - 1))
+                # global normalization across the full logical batch (exact gradient equivalence)
+                m_t_full = mask[:, t]
+                if m_t_full.ndim > 1:
+                    m_t_full = m_t_full.view(bs_total)
+                total_w = torch.clamp(m_t_full.float().sum() * float(self.args.n_agents), min=1.0).to(self.device)
 
-                # expand to per-agent targets
-                y_exp = y.unsqueeze(1).expand(bs, na).reshape(-1)  # (bs*na,)
-                logits_flat = agent_logits.reshape(bs * na, nc)
+                # Loss for logging (detached)
+                loss_t_val = 0.0
 
-                # weight by filled mask if available
-                m_t = mask[:, t]
-                if m_t.ndim > 1:
-                    m_t = m_t.view(bs)
-                w = m_t.float().unsqueeze(1).expand(bs, na).reshape(-1)  # (bs*na,)
-                # CE per sample then masked average
-                ce = F.cross_entropy(logits_flat, y_exp, reduction="none")  # (bs*na,)
-                denom = torch.clamp(w.sum(), min=1.0)
-                loss_t = (ce * w).sum() / denom
-                total_loss = total_loss + loss_t
+                for (s0, s1) in spans:
+                    b_slice = batch[slice(s0, s1)]
+                    agent_logits, _info = self.mac.forward(b_slice, t, train_mode=True)
+                    if not isinstance(agent_logits, torch.Tensor) or agent_logits.ndim != 3:
+                        continue
+                    if not torch.isfinite(agent_logits).all():
+                        self.logger.warning(f"belief_supervised: non-finite agent_logits at t={t}; skipping slice {s0}:{s1}.")
+                        continue
+                    bs, na, nc = agent_logits.shape
 
-                # accuracy (masked)
-                pred = logits_flat.argmax(dim=-1)
-                total_correct += float(((pred == y_exp).float() * w).sum().item())
-                total_count += float(w.sum().item())
+                    y = b_slice["gt_action"][:, t].to(self.device)
+                    if y.ndim > 1:
+                        y = y.view(bs)
+                    y = torch.clamp(y.long(), min=0, max=max(0, int(nc) - 1))
+
+                    y_exp = y.unsqueeze(1).expand(bs, na).reshape(-1)
+                    logits_flat = agent_logits.reshape(bs * na, nc)
+
+                    # Debug: entropy / confidence (no grad)
+                    try:
+                        with torch.no_grad():
+                            p = F.softmax(logits_flat, dim=-1)
+                            ent = (-p * torch.log(torch.clamp(p, min=1e-12))).sum(dim=-1)
+                            mx = p.max(dim=-1)[0]
+                            if torch.isfinite(ent).all():
+                                dbg_entropy_sum += float(ent.mean().item())
+                                dbg_entropy_count += 1
+                            if torch.isfinite(mx).all():
+                                dbg_maxprob_sum += float(mx.mean().item())
+                                dbg_maxprob_count += 1
+                            if torch.isfinite(logits_flat).all():
+                                dbg_logit_abs_sum += float(logits_flat.abs().mean().item())
+                                dbg_logit_std_sum += float(logits_flat.std(dim=-1).mean().item())
+                                dbg_logit_count += 1
+                    except Exception:
+                        pass
+
+                    m_t = m_t_full[s0:s1]
+                    w = m_t.float().unsqueeze(1).expand(bs, na).reshape(-1)
+
+                    use_soft = bool(getattr(self.args, "belief_supervised_use_soft_labels", False)) and ("gt_action_dist" in batch.scheme)
+                    if use_soft:
+                        # Soft CE sum (normalized by total_w for exactness)
+                        try:
+                            psl = b_slice["gt_action_dist"][:, t].to(self.device)
+                            if psl.ndim == 1:
+                                psl = psl.view(bs, -1)
+                            if psl.shape[-1] != nc:
+                                if psl.shape[-1] > nc:
+                                    psl = psl[:, :nc]
+                                else:
+                                    pad = torch.zeros(bs, nc - psl.shape[-1], device=self.device, dtype=psl.dtype)
+                                    psl = torch.cat([psl, pad], dim=-1)
+                            psl = torch.clamp(psl.float(), min=0.0)
+                            ps = psl.sum(dim=-1, keepdim=True)
+                            valid = (ps.squeeze(-1) > 0)
+                            if bool(valid.any().item()):
+                                soft_available_steps += 1
+                                try:
+                                    if nc > 1:
+                                        soft_p1_sum += float(psl[valid, 1].mean().item())
+                                        soft_p_count += 1
+                                except Exception:
+                                    pass
+                                psl = torch.where(ps > 0, psl / ps, torch.full_like(psl, 1.0 / float(nc)))
+                                p_exp = psl.unsqueeze(1).expand(bs, na, nc).reshape(bs * na, nc)
+                                logp = F.log_softmax(logits_flat, dim=-1)
+                                s_ce = -(p_exp * logp).sum(dim=-1)
+                                if torch.isfinite(s_ce).all():
+                                    loss_sum = (s_ce * w).sum()
+                                    (loss_sum / total_w).backward()
+                                    loss_t_val += float((loss_sum.detach() / total_w).item())
+                                    soft_used_steps += 1
+                                    loss_used = True
+                                else:
+                                    loss_used = False
+                            else:
+                                loss_used = False
+                        except Exception:
+                            loss_used = False
+                    else:
+                        loss_used = False
+
+                    if not loss_used:
+                        ce = F.cross_entropy(logits_flat, y_exp, reduction="none", weight=ce_weight)
+                        if not torch.isfinite(ce).all():
+                            self.logger.warning(f"belief_supervised: non-finite CE at t={t}; skipping slice {s0}:{s1}.")
+                            continue
+                        loss_sum = (ce * w).sum()
+                        (loss_sum / total_w).backward()
+                        loss_t_val += float((loss_sum.detach() / total_w).item())
+
+                    # accuracy + class counts (masked)
+                    pred = logits_flat.argmax(dim=-1)
+                    total_correct += float(((pred == y_exp).float() * w).sum().item())
+                    total_count += float(w.sum().item())
+                    try:
+                        with torch.no_grad():
+                            if pred_counts is None:
+                                pred_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
+                            if gt_counts is None:
+                                gt_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
+                            if correct_counts is None:
+                                correct_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
+                            m = (w > 0.5)
+                            if bool(m.any().item()):
+                                pc = torch.bincount(pred[m], minlength=nc).float()
+                                gc = torch.bincount(y_exp[m], minlength=nc).float()
+                                pred_counts[: pc.numel()] += pc
+                                gt_counts[: gc.numel()] += gc
+                                corr = (pred == y_exp) & m
+                                if bool(corr.any().item()):
+                                    cc = torch.bincount(y_exp[corr], minlength=nc).float()
+                                    correct_counts[: cc.numel()] += cc
+                    except Exception:
+                        pass
+
+                # accumulate (detached) per-t loss for logging
+                total_loss = total_loss + torch.tensor(float(loss_t_val), device=self.device, dtype=torch.float32)
 
             # mean over timesteps (avoid dependence on seq_len)
             steps = max(1, int(batch.max_seq_length - 1))
             total_loss = total_loss / float(steps)
 
-            self.belief_supervised_optimizer.zero_grad()
-            total_loss.backward()
+            # Safety: if loss is NaN/Inf (often caused by degenerate all-masked attention),
+            # skip optimizer step to avoid corrupting weights.
+            if not torch.isfinite(total_loss).all():
+                self.logger.warning("belief_supervised: total_loss is NaN/Inf; skipping optimizer step for this batch.")
+                try:
+                    self.belief_supervised_optimizer.zero_grad(set_to_none=True)
+                except Exception:
+                    self.belief_supervised_optimizer.zero_grad()
+                return {
+                    "status": "belief_supervised_skipped_nan",
+                    "loss_total": float("nan"),
+                    "loss_belief": float("nan"),
+                    "loss_encoder": 0.0,
+                    "loss_mixer": 0.0,
+                    "belief_sup_acc": float(acc) if "acc" in locals() else 0.0,
+                    "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+                }
+
+            # gradients already accumulated via (loss_sum/total_w).backward() per micro-batch above
             # clip agent grads
             try:
                 agent = getattr(self.mac, "agent", None)
@@ -285,9 +579,65 @@ class ECONLearner:
                     torch.nn.utils.clip_grad_norm_(list(agent.parameters()), 10.0)
             except Exception:
                 pass
+            # Debug: gradient norm (to detect frozen/zero-grad situations)
+            grad_norm = 0.0
+            try:
+                agent = getattr(self.mac, "agent", None)
+                if agent is not None and hasattr(agent, "parameters"):
+                    s = 0.0
+                    for p in agent.parameters():
+                        if p is None or (not isinstance(p, torch.Tensor)) or (p.grad is None):
+                            continue
+                        g = p.grad
+                        if not torch.isfinite(g).all():
+                            continue
+                        s += float(g.detach().float().pow(2).sum().item())
+                    grad_norm = float(s ** 0.5)
+            except Exception:
+                grad_norm = 0.0
             self.belief_supervised_optimizer.step()
 
             acc = (total_correct / max(1.0, total_count)) if total_count > 0 else 0.0
+            # finalize debug distributions
+            pred_frac = [float("nan")] * int(nc)
+            gt_frac = [float("nan")] * int(nc)
+            # per-class precision/recall (masked)
+            recall = [float("nan")] * int(nc)
+            precision = [float("nan")] * int(nc)
+            # raw counts for debugging (masked)
+            pred_cnt = [0.0] * int(nc)
+            gt_cnt = [0.0] * int(nc)
+            correct_cnt = [0.0] * int(nc)
+            has_gt = [0.0] * int(nc)
+            try:
+                if isinstance(pred_counts, torch.Tensor) and pred_counts.sum().item() > 0:
+                    pf = (pred_counts / pred_counts.sum()).detach().cpu().tolist()
+                    pred_frac = [float(x) for x in pf]
+                if isinstance(gt_counts, torch.Tensor) and gt_counts.sum().item() > 0:
+                    gf = (gt_counts / gt_counts.sum()).detach().cpu().tolist()
+                    gt_frac = [float(x) for x in gf]
+                if isinstance(correct_counts, torch.Tensor):
+                    # recall_c = correct_c / gt_c
+                    if isinstance(gt_counts, torch.Tensor):
+                        for i in range(int(nc)):
+                            gti = float(gt_counts[i].item())
+                            ci = float(correct_counts[i].item())
+                            gt_cnt[i] = gti
+                            correct_cnt[i] = ci
+                            has_gt[i] = 1.0 if gti > 0 else 0.0
+                            recall[i] = (ci / gti) if gti > 0 else 0.0
+                    # precision_c = correct_c / pred_c
+                    if isinstance(pred_counts, torch.Tensor):
+                        for i in range(int(nc)):
+                            pi = float(pred_counts[i].item())
+                            ci = float(correct_counts[i].item())
+                            pred_cnt[i] = pi
+                            # (correct_cnt already filled above if gt_counts existed; keep safe)
+                            if correct_cnt[i] == 0.0:
+                                correct_cnt[i] = ci
+                            precision[i] = (ci / pi) if pi > 0 else 0.0
+            except Exception:
+                pass
             return {
                 "status": "belief_supervised",
                 "loss_total": float(total_loss.item()),
@@ -296,7 +646,51 @@ class ECONLearner:
                 "loss_encoder": 0.0,
                 "loss_mixer": 0.0,
                 "belief_sup_acc": float(acc),
+                # how many (masked) samples actually contributed to CE/acc this update
+                # (if this is ~1, pred*_frac will naturally jump between 0/1)
+                "belief_sup_effective_count": float(total_count),
                 "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+                # diagnostics (high-signal when loss/acc look stuck)
+                "belief_sup_grad_norm": float(grad_norm),
+                "belief_sup_entropy": float(dbg_entropy_sum / max(1, dbg_entropy_count)) if dbg_entropy_count > 0 else float("nan"),
+                "belief_sup_maxprob": float(dbg_maxprob_sum / max(1, dbg_maxprob_count)) if dbg_maxprob_count > 0 else float("nan"),
+                "belief_sup_logit_abs_mean": float(dbg_logit_abs_sum / max(1, dbg_logit_count)) if dbg_logit_count > 0 else float("nan"),
+                "belief_sup_logit_std": float(dbg_logit_std_sum / max(1, dbg_logit_count)) if dbg_logit_count > 0 else float("nan"),
+                # soft-label diagnostics: verify Scheme-B is actually used
+                "belief_sup_soft_available_frac": float(soft_available_steps / float(steps)) if steps > 0 else 0.0,
+                "belief_sup_soft_used_frac": float(soft_used_steps / float(steps)) if steps > 0 else 0.0,
+                "belief_sup_soft_p1_mean": float(soft_p1_sum / max(1, soft_p_count)) if soft_p_count > 0 else float("nan"),
+                # class distribution (first 3 are most relevant for stance K=3)
+                "belief_sup_pred0_frac": float(pred_frac[0]) if len(pred_frac) > 0 else float("nan"),
+                "belief_sup_pred1_frac": float(pred_frac[1]) if len(pred_frac) > 1 else float("nan"),
+                "belief_sup_pred2_frac": float(pred_frac[2]) if len(pred_frac) > 2 else float("nan"),
+                "belief_sup_gt0_frac": float(gt_frac[0]) if len(gt_frac) > 0 else float("nan"),
+                "belief_sup_gt1_frac": float(gt_frac[1]) if len(gt_frac) > 1 else float("nan"),
+                "belief_sup_gt2_frac": float(gt_frac[2]) if len(gt_frac) > 2 else float("nan"),
+                # per-class recall/precision (for stance K=3)
+                "belief_sup_recall0": float(recall[0]) if len(recall) > 0 else float("nan"),
+                "belief_sup_recall1": float(recall[1]) if len(recall) > 1 else float("nan"),
+                "belief_sup_recall2": float(recall[2]) if len(recall) > 2 else float("nan"),
+                "belief_sup_precision0": float(precision[0]) if len(precision) > 0 else float("nan"),
+                "belief_sup_precision1": float(precision[1]) if len(precision) > 1 else float("nan"),
+                "belief_sup_precision2": float(precision[2]) if len(precision) > 2 else float("nan"),
+                # counts + validity flags (helps interpret recall/precision when a class is absent in current batch)
+                "belief_sup_gt0_count": float(gt_cnt[0]) if len(gt_cnt) > 0 else 0.0,
+                "belief_sup_gt1_count": float(gt_cnt[1]) if len(gt_cnt) > 1 else 0.0,
+                "belief_sup_gt2_count": float(gt_cnt[2]) if len(gt_cnt) > 2 else 0.0,
+                "belief_sup_pred0_count": float(pred_cnt[0]) if len(pred_cnt) > 0 else 0.0,
+                "belief_sup_pred1_count": float(pred_cnt[1]) if len(pred_cnt) > 1 else 0.0,
+                "belief_sup_pred2_count": float(pred_cnt[2]) if len(pred_cnt) > 2 else 0.0,
+                "belief_sup_correct0_count": float(correct_cnt[0]) if len(correct_cnt) > 0 else 0.0,
+                "belief_sup_correct1_count": float(correct_cnt[1]) if len(correct_cnt) > 1 else 0.0,
+                "belief_sup_correct2_count": float(correct_cnt[2]) if len(correct_cnt) > 2 else 0.0,
+                "belief_sup_has_gt0": float(has_gt[0]) if len(has_gt) > 0 else 0.0,
+                "belief_sup_has_gt1": float(has_gt[1]) if len(has_gt) > 1 else 0.0,
+                "belief_sup_has_gt2": float(has_gt[2]) if len(has_gt) > 2 else 0.0,
+                # record the *effective* CE class weights (so we can verify config takes effect in TensorBoard)
+                "belief_sup_ce_w0": float(ce_weight_list[0]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 0 else float("nan"),
+                "belief_sup_ce_w1": float(ce_weight_list[1]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 1 else float("nan"),
+                "belief_sup_ce_w2": float(ce_weight_list[2]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 2 else float("nan"),
             }
 
         # ==============================
@@ -424,6 +818,21 @@ class ECONLearner:
         # Stage 1: Individual Belief Formation
         # ===========================================
         
+        # Helper: select scalar Q for executed actions from per-action Q tensor.
+        def _select_chosen_q(q_all: torch.Tensor, actions_t: torch.Tensor) -> torch.Tensor:
+            """
+            q_all: (bs, n_agents, n_actions)
+            actions_t: (bs, n_agents, 1) or (bs, n_agents)
+            returns: (bs, n_agents)
+            """
+            if actions_t.ndim == 3 and actions_t.shape[-1] == 1:
+                a = actions_t.long()
+            elif actions_t.ndim == 2:
+                a = actions_t.long().unsqueeze(-1)
+            else:
+                a = actions_t.long().reshape(actions_t.shape[0], actions_t.shape[1], 1)
+            return q_all.gather(-1, a).squeeze(-1)
+
         # Collect data from forward passes - Stage 1
         list_belief_states_stage1, list_prompt_embeddings_stage1, list_local_q_values_stage1, list_group_repr_stage1 = [], [], [], []
         list_belief_states_stage1_next, list_prompt_embeddings_stage1_next, list_local_q_values_stage1_next, list_group_repr_stage1_next = [], [], [], []
@@ -439,10 +848,19 @@ class ECONLearner:
         # Stage 1: Forward pass through time steps for individual belief formation
         self.logger.debug("Starting Stage 1: Individual belief formation")
         for t in range(batch.max_seq_length - 1):
-            _, mac_info_t = self.mac.forward(batch, t, train_mode=True)
+            agent_outs_t, mac_info_t = self.mac.forward(batch, t, train_mode=True)
             list_belief_states_stage1.append(mac_info_t["belief_states"])
             list_prompt_embeddings_stage1.append(mac_info_t["prompt_embeddings"])
-            list_local_q_values_stage1.append(mac_info_t["q_values"])
+            # For RL with discrete actions, prefer chosen-action Q derived from per-action outputs.
+            # This ensures action_type_head participates in TD updates (Stage4 objective).
+            try:
+                if isinstance(agent_outs_t, torch.Tensor) and agent_outs_t.ndim == 3 and agent_outs_t.shape[-1] > 1:
+                    a_t = batch["actions"][:, t].to(self.device)  # (bs, n_agents, 1)
+                    list_local_q_values_stage1.append(_select_chosen_q(agent_outs_t, a_t))
+                else:
+                    list_local_q_values_stage1.append(mac_info_t["q_values"])
+            except Exception:
+                list_local_q_values_stage1.append(mac_info_t["q_values"])
             list_group_repr_stage1.append(mac_info_t["group_repr"])
 
             # 修复：正确处理commitment_embedding
@@ -459,10 +877,17 @@ class ECONLearner:
                         list_commitment_features_t.append(dummy_emb)
                         self.logger.debug(f"Created dummy commitment_embedding at t={t}")
 
-            _, target_mac_info_t_next = self.target_mac.forward(batch, t + 1, train_mode=True)
+            target_agent_outs_next, target_mac_info_t_next = self.target_mac.forward(batch, t + 1, train_mode=True)
             list_belief_states_stage1_next.append(target_mac_info_t_next["belief_states"])
             list_prompt_embeddings_stage1_next.append(target_mac_info_t_next["prompt_embeddings"])
-            list_local_q_values_stage1_next.append(target_mac_info_t_next["q_values"])
+            # Target: max over actions for next state when per-action outputs are available.
+            try:
+                if isinstance(target_agent_outs_next, torch.Tensor) and target_agent_outs_next.ndim == 3 and target_agent_outs_next.shape[-1] > 1:
+                    list_local_q_values_stage1_next.append(target_agent_outs_next.max(dim=-1)[0])
+                else:
+                    list_local_q_values_stage1_next.append(target_mac_info_t_next["q_values"])
+            except Exception:
+                list_local_q_values_stage1_next.append(target_mac_info_t_next["q_values"])
             list_group_repr_stage1_next.append(target_mac_info_t_next["group_repr"])
 
         # Stack temporal data for Stage 1

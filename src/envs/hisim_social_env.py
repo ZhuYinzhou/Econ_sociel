@@ -468,12 +468,23 @@ class HiSimSocialEnv(gym.Env):
         self.reward_w_action_type = float(kwargs.get("reward_w_action_type", 0.2))
         self.reward_w_stance = float(kwargs.get("reward_w_stance", 0.7))
         self.reward_w_text = float(kwargs.get("reward_w_text", 0.3))
+        # Optional: z-based reward (Stage4 recommendation: start simple with z-only reward)
+        # - Computed at stage boundary where z_mask==1 (end of stage t, target is edge stance dist at t+1)
+        # - Default 0.0 keeps backward compatibility
+        self.reward_w_z = float(kwargs.get("reward_w_z", 0.0))
+        self.reward_z_on_stage_end_only = bool(kwargs.get("reward_z_on_stage_end_only", True))
         # normalize if user provided weird weights (keep backward compatibility if action_type weight is 0)
-        sw = max(0.0, self.reward_w_action_type) + max(0.0, self.reward_w_stance) + max(0.0, self.reward_w_text)
+        sw = (
+            max(0.0, self.reward_w_action_type)
+            + max(0.0, self.reward_w_stance)
+            + max(0.0, self.reward_w_text)
+            + max(0.0, self.reward_w_z)
+        )
         if sw > 0:
             self.reward_w_action_type /= sw
             self.reward_w_stance /= sw
             self.reward_w_text /= sw
+            self.reward_w_z /= sw
 
         # action types (core user behavior)
         self.action_types: List[str] = ["post", "retweet", "reply", "like", "do_nothing"]
@@ -1353,6 +1364,42 @@ class HiSimSocialEnv(gym.Env):
                 "z_target_labeled_edge_n": int(labeled_edge_n),
             }
         )
+
+        # Optional: add z-based reward (default disabled)
+        # This makes Stage4 start from a clean, macro objective without text-quality noise.
+        try:
+            if float(getattr(self, "reward_w_z", 0.0)) > 0.0:
+                do_z = True
+                if bool(getattr(self, "reward_z_on_stage_end_only", True)) and not (is_end_of_stage and z_mask > 0):
+                    do_z = False
+                if do_z:
+                    reward_z = 0.0
+                    if self.population_z_mode == "continuous":
+                        # scalar: encourage closeness to target scalar (negative L2)
+                        zt = float(z_target[0]) if isinstance(z_target, list) and len(z_target) > 0 else 0.0
+                        zp = float(z_pred[0]) if isinstance(z_pred, list) and len(z_pred) > 0 else 0.0
+                        reward_z = -float((zp - zt) ** 2)
+                    else:
+                        # categorical: negative KL(target || pred)
+                        import math
+
+                        eps = 1e-8
+                        pt = [max(0.0, float(x)) for x in (z_target or [])]
+                        pp = [max(0.0, float(x)) for x in (z_pred or [])]
+                        spt = float(sum(pt))
+                        spp = float(sum(pp))
+                        if spt > 0 and spp > 0:
+                            pt = [x / spt for x in pt]
+                            pp = [x / spp for x in pp]
+                            kl = 0.0
+                            for i in range(min(len(pt), len(pp))):
+                                kl += pt[i] * (math.log(max(eps, pt[i])) - math.log(max(eps, pp[i])))
+                            reward_z = -float(max(0.0, kl))
+                    # add to total_reward (weights already normalized)
+                    total_reward = float(total_reward) + float(self.reward_w_z) * float(reward_z)
+                    info["reward_z"] = float(reward_z)
+        except Exception:
+            pass
 
         # merge extra info (LLM responses etc.)
         info.update(extra_info)

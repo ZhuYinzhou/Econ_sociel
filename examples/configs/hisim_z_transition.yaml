@@ -65,6 +65,12 @@ commitment_embedding_dim: 1024
 z_transition_loss_weight: 1.0
 z_transition_loss_type: "mse"
 
+# Stage3a hard constraints:
+# - Explicit stage conditioning in population_update_head
+# - Only train population_update_head (+ stage_embed / mixing gate), freeze the rest of encoder/agent
+population_update_use_stage: true
+train_population_update_head_only: true
+
 env: "huggingface_dataset_env"
 env_args:
   hf_dataset_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1_z_transition"

@@ -37,6 +37,7 @@ import json
 import glob
 import hashlib
 import re
+import random
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -114,6 +115,138 @@ def _extract_text(tweet: Dict[str, Any]) -> str:
         if v:
             return str(v).strip()
     return ""
+
+def _infer_action_type_from_macro_tweet(tweet: Dict[str, Any]) -> str:
+    """
+    Infer a 5-way action_type from HiSim macro tweet-like dict.
+    Aligns with hisim_social_env.action_types:
+      ["post","retweet","reply","like","do_nothing"]
+
+    Notes:
+    - Macro data usually cannot observe "like" or "do_nothing" explicitly.
+    - We map quotedTweet to retweet (user request: quote ≈ retweet for action-type).
+    """
+    # If there is no text, treat as do_nothing
+    txt = _extract_text(tweet)
+    if not txt:
+        return "do_nothing"
+
+    # Prefer explicit structure
+    try:
+        if tweet.get("retweetedTweet") is not None:
+            return "retweet"
+        # quotedTweet 表示引用 -> 映射为 retweet（合并到转发类）
+        if tweet.get("quotedTweet") is not None:
+            return "retweet"
+    except Exception:
+        pass
+
+    s = str(txt).lstrip()
+    # Fallback to common Twitter conventions
+    if s.startswith("RT @") or s.startswith("RT@"):
+        return "retweet"
+    if s.startswith("@"):
+        return "reply"
+    return "post"
+
+
+def _action_counts_from_stage(stage_items: List[Any]) -> List[int]:
+    """Return action counts in fixed order [post,retweet,reply,like,do_nothing]."""
+    order = ["post", "retweet", "reply", "like", "do_nothing"]
+    idx = {a: i for i, a in enumerate(order)}
+    counts = [0, 0, 0, 0, 0]
+    for it in stage_items:
+        d = _as_mapping(it)
+        if not d:
+            continue
+        at = _infer_action_type_from_macro_tweet(d)
+        counts[idx.get(at, 0)] += 1
+    return counts
+
+
+def _counts_to_ratio(counts: List[int]) -> List[float]:
+    tot = float(sum(int(x) for x in counts))
+    if tot <= 0:
+        return [0.0 for _ in counts]
+    return [float(x) / tot for x in counts]
+
+
+def _stance_id_from_label(label: Optional[str], label2id: Dict[str, int]) -> int:
+    if not label:
+        return -1
+    lab = _normalize_label(label)
+    return int(label2id.get(lab, -1))
+
+
+def _action_type_id_from_counts(action_counts: List[int]) -> int:
+    """
+    Map action counts to a single "mode" action id aligned to:
+      0=post,1=retweet,2=reply,3=like,4=do_nothing
+    Returns -1 if no actions observed.
+    """
+    if not action_counts or sum(int(x) for x in action_counts) <= 0:
+        return -1
+    try:
+        return int(max(range(len(action_counts)), key=lambda i: int(action_counts[i])))
+    except Exception:
+        return -1
+
+
+def _neighbor_recent_items(
+    macro: Dict[str, Any],
+    neighbors: List[str],
+    t: int,
+    k_recent: int,
+) -> List[Dict[str, Any]]:
+    """
+    Collect neighbor stage-t tweet items (dict-like), sort by date desc, and return top-k.
+    If k_recent<=0, return all items.
+    """
+    items: List[Tuple[Optional[datetime], Dict[str, Any]]] = []
+    for nb in neighbors:
+        nb_dict = macro.get(nb)
+        if not isinstance(nb_dict, dict):
+            continue
+        stage = nb_dict.get(t) or []
+        if not isinstance(stage, list) or not stage:
+            continue
+        for it in stage:
+            d = _as_mapping(it)
+            if not d:
+                continue
+            dt = _parse_datetime(d.get("date") or d.get("time") or d.get("current_time"))
+            items.append((dt, d))
+    # sort: dt present first, then by dt desc
+    items.sort(key=lambda x: (x[0] is None, -(x[0].timestamp() if x[0] else 0.0)))
+    out = [d for _dt, d in items]
+    if k_recent and k_recent > 0:
+        out = out[: int(k_recent)]
+    return out
+
+def _infer_action_type_from_text(text: Optional[str]) -> str:
+    """
+    Heuristic action type inference aligned with hisim_social_env.action_types:
+      ["post","retweet","reply","like","do_nothing"]
+    Macro data usually only contains tweet text, so "like" is rarely observable.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "do_nothing"
+    low = t.lower()
+    if low.startswith("rt @") or " rt @" in low:
+        return "retweet"
+    if low.startswith("@"):
+        return "reply"
+    return "post"
+
+def _action_type_counts_from_texts(texts: List[str]) -> Dict[str, int]:
+    counter = Counter()
+    for txt in texts or []:
+        at = _infer_action_type_from_text(txt)
+        counter[at] += 1
+    # ensure fixed keys
+    out = {k: int(counter.get(k, 0)) for k in ["post", "retweet", "reply", "like", "do_nothing"]}
+    return out
 
 
 def _parse_datetime(s: Any) -> Optional[datetime]:
@@ -375,6 +508,11 @@ class BuildArgs:
     self_label_t: Optional[str]
     neighbor_texts: List[Tuple[str, str]]  # (neighbor_user, text)
     neighbor_label_counter: Dict[str, int]
+    # action-type features aligned to ["post","retweet","reply","like","do_nothing"]
+    self_action_counts: List[int]
+    self_action_ratio: List[float]
+    neighbor_action_counts: List[int]
+    neighbor_action_ratio: List[float]
     population_texts: List[Tuple[str, str]]  # (user, text) aggregated from secondary users
     population_label_counter: Dict[str, int]
     label2id: Dict[str, int]
@@ -413,6 +551,16 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         lines.append(f"User stance at stage t (observed): {args.self_label_t}")
         lines.append("")
 
+    # Core user action-type summary at stage t (macro-inferred, aligned to 5-way action space)
+    try:
+        if args.self_action_counts:
+            at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+            lines.append("User action-type distribution at stage t (observed, aggregated):")
+            lines.append(", ".join([f"{n}:{int(args.self_action_counts[i])}" for i, n in enumerate(at_names)]))
+            lines.append("")
+    except Exception:
+        pass
+
     if args.self_texts:
         lines.append("User posts at stage t (observed):")
         for i, txt in enumerate(args.self_texts[:20], 1):
@@ -425,6 +573,15 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         lines.append("Neighbor stance distribution at stage t (observed, aggregated):")
         lines.append(", ".join([f"{k}:{v}" for k, v in top]))
         lines.append("")
+
+    try:
+        if args.neighbor_action_counts:
+            at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+            lines.append("Neighbor action-type distribution at stage t (observed, aggregated):")
+            lines.append(", ".join([f"{n}:{int(args.neighbor_action_counts[i])}" for i, n in enumerate(at_names)]))
+            lines.append("")
+    except Exception:
+        pass
 
     if args.neighbor_texts:
         lines.append("Neighbor posts at stage t (observed, aggregated):")
@@ -457,6 +614,106 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
     lines.append(label_spec)
     lines.append("")
     lines.append("Return ONLY the label id in the format: \\boxed{<id>}")
+    return "\n".join(lines)
+
+
+def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
+    """
+    Build an offline imitation-learning prompt for CORE-user action_type prediction.
+
+    Target: predict the user's NEXT-stage (t+1) action_type id in {0..4}:
+      0=post, 1=retweet, 2=reply, 3=like, 4=do_nothing
+    """
+    action_spec = "\n".join(
+        [
+            "post -> 0",
+            "retweet -> 1",
+            "reply -> 2",
+            "like -> 3",
+            "do_nothing -> 4",
+        ]
+    )
+
+    lines: List[str] = []
+    lines.append("You are an action-policy predictor in a social media user simulation setting.")
+    lines.append(f"Topic: {args.topic}")
+    lines.append(f"Event: {args.event}")
+    lines.append(f"User: {args.user}")
+    lines.append(f"Stage t: {args.t}")
+    lines.append("")
+    if args.persona:
+        lines.append("User persona (profile):")
+        lines.append(args.persona.strip())
+        lines.append("")
+
+    if args.user_history:
+        lines.append("User historical posts / memory (observed):")
+        lines.append(args.user_history.strip())
+        lines.append("")
+
+    if args.self_label_t:
+        lines.append(f"User stance at stage t (observed): {args.self_label_t}")
+        lines.append("")
+
+    # User action distribution at stage t (observed)
+    try:
+        if args.self_action_counts:
+            at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+            lines.append("User action-type distribution at stage t (observed, aggregated):")
+            lines.append(", ".join([f"{n}:{int(args.self_action_counts[i])}" for i, n in enumerate(at_names)]))
+            lines.append("")
+    except Exception:
+        pass
+
+    if args.self_texts:
+        lines.append("User posts at stage t (observed):")
+        for i, txt in enumerate(args.self_texts[:20], 1):
+            lines.append(f"- ({i}) {txt}")
+        lines.append("")
+
+    # Neighbor summary
+    if args.neighbor_label_counter:
+        top = sorted(args.neighbor_label_counter.items(), key=lambda x: -x[1])[:10]
+        lines.append("Neighbor stance distribution at stage t (observed, aggregated):")
+        lines.append(", ".join([f"{k}:{v}" for k, v in top]))
+        lines.append("")
+
+    try:
+        if args.neighbor_action_counts:
+            at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+            lines.append("Neighbor action-type distribution at stage t (observed, aggregated):")
+            lines.append(", ".join([f"{n}:{int(args.neighbor_action_counts[i])}" for i, n in enumerate(at_names)]))
+            lines.append("")
+    except Exception:
+        pass
+
+    if args.neighbor_texts:
+        lines.append("Neighbor posts at stage t (observed, aggregated):")
+        count = 0
+        for nb, txt in args.neighbor_texts:
+            lines.append(f"- [{nb}] {txt}")
+            count += 1
+            if max_neighbor_lines > 0 and count >= max_neighbor_lines:
+                break
+        lines.append("")
+
+    # Population-level observation (optional)
+    if args.population_label_counter:
+        top = sorted(args.population_label_counter.items(), key=lambda x: -x[1])[:10]
+        lines.append("Population-level stance distribution at stage t (secondary users, observed):")
+        lines.append(", ".join([f"{k}:{v}" for k, v in top]))
+        lines.append("")
+    if args.population_texts:
+        lines.append("Population-level posts at stage t (secondary users, observed):")
+        for u, txt in args.population_texts[:max_neighbor_lines]:
+            lines.append(f"- [{u}] {txt}")
+        lines.append("")
+
+    lines.append("Task: Predict the user's MOST LIKELY action_type at stage t+1.")
+    lines.append("Valid action types:")
+    lines.append(action_spec)
+    lines.append("")
+    lines.append("Return ONLY the action type id in the format: \\boxed{<id>}")
     return "\n".join(lines)
 
 
@@ -494,6 +751,12 @@ def _build_example_from_states(
         "self_label_t": build_args.self_label_t if build_args.self_label_t is not None else "",
         "is_core_user": bool(build_args.is_core_user),
         "target_distribution_prob": target_distribution_prob,
+        # === structured action features (macro-inferred) ===
+        # aligned to ["post","retweet","reply","like","do_nothing"]
+        "self_action_counts_t": [int(x) for x in (build_args.self_action_counts or [0, 0, 0, 0, 0])],
+        "self_action_ratio_t": [float(x) for x in (build_args.self_action_ratio or [0.0, 0.0, 0.0, 0.0, 0.0])],
+        "neighbor_action_counts_t": [int(x) for x in (build_args.neighbor_action_counts or [0, 0, 0, 0, 0])],
+        "neighbor_action_ratio_t": [float(x) for x in (build_args.neighbor_action_ratio or [0.0, 0.0, 0.0, 0.0, 0.0])],
     }
 
 
@@ -543,6 +806,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
     max_self_tweets: int = 8,
     max_neighbor_users: int = 50,
     max_neighbor_tweets_total: int = 120,
+    neighbor_k_recent_tweets: int = 0,
     include_user_history: bool = True,
     max_user_history_chars: int = 2000,
     use_population_observation: bool = True,
@@ -558,7 +822,32 @@ def convert_hisim_macro_to_belief_hf_dataset(
     force_k: int = 3,
     export_z_transition_dataset: bool = True,
     z_transition_out_dir: str = "",
+    # z_transition population belief representation:
+    # - "scalar": K=1 scalar z ∈ [-1,1] (Oppose=-1, Neutral=0, Support=+1) averaged over secondary users
+    # - "dist":   K=3 distribution z ∈ Δ^3 aligned to label2id ids (Neutral/Oppose/Support)
+    z_transition_population_mode: str = "scalar",
     noncore_target_mode: str = "self",
+    # Core-user target definition:
+    # - "self": predict the user's OWN stance at t+1 (label from user's stage_tp1)
+    # - "neighbor": predict neighbors' stance at t+1 (label from neighbors' stage_tp1 majority)
+    core_target_mode: str = "neighbor",
+    # Neighbor list handling
+    shuffle_neighbors_before_truncation: bool = True,
+    neighbor_shuffle_seed: int = 0,
+    # z-transition dataset conditioning:
+    # - "population_only": current behavior (population texts only; no per-core conditioning)
+    # - "core_user": build a z-transition sample per (core_user, t) using build_belief_input as question,
+    #               and label with secondary-population z_t/z_{t+1}.
+    z_transition_conditioning: str = "population_only",
+    # === Stage4 (offline) action policy imitation dataset (core users only) ===
+    export_action_imitation_dataset: bool = False,
+    action_imitation_out_dir: str = "",
+    # === Preview (auto-generated after export) ===
+    export_preview: bool = True,
+    preview_num_per_split: int = 3,
+    preview_seed: int = 42,
+    preview_max_chars: int = 600,
+    preview_filename: str = "preview.jsonl",
 ) -> None:
     """
     主转换入口：扫描 hisim_data_root 下的宏观数据，生成信念网络训练样本，并保存为 HF dataset。
@@ -616,6 +905,70 @@ def convert_hisim_macro_to_belief_hf_dataset(
     # split buckets (z-transition dataset)
     z_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
 
+    # split buckets (action imitation dataset; core users only)
+    a_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
+
+    def _truncate_text(s: Any, n: int) -> str:
+        try:
+            ss = str(s) if s is not None else ""
+        except Exception:
+            ss = ""
+        n = int(n)
+        if n <= 0:
+            return ss
+        if len(ss) <= n:
+            return ss
+        return ss[:n] + " ..."
+
+    def _write_preview_jsonl(out_dir: str, split_to_items: Dict[str, List[Dict[str, Any]]], *, tag: str) -> None:
+        """
+        Write a single preview file into out_dir with a few sampled items per split.
+        Intended for quick human inspection of the exact data fed to the model.
+        """
+        if not bool(export_preview):
+            return
+        try:
+            _ensure_dir(out_dir)
+            fn = str(preview_filename or "preview.jsonl").strip() or "preview.jsonl"
+            path = os.path.join(out_dir, fn)
+            rng = random.Random(int(preview_seed))
+            nps = max(1, int(preview_num_per_split))
+            maxc = max(0, int(preview_max_chars))
+
+            with open(path, "w", encoding="utf-8") as f:
+                for split in ("train", "validation", "test"):
+                    items = split_to_items.get(split) or []
+                    if not isinstance(items, list) or len(items) == 0:
+                        continue
+                    k = min(nps, len(items))
+                    idxs = list(range(len(items)))
+                    rng.shuffle(idxs)
+                    for i in idxs[:k]:
+                        it = items[i]
+                        if not isinstance(it, dict):
+                            continue
+                        rec = {
+                            "_tag": str(tag),
+                            "_split": str(split),
+                            "_idx": int(i),
+                            "topic": it.get("topic"),
+                            "event": it.get("event"),
+                            "user": it.get("user"),
+                            "t": it.get("t", it.get("stage_t")),
+                            "is_core_user": it.get("is_core_user"),
+                            "answer": it.get("answer"),
+                            "target_id": it.get("target_id", it.get("target_action_type_id")),
+                            "target_label": it.get("target_label"),
+                            "z_t": it.get("z_t"),
+                            "z_target": it.get("z_target"),
+                            "z_mask": it.get("z_mask"),
+                            "question_preview": _truncate_text(it.get("question", ""), maxc),
+                        }
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"[preview] wrote {path}")
+        except Exception as e:
+            print(f"[preview] skipped due to error: {e}")
+
     stats = {
         "topics": list(filtered.keys()),
         "label2id_size": len(label2id),
@@ -648,6 +1001,14 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "max_population_tweets_total": int(max_population_tweets_total),
         "export_z_transition_dataset": bool(export_z_transition_dataset),
         "noncore_target_mode": str(noncore_target_mode),
+        "core_target_mode": str(core_target_mode),
+        # neighbor sampling options
+        "shuffle_neighbors_before_truncation": bool(shuffle_neighbors_before_truncation),
+        "neighbor_shuffle_seed": int(neighbor_shuffle_seed),
+        # target-id histogram (helps detect missing classes like Oppose=1)
+        "target_id_counts": {0: 0, 1: 0, 2: 0},
+        # structured neighbor feature window
+        "neighbor_k_recent_tweets": int(neighbor_k_recent_tweets),
     }
 
     z_stats = {
@@ -655,7 +1016,17 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "label2id_size": len(label2id),
         "num_examples": 0,
         "export_z_transition_dataset": bool(export_z_transition_dataset),
-        "z_transition_definition": "secondary_users_stage_label_dist: z_t and z_target are distributions over [Neutral,Oppose,Support] computed from per-user stage majority label",
+        "z_transition_population_mode": str(z_transition_population_mode),
+        "z_transition_definition": "scalar: z in [-1,1] or dist: z in Δ^3; computed from SECONDARY users at each stage (per-user stage-majority label), aligned to label2id",
+        "z_transition_conditioning": str(z_transition_conditioning),
+    }
+
+    a_stats = {
+        "topics": list(filtered.keys()),
+        "num_examples": 0,
+        "num_examples_core": 0,
+        "action_id_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
+        "definition": "Predict CORE user's next-stage (t+1) action_type id from stage-t context; action_type in [post,retweet,reply,like,do_nothing].",
     }
 
     def _load_user_history_snippet(topic: str, user: str) -> str:
@@ -887,9 +1258,14 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     }
 
             # === 可选：导出 z(t)->z(t+1) transition 数据集（用于训练 BeliefEncoder.population_update_head）===
-            # 每条样本对应一个 stage transition（t in [0..12]），目标为“次要用户(secondary)的 stage label”
-            # 映射到标量 [-1,0,1] 后取均值，得到连续态度 z ∈ [-1,1]，学习 z(t)->z(t+1) 的回归动态。
+            # 支持两种 z 表示：
+            # - scalar: K=1 标量 z∈[-1,1]（Oppose=-1, Neutral=0, Support=+1），取 secondary users 的 stage-majority label 均值
+            # - dist:   K=3 分布 z∈Δ^3（按 label2id 的 id 顺序），取 secondary users 的 stage-majority label 分布
             if export_z_transition_dataset:
+                z_pop_mode = str(z_transition_population_mode or "scalar").strip().lower()
+                if z_pop_mode not in ("scalar", "dist"):
+                    z_pop_mode = "scalar"
+
                 def _stage_scalar_over_users(users_list: List[str], stage_t: int) -> Tuple[float, int]:
                     # label -> scalar mapping
                     v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
@@ -913,63 +1289,188 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     z = acc / float(total)
                     return float(max(-1.0, min(1.0, z))), int(total)
 
-                # secondary users = not in core_users
-                secondary_users = [u for u in macro.keys() if str(u) not in core_users]
-                for t in range(0, 13):
-                    z_t, labeled_t = _stage_scalar_over_users(secondary_users, t)
-                    z_tp1, labeled_tp1 = _stage_scalar_over_users(secondary_users, t + 1)
-
-                    # Build a compact "population observation" question. Use population_cache texts if enabled.
-                    pop = population_cache.get(t, {}) if use_population_observation else {}
-                    pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
-                    # render texts
-                    rendered_texts: List[str] = []
-                    for u_txt in (pop_texts or [])[: min(120, max(0, int(max_population_tweets_total)) if max_population_tweets_total > 0 else 120)]:
+                def _stage_dist_over_users(users_list: List[str], stage_t: int) -> Tuple[List[float], int]:
+                    """
+                    Compute a 3-way stance distribution over secondary users at stage_t.
+                    We take each user's stage-majority label, map to label2id, then normalize counts.
+                    """
+                    K = 3
+                    counts = [0 for _ in range(K)]
+                    total = 0
+                    for uu in users_list:
+                        ud = macro.get(uu)
+                        if not isinstance(ud, dict):
+                            continue
+                        st_items = ud.get(stage_t) or []
+                        if not isinstance(st_items, list) or not st_items:
+                            continue
+                        lab = _stage_label(st_items)
+                        lab = _normalize_label(lab)
+                        if not lab:
+                            continue
+                        if lab not in label2id:
+                            continue
                         try:
-                            u0, txt0 = u_txt
-                            if txt0:
-                                rendered_texts.append(f"- [{u0}] {txt0}")
+                            idx = int(label2id[lab])
                         except Exception:
                             continue
+                        if 0 <= idx < K:
+                            counts[idx] += 1
+                            total += 1
+                    if total <= 0:
+                        # uniform but will be masked out by labeled_count=0
+                        return [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 0
+                    return [c / float(total) for c in counts], int(total)
 
-                    q_lines: List[str] = []
-                    q_lines.append("You are predicting how the SECONDARY-user population stance evolves over stages.")
-                    q_lines.append(f"Topic: {topic}")
-                    q_lines.append(f"Event: {event}")
-                    q_lines.append(f"Stage t: {t}")
-                    q_lines.append("")
-                    q_lines.append("Population-level observed texts at stage t (secondary users):")
-                    if rendered_texts:
-                        q_lines.extend(rendered_texts[:200])
+                # secondary users = not in core_users
+                secondary_users = [u for u in macro.keys() if str(u) not in core_users]
+                z_cond = str(z_transition_conditioning or "population_only").strip().lower()
+                for t in range(0, 13):
+                    if z_pop_mode == "dist":
+                        z_t, labeled_t = _stage_dist_over_users(secondary_users, t)
+                        z_tp1, labeled_tp1 = _stage_dist_over_users(secondary_users, t + 1)
                     else:
-                        q_lines.append("(no population texts available)")
-                    q_lines.append("")
-                    q_lines.append("Task: Predict the NEXT-stage population stance scalar z(t+1) in [-1, 1].")
-                    q_lines.append("Interpretation: Oppose=-1, Neutral=0, Support=+1; z is the mean over secondary users at that stage.")
-                    q = "\n".join(q_lines)
+                        z_t, labeled_t = _stage_scalar_over_users(secondary_users, t)
+                        z_tp1, labeled_tp1 = _stage_scalar_over_users(secondary_users, t + 1)
 
-                    ex = {
-                        "question": q,
-                        # dummy answer; reward can be disabled in training config (ts_weight=0)
-                        "answer": "\\boxed{0}",
-                        "topic": str(topic),
-                        "event": str(event),
-                        "t": int(t),
-                        "stage_t": int(t),
-                        # mark as non-core sample; this dataset is for secondary population dynamics
-                        "is_core_user": False,
-                        # transition supervision
-                        "z_t": float(z_t),
-                        "z_target": float(z_tp1),
-                        "z_mask": 1.0,
-                        "labeled_secondary_users_t": int(labeled_t),
-                        "labeled_secondary_users_tp1": int(labeled_tp1),
-                    }
+                    if z_cond in ("core_user", "core", "conditioned", "cond"):
+                        # Build a conditioned sample for EACH core user at stage t, but label by secondary population z(t+1).
+                        for user in list(core_users):
+                            ud = macro.get(user)
+                            if not isinstance(ud, dict):
+                                continue
+                            stage_ut = ud.get(t) or []
+                            stage_utp1 = ud.get(t + 1) or []
+                            if not isinstance(stage_ut, list) or not isinstance(stage_utp1, list):
+                                continue
 
-                    # Split by stage (stable) to avoid leakage across transition stages
-                    split = "train" if t <= 9 else ("validation" if t == 10 else "test")
-                    z_split_examples[split].append(ex)
-                    z_stats["num_examples"] += 1
+                            persona = role_desc.get(str(user), "")
+                            user_history = _load_user_history_snippet(topic, str(user))
+                            self_label_t = _stage_label(stage_ut)
+                            self_texts = _stage_texts(stage_ut, max_tweets=max_self_tweets)
+                            # neighbor slice consistent with belief dataset
+                            neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
+                            neighbors = [nb for nb in neighbors if nb in macro]
+                            if max_neighbor_users > 0 and len(neighbors) > max_neighbor_users:
+                                neighbors = neighbors[:max_neighbor_users]
+                            neighbor_texts: List[Tuple[str, str]] = []
+                            neighbor_label_counter: Counter = Counter()
+                            for nb in neighbors:
+                                nb_dict = macro.get(nb)
+                                if not isinstance(nb_dict, dict):
+                                    continue
+                                nb_stage = nb_dict.get(t) or []
+                                if not isinstance(nb_stage, list) or not nb_stage:
+                                    continue
+                                nb_lab = _stage_label(nb_stage)
+                                if nb_lab:
+                                    neighbor_label_counter[nb_lab] += 1
+                                nb_texts = _stage_texts(nb_stage, max_tweets=2)
+                                for txt in nb_texts:
+                                    if txt:
+                                        neighbor_texts.append((str(nb), txt))
+                                if max_neighbor_tweets_total > 0 and len(neighbor_texts) >= max_neighbor_tweets_total:
+                                    break
+
+                            pop = population_cache.get(t, {}) if use_population_observation else {}
+                            pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
+                            pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
+
+                            bargs = BuildArgs(
+                                topic=str(topic),
+                                event=str(event),
+                                user=str(user),
+                                t=int(t),
+                                persona=str(persona),
+                                user_history=str(user_history),
+                                self_texts=self_texts,
+                                self_label_t=self_label_t,
+                                neighbor_texts=neighbor_texts,
+                                neighbor_label_counter=dict(neighbor_label_counter),
+                                population_texts=pop_texts,
+                                population_label_counter=pop_label_counter,
+                                label2id=label2id,
+                                is_core_user=True,
+                                target_mode="neighbor_tp1",  # doesn't matter for z_transition; kept for prompt consistency
+                            )
+                            q = build_belief_input(bargs)
+
+                            # structured conditioning fields
+                            core_stance_id_t = int(label2id.get(str(self_label_t), -1)) if self_label_t else -1
+                            core_action_type_t = _infer_action_type_from_text(self_texts[0] if self_texts else "")
+                            action2id = {"post": 0, "retweet": 1, "reply": 2, "like": 3, "do_nothing": 4}
+                            core_action_type_id_t = int(action2id.get(core_action_type_t, 4))
+                            neigh_action_counts = _action_type_counts_from_texts([txt for _, txt in neighbor_texts][: max(0, int(max_neighbor_tweets_total))])
+
+                            ex = {
+                                "question": q,
+                                "answer": "\\boxed{0}",
+                                "topic": str(topic),
+                                "event": str(event),
+                                "t": int(t),
+                                "stage_t": int(t),
+                                "is_core_user": True,
+                                # transition supervision (scalar K=1 or dist K=3)
+                                "z_t": z_t if z_pop_mode == "dist" else float(z_t),
+                                "z_target": z_tp1 if z_pop_mode == "dist" else float(z_tp1),
+                                "z_mask": 1.0 if int(labeled_tp1) > 0 else 0.0,
+                                "labeled_secondary_users_t": int(labeled_t),
+                                "labeled_secondary_users_tp1": int(labeled_tp1),
+                                # extra conditioning (optional)
+                                "core_stance_id_t": int(core_stance_id_t),
+                                "core_action_type_id_t": int(core_action_type_id_t),
+                                "has_user_history": 1 if bool(user_history) else 0,
+                                "has_neighbors": 1 if bool(neighbors) else 0,
+                                "neighbor_action_type_counts_t": neigh_action_counts,
+                            }
+                            # Split by stage to avoid leakage
+                            split = "train" if t <= 9 else ("validation" if t == 10 else "test")
+                            z_split_examples[split].append(ex)
+                            z_stats["num_examples"] += 1
+                    else:
+                        # population-only (current behavior)
+                        pop = population_cache.get(t, {}) if use_population_observation else {}
+                        pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
+                        rendered_texts: List[str] = []
+                        for u_txt in (pop_texts or [])[: min(120, max(0, int(max_population_tweets_total)) if max_population_tweets_total > 0 else 120)]:
+                            try:
+                                u0, txt0 = u_txt
+                                if txt0:
+                                    rendered_texts.append(f"- [{u0}] {txt0}")
+                            except Exception:
+                                continue
+                        q_lines: List[str] = []
+                        q_lines.append("You are predicting how the SECONDARY-user population stance evolves over stages.")
+                        q_lines.append(f"Topic: {topic}")
+                        q_lines.append(f"Event: {event}")
+                        q_lines.append(f"Stage t: {t}")
+                        q_lines.append("")
+                        q_lines.append("Population-level observed texts at stage t (secondary users):")
+                        if rendered_texts:
+                            q_lines.extend(rendered_texts[:200])
+                        else:
+                            q_lines.append("(no population texts available)")
+                        q_lines.append("")
+                        q_lines.append("Task: Predict the NEXT-stage population stance scalar z(t+1) in [-1, 1].")
+                        q_lines.append("Interpretation: Oppose=-1, Neutral=0, Support=+1; z is the mean over secondary users at that stage.")
+                        q = "\n".join(q_lines)
+                        ex = {
+                            "question": q,
+                            "answer": "\\boxed{0}",
+                            "topic": str(topic),
+                            "event": str(event),
+                            "t": int(t),
+                            "stage_t": int(t),
+                            "is_core_user": False,
+                            "z_t": z_t if z_pop_mode == "dist" else float(z_t),
+                            "z_target": z_tp1 if z_pop_mode == "dist" else float(z_tp1),
+                            "z_mask": 1.0 if int(labeled_tp1) > 0 else 0.0,
+                            "labeled_secondary_users_t": int(labeled_t),
+                            "labeled_secondary_users_tp1": int(labeled_tp1),
+                        }
+                        split = "train" if t <= 9 else ("validation" if t == 10 else "test")
+                        z_split_examples[split].append(ex)
+                        z_stats["num_examples"] += 1
 
             users = list(macro.keys())
             if max_users > 0:
@@ -1008,10 +1509,15 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         continue
 
                     # === target definition ===
-                    # Core users: predict neighbors at t+1 (belief about others).
-                    # Non-core users: default to predict SELF at t+1 (Scheme C), because follower_dict often only covers core.
+                    # Choose supervision target for this sample.
+                    # - core_target_mode controls CORE users (default historical behavior was neighbor_tp1).
+                    # - noncore_target_mode controls NONCORE users (default self_tp1 due to sparse neighbor graph).
                     noncore_tm = str(noncore_target_mode or "self").strip().lower()
-                    target_mode = "neighbor_tp1" if is_core_user else ("self_tp1" if noncore_tm in ("self", "self_tp1", "own", "user") else "neighbor_tp1")
+                    core_tm = str(core_target_mode or "neighbor").strip().lower()
+                    if is_core_user:
+                        target_mode = "self_tp1" if core_tm in ("self", "self_tp1", "own", "user") else "neighbor_tp1"
+                    else:
+                        target_mode = "self_tp1" if noncore_tm in ("self", "self_tp1", "own", "user") else "neighbor_tp1"
 
                     neighbors: List[str] = []
                     target_counter: Dict[int, int] = {}
@@ -1043,6 +1549,15 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
 
                         # limit and filter to users existing in macro
+                        if shuffle_neighbors_before_truncation and len(neighbors) > 1:
+                            try:
+                                import random
+                                # deterministic per-sample shuffle so dataset build is reproducible
+                                seed = int(neighbor_shuffle_seed) ^ int(_stable_hash_to_bucket(f"{topic}:{event}:{user}:{t}", buckets=2**31-1))
+                                rnd = random.Random(seed)
+                                rnd.shuffle(neighbors)
+                            except Exception:
+                                pass
                         if max_neighbor_users > 0 and len(neighbors) > max_neighbor_users:
                             neighbors = neighbors[:max_neighbor_users]
                         neighbors = [nb for nb in neighbors if nb in macro]
@@ -1098,11 +1613,16 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     user_history = _load_user_history_snippet(topic, str(user)) if is_core_user else ""
                     self_label_t = _stage_label(stage_t)
                     self_texts = _stage_texts(stage_t, max_tweets=max_self_tweets)
+                    # macro-inferred action distribution for the user at stage t
+                    self_action_counts = _action_counts_from_stage(stage_t)
+                    self_action_ratio = _counts_to_ratio(self_action_counts)
 
                     
 
                     neighbor_texts: List[Tuple[str, str]] = []
                     neighbor_label_counter: Counter = Counter()
+                    # macro-inferred action distribution for neighbors at stage t (aggregated across neighbors)
+                    neighbor_action_counts = [0, 0, 0, 0, 0]
                     if neighbors:
                         for nb in neighbors:
                             nb_dict = macro.get(nb)
@@ -1114,6 +1634,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             nb_lab = _stage_label(nb_stage)
                             if nb_lab:
                                 neighbor_label_counter[nb_lab] += 1
+                            # action counts: sum over neighbor stages
+                            try:
+                                c = _action_counts_from_stage(nb_stage)
+                                for i in range(5):
+                                    neighbor_action_counts[i] += int(c[i])
+                            except Exception:
+                                pass
                             # take at most 1-2 texts per neighbor to control length
                             nb_texts = _stage_texts(nb_stage, max_tweets=2)
                             for txt in nb_texts:
@@ -1121,6 +1648,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                     neighbor_texts.append((str(nb), txt))
                             if max_neighbor_tweets_total > 0 and len(neighbor_texts) >= max_neighbor_tweets_total:
                                 break
+                    neighbor_action_ratio = _counts_to_ratio(neighbor_action_counts)
 
                     pop = population_cache.get(t, {}) if use_population_observation else {}
                     pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
@@ -1137,6 +1665,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         self_label_t=self_label_t,
                         neighbor_texts=neighbor_texts,
                         neighbor_label_counter=dict(neighbor_label_counter),
+                        self_action_counts=self_action_counts,
+                        self_action_ratio=self_action_ratio,
+                        neighbor_action_counts=neighbor_action_counts,
+                        neighbor_action_ratio=neighbor_action_ratio,
                         population_texts=pop_texts,
                         population_label_counter=pop_label_counter,
                         label2id=label2id,
@@ -1145,6 +1677,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     )
 
                     ex = _build_example_from_states(bargs, target_label=target_label, target_id=target_id, target_distribution=target_counter)
+                    try:
+                        # update histogram for quick sanity checks
+                        tid = int(target_id)
+                        if tid in stats["target_id_counts"]:
+                            stats["target_id_counts"][tid] += 1
+                    except Exception:
+                        pass
 
                     if split_by_user:
                         bucket = _stable_hash_to_bucket(str(user), buckets=10)
@@ -1158,6 +1697,42 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         stats["num_examples_core"] += 1
                     else:
                         stats["num_examples_noncore"] += 1
+
+                    # === Optional: Stage4 action imitation dataset (core users only) ===
+                    if export_action_imitation_dataset and bool(is_core_user):
+                        try:
+                            # Target action_type is inferred from stage t+1 macro items (mode action id).
+                            # If no actions observed, treat as do_nothing (4).
+                            action_counts_tp1 = _action_counts_from_stage(stage_tp1)
+                            aid = _action_type_id_from_counts(action_counts_tp1)
+                            if aid is None or int(aid) < 0:
+                                aid = 4
+                            aid = int(max(0, min(4, int(aid))))
+                            q_action = build_action_imitation_input(bargs)
+                            a_ex = {
+                                "question": q_action,
+                                "answer": f"\\boxed{{{aid}}}",
+                                "target_action_type_id": int(aid),
+                                "target_action_counts_tp1": [int(x) for x in (action_counts_tp1 or [0, 0, 0, 0, 0])],
+                                "topic": bargs.topic,
+                                "event": bargs.event,
+                                "user": bargs.user,
+                                "t": int(bargs.t),
+                                "is_core_user": True,
+                            }
+                            a_split_examples[split].append(a_ex)
+                            a_stats["num_examples"] += 1
+                            a_stats["num_examples_core"] += 1
+                            try:
+                                a_stats["action_id_counts"][int(aid)] = int(a_stats["action_id_counts"].get(int(aid), 0)) + 1
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            # keep belief dataset generation robust (do not fail the whole conversion)
+                            try:
+                                stats["skipped_action_imitation"] = int(stats.get("skipped_action_imitation", 0)) + 1
+                            except Exception:
+                                pass
 
     if stats["num_examples"] == 0:
         raise RuntimeError("没有构造出任何样本，请检查数据路径/字段或参数。")
@@ -1184,6 +1759,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
         json.dump(label2id, f, ensure_ascii=False, indent=2)
     with open(os.path.join(output_dir, "stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
+    # preview (belief dataset)
+    _write_preview_jsonl(str(output_dir), split_examples, tag="belief")
 
     # === save z-transition dataset (optional) ===
     if export_z_transition_dataset and z_stats.get("num_examples", 0) > 0:
@@ -1209,6 +1786,35 @@ def convert_hisim_macro_to_belief_hf_dataset(
             json.dump(label2id, f, ensure_ascii=False, indent=2)
         with open(os.path.join(z_out, "stats.json"), "w", encoding="utf-8") as f:
             json.dump(z_stats, f, ensure_ascii=False, indent=2)
+        # preview (z_transition dataset)
+        _write_preview_jsonl(str(z_out), z_split_examples, tag="z_transition")
+
+    # === save action imitation dataset (optional; core users only) ===
+    if export_action_imitation_dataset and a_stats.get("num_examples", 0) > 0:
+        a_out = str(action_imitation_out_dir or "").strip()
+        if not a_out:
+            a_out = output_dir.rstrip("/") + "_action_imitation_core"
+        _ensure_dir(a_out)
+        if _HAS_DATASETS:
+            a_ds = DatasetDict({k: Dataset.from_list(v) for k, v in a_split_examples.items() if v})  # type: ignore[misc]
+            print(f"保存 action_imitation(HF) 数据集到: {a_out}")
+            a_ds.save_to_disk(a_out)  # type: ignore[union-attr]
+        else:
+            print("[WARN] 当前环境未安装 `datasets`，将改为输出 action_imitation JSONL。")
+            for split, items in a_split_examples.items():
+                if not items:
+                    continue
+                jsonl_path = os.path.join(a_out, f"{split}.jsonl")
+                with open(jsonl_path, "w", encoding="utf-8") as f:
+                    for it in items:
+                        f.write(json.dumps(it, ensure_ascii=False) + "\n")
+            print(f"已输出 action_imitation JSONL 到: {a_out}")
+        with open(os.path.join(a_out, "action2id.json"), "w", encoding="utf-8") as f:
+            json.dump({"post": 0, "retweet": 1, "reply": 2, "like": 3, "do_nothing": 4}, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(a_out, "stats.json"), "w", encoding="utf-8") as f:
+            json.dump(a_stats, f, ensure_ascii=False, indent=2)
+        # preview (action imitation dataset)
+        _write_preview_jsonl(str(a_out), a_split_examples, tag="action_imitation")
 
     print("完成。")
 
@@ -1294,6 +1900,12 @@ def main():
         type=int,
         default=120,
         help="NeighborState 中最多聚合多少条邻居推文（全体邻居合计）",
+    )
+    parser.add_argument(
+        "--neighbor-k-recent-tweets",
+        type=int,
+        default=0,
+        help="用于结构化邻居特征的最近 k 条邻居推文（按 date 降序）。0 表示使用全部可用邻居推文。",
     )
     parser.add_argument(
         "--no-split-by-user",
@@ -1385,11 +1997,83 @@ def main():
         help="z_transition 数据集输出目录（留空则不单独输出；你也可以直接用 --out-dir 的目录）。",
     )
     parser.add_argument(
+        "--export-action-imitation-dataset",
+        action="store_true",
+        help="同时导出 Stage4 action imitation 数据集（core users only，监督 action_type id in [0..4]）。",
+    )
+    parser.add_argument(
+        "--action-imitation-out-dir",
+        type=str,
+        default="",
+        help="action imitation 数据集输出目录（留空则使用 <out-dir>_action_imitation_core）。",
+    )
+    parser.add_argument(
         "--noncore-target-mode",
         type=str,
         default="self",
         choices=["self", "neighbor"],
         help="noncore 用户的监督目标：self=预测用户自身在 t+1 的 stance（推荐）；neighbor=预测邻居在 t+1 的 stance（需要 noncore 有邻居图）。",
+    )
+    parser.add_argument(
+        "--core-target-mode",
+        type=str,
+        default="neighbor",
+        choices=["self", "neighbor"],
+        help="core 用户的监督目标：self=预测用户自身在 t+1 的 stance；neighbor=预测邻居在 t+1 的 stance（旧默认）。",
+    )
+    parser.add_argument(
+        "--no-shuffle-neighbors",
+        action="store_true",
+        help="默认会在截断 max-neighbor-users 之前对邻居列表做确定性打乱（避免顺序偏置）。传入此参数则不打乱。",
+    )
+    parser.add_argument(
+        "--neighbor-shuffle-seed",
+        type=int,
+        default=0,
+        help="邻居打乱的全局种子（会与 topic/event/user/t 的 hash 组合，确保每个样本可复现）。",
+    )
+    parser.add_argument(
+        "--z-transition-conditioning",
+        type=str,
+        default="population_only",
+        choices=["population_only", "core_user"],
+        help="z_transition 数据集的条件输入：population_only=仅次要用户群体观测；core_user=以 core 用户视角构造 question，并监督 secondary population 的 z(t)->z(t+1)。",
+    )
+    parser.add_argument(
+        "--z-transition-population-mode",
+        type=str,
+        default="scalar",
+        choices=["scalar", "dist"],
+        help="z_transition 的 z 表示：scalar=z∈[-1,1]；dist=z∈Δ^3（由 secondary 用户 stance 分布归一化得到，形如 [p_neu,p_opp,p_sup]，按 label2id 的 id 顺序）。",
+    )
+    parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="默认会在每个输出目录生成 preview.jsonl（抽样若干条数据用于人工检查）。传入此参数则关闭。",
+    )
+    parser.add_argument(
+        "--preview-num-per-split",
+        type=int,
+        default=3,
+        help="preview.jsonl 中每个 split 抽样多少条样本（默认 3）。",
+    )
+    parser.add_argument(
+        "--preview-seed",
+        type=int,
+        default=42,
+        help="preview 抽样随机种子（保证可复现）。",
+    )
+    parser.add_argument(
+        "--preview-max-chars",
+        type=int,
+        default=600,
+        help="preview.jsonl 里 question 的截断长度（避免文件过大）。0 表示不截断。",
+    )
+    parser.add_argument(
+        "--preview-filename",
+        type=str,
+        default="preview.jsonl",
+        help="预览文件名（默认 preview.jsonl）。",
     )
 
     args = parser.parse_args()
@@ -1408,6 +2092,7 @@ def main():
         max_self_tweets=args.max_self_tweets,
         max_neighbor_users=args.max_neighbor_users,
         max_neighbor_tweets_total=args.max_neighbor_tweets_total,
+        neighbor_k_recent_tweets=int(args.neighbor_k_recent_tweets),
         include_user_history=(not args.no_user_history),
         max_user_history_chars=args.max_user_history_chars,
         use_population_observation=(not args.no_population_observation),
@@ -1423,7 +2108,19 @@ def main():
         force_k=int(args.force_k),
         export_z_transition_dataset=bool(args.export_z_transition_dataset),
         z_transition_out_dir=str(args.z_transition_out_dir or ""),
+        z_transition_population_mode=str(getattr(args, "z_transition_population_mode", "scalar") or "scalar"),
+        export_action_imitation_dataset=bool(getattr(args, "export_action_imitation_dataset", False)),
+        action_imitation_out_dir=str(getattr(args, "action_imitation_out_dir", "") or ""),
+        export_preview=(not bool(getattr(args, "no_preview", False))),
+        preview_num_per_split=int(getattr(args, "preview_num_per_split", 3)),
+        preview_seed=int(getattr(args, "preview_seed", 42)),
+        preview_max_chars=int(getattr(args, "preview_max_chars", 600)),
+        preview_filename=str(getattr(args, "preview_filename", "preview.jsonl") or "preview.jsonl"),
         noncore_target_mode=str(args.noncore_target_mode or "self"),
+        core_target_mode=str(args.core_target_mode or "neighbor"),
+        shuffle_neighbors_before_truncation=(not bool(args.no_shuffle_neighbors)),
+        neighbor_shuffle_seed=int(args.neighbor_shuffle_seed),
+        z_transition_conditioning=str(args.z_transition_conditioning or "population_only"),
     )
 
 

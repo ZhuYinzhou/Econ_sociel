@@ -4,6 +4,11 @@ import numpy as np
 import os
 from datasets import load_dataset, Dataset, IterableDataset, DatasetDict
 try:
+    # Optional: concatenate_datasets is available in HuggingFace datasets
+    from datasets import concatenate_datasets  # type: ignore
+except Exception:
+    concatenate_datasets = None  # type: ignore
+try:
     from datasets import load_from_disk  # type: ignore
 except Exception:
     load_from_disk = None  # type: ignore
@@ -22,6 +27,9 @@ class HuggingFaceDatasetEnv(gym.Env):
     def __init__(self, **kwargs):
         super().__init__()
         
+        # hf_dataset_path can be:
+        # - str: a HF hub dataset name or a local save_to_disk directory
+        # - list[str]: multiple datasets to be merged (concatenated) AFTER loading the same split
         self.dataset_path = kwargs.get("hf_dataset_path", "gsm8k")
         self.dataset_config_name = kwargs.get("hf_dataset_config_name", None)
         self.dataset_split = kwargs.get("dataset_split", "train")
@@ -48,11 +56,31 @@ class HuggingFaceDatasetEnv(gym.Env):
         
         self.question_field = kwargs.get("question_field_name", "question")
         self.answer_field = kwargs.get("answer_field_name", "answer")
+
+        # ===== Optional: oversample a specific stance-id label on train split =====
+        # Motivation: stage-1/2 offline stance classification can be highly imbalanced (e.g., label1 < 1%).
+        # We only oversample TRAIN split; validation/test must keep the original distribution.
+        self.oversample_enabled = bool(kwargs.get("oversample_enabled", False))
+        self.oversample_only_train = bool(kwargs.get("oversample_only_train", True))
+        self.oversample_label_id = int(kwargs.get("oversample_label_id", 1))
+        self.oversample_target_ratio = float(kwargs.get("oversample_target_ratio", 0.05))  # e.g., 0.05~0.10
+        self.oversample_seed = int(kwargs.get("oversample_seed", 42))
+        # Safety cap to avoid exploding dataset size (multiplier for the minority class)
+        self.oversample_max_multiplier = int(kwargs.get("oversample_max_multiplier", 30))
+        if self.oversample_max_multiplier < 1:
+            self.oversample_max_multiplier = 1
+        if self.oversample_target_ratio < 0.0:
+            self.oversample_target_ratio = 0.0
+        if self.oversample_target_ratio > 0.99:
+            self.oversample_target_ratio = 0.99
         
         # For reward calculation, if needed directly in env
         self.reward_args = kwargs.get("reward_config", {})
         # Whether to emit belief/z supervision fields from samples (for z_transition training)
         self.emit_belief_fields = bool(kwargs.get("emit_belief_fields", True))
+        # Verbosity control: this env can print very long observations every step.
+        # Disable for training runs to avoid terminal spam.
+        self.verbose_step_logging = bool(kwargs.get("verbose_step_logging", True))
         # Optional: population belief dim for offline transition supervision.
         # - K=3: categorical distribution over stances
         # - K=1: scalar z in [-1,1]
@@ -63,29 +91,62 @@ class HuggingFaceDatasetEnv(gym.Env):
             # Support both:
             # - HuggingFace hub datasets via load_dataset(...)
             # - local datasets saved by DatasetDict.save_to_disk(...) via load_from_disk(...)
-            use_local_disk = bool(isinstance(self.dataset_path, str) and os.path.isdir(self.dataset_path))
-            if use_local_disk:
-                if self.is_streaming:
-                    logger.warning("dataset_streaming=True is not supported for load_from_disk datasets. Forcing streaming=False.")
-                    self.is_streaming = False
-                if load_from_disk is None:
-                    raise RuntimeError("datasets.load_from_disk is unavailable. Please ensure `datasets` is installed correctly.")
-                loaded = load_from_disk(self.dataset_path)
-                # loaded can be Dataset or DatasetDict
-                if isinstance(loaded, DatasetDict):
-                    if self.dataset_split not in loaded:
-                        raise KeyError(f"Split '{self.dataset_split}' not found in dataset at {self.dataset_path}. Available: {list(loaded.keys())}")
-                    self.dataset = loaded[self.dataset_split]
+            # Also support merging multiple datasets (list of paths/names) by concatenation.
+
+            def _load_one(path_or_name: str):
+                use_local = bool(isinstance(path_or_name, str) and os.path.isdir(path_or_name))
+                if use_local:
+                    if self.is_streaming:
+                        logger.warning("dataset_streaming=True is not supported for load_from_disk datasets. Forcing streaming=False.")
+                        self.is_streaming = False
+                    if load_from_disk is None:
+                        raise RuntimeError("datasets.load_from_disk is unavailable. Please ensure `datasets` is installed correctly.")
+                    loaded = load_from_disk(path_or_name)
+                    if isinstance(loaded, DatasetDict):
+                        if self.dataset_split not in loaded:
+                            raise KeyError(
+                                f"Split '{self.dataset_split}' not found in dataset at {path_or_name}. Available: {list(loaded.keys())}"
+                            )
+                        ds = loaded[self.dataset_split]
+                    else:
+                        ds = loaded
+                    logger.info(f"Loaded dataset from disk: {path_or_name}, split: {self.dataset_split}, streaming={self.is_streaming}")
+                    return ds
                 else:
-                    # If it's a single Dataset, treat it as the requested split
-                    self.dataset = loaded
-                logger.info(f"Loaded dataset from disk: {self.dataset_path}, split: {self.dataset_split}, streaming={self.is_streaming}")
+                    ds = load_dataset(
+                        path_or_name,
+                        name=self.dataset_config_name,
+                        split=self.dataset_split,
+                        streaming=self.is_streaming
+                    )
+                    return ds
+
+            # Normalize dataset_path into a list or a single string
+            ds_sources: List[str] = []
+            if isinstance(self.dataset_path, (list, tuple)):
+                ds_sources = [str(x) for x in self.dataset_path if str(x).strip() != ""]
+            elif isinstance(self.dataset_path, str) and "," in self.dataset_path:
+                # allow comma-separated for convenience in CLI/env
+                ds_sources = [s.strip() for s in self.dataset_path.split(",") if s.strip()]
             else:
-                self.dataset = load_dataset(
-                    self.dataset_path,
-                    name=self.dataset_config_name,
-                    split=self.dataset_split,
-                    streaming=self.is_streaming
+                ds_sources = [str(self.dataset_path)]
+
+            if self.is_streaming and len(ds_sources) > 1:
+                raise RuntimeError("Merging multiple datasets is not supported in streaming mode. Set dataset_streaming: false.")
+
+            if len(ds_sources) == 1:
+                self.dataset = _load_one(ds_sources[0])
+            else:
+                if concatenate_datasets is None:
+                    raise RuntimeError("datasets.concatenate_datasets is unavailable; cannot merge multiple datasets.")
+                parts = []
+                for src in ds_sources:
+                    parts.append(_load_one(src))
+                self.dataset = concatenate_datasets(parts)
+                logger.info(
+                    f"Merged {len(parts)} datasets by concatenation for split='{self.dataset_split}': "
+                    + ", ".join(ds_sources)
+                    + f" | merged_num_samples={len(self.dataset)}"
                 )
             if self.is_streaming:
                 self.dataset_iterator = iter(self.dataset)
@@ -101,6 +162,93 @@ class HuggingFaceDatasetEnv(gym.Env):
                     self.dataset_list = [s for s in self.dataset_list if bool(s.get("is_core_user", False)) == want]
                     after = len(self.dataset_list)
                     logger.info(f"Filtered dataset by is_core_user={want}: {before} -> {after}")
+
+                # Optional: oversample minority label on TRAIN split only
+                try:
+                    do_oversample = bool(self.oversample_enabled)
+                    if self.oversample_only_train and str(self.dataset_split).lower() != "train":
+                        do_oversample = False
+                    if do_oversample:
+                        na = int(getattr(self, "n_actions", 1))
+                        if na <= 1:
+                            logger.warning("[HFEnv] oversample_enabled=True but n_actions<=1; skipping oversampling.")
+                        else:
+                            # Compute label ids from boxed answer: \boxed{<id>}
+                            boxed_re = getattr(self, "_boxed_int_re", re.compile(r"\\boxed\{\s*([-+]?\d+)\s*\}"))
+                            y: List[int] = []
+                            idx_by_label: Dict[int, List[int]] = {i: [] for i in range(na)}
+                            missing = 0
+                            for i, s in enumerate(self.dataset_list):
+                                a = s.get(self.answer_field, "")
+                                if not isinstance(a, str):
+                                    missing += 1
+                                    y.append(-1)
+                                    continue
+                                m = boxed_re.search(a)
+                                if not m:
+                                    missing += 1
+                                    y.append(-1)
+                                    continue
+                                try:
+                                    sid = int(m.group(1))
+                                except Exception:
+                                    missing += 1
+                                    y.append(-1)
+                                    continue
+                                y.append(sid)
+                                if 0 <= sid < na:
+                                    idx_by_label[sid].append(i)
+
+                            counts = [len(idx_by_label[i]) for i in range(na)]
+                            total = int(sum(counts))
+                            lid = int(self.oversample_label_id)
+                            if not (0 <= lid < na):
+                                logger.warning(f"[HFEnv] oversample_label_id={lid} out of range for n_actions={na}; skipping oversampling.")
+                            elif total <= 0:
+                                logger.warning("[HFEnv] No valid boxed labels found; skipping oversampling.")
+                            elif len(idx_by_label.get(lid, [])) <= 0:
+                                logger.warning(f"[HFEnv] No samples for label_id={lid}; skipping oversampling.")
+                            else:
+                                cur = float(counts[lid]) / float(total) if total > 0 else 0.0
+                                tgt = float(self.oversample_target_ratio)
+                                if tgt <= 0.0 or cur >= tgt:
+                                    logger.info(
+                                        f"[HFEnv] Oversampling skipped (current_ratio={cur:.4f} >= target_ratio={tgt:.4f}). "
+                                        f"counts={counts}, missing_boxed={missing}"
+                                    )
+                                else:
+                                    # x >= (tgt*total - count_lid) / (1 - tgt)
+                                    need = int(np.ceil((tgt * float(total) - float(counts[lid])) / max(1e-8, (1.0 - tgt))))
+                                    # Cap by max_multiplier
+                                    max_extra = int(self.oversample_max_multiplier * counts[lid] - counts[lid])
+                                    if max_extra < 0:
+                                        max_extra = 0
+                                    extra = int(min(need, max_extra))
+                                    if extra <= 0:
+                                        logger.info(
+                                            f"[HFEnv] Oversampling computed extra<=0 (need={need}, cap_extra={max_extra}); skipping."
+                                        )
+                                    else:
+                                        rng = random.Random(int(self.oversample_seed))
+                                        src_indices = list(idx_by_label[lid])
+                                        add_samples = [self.dataset_list[rng.choice(src_indices)] for _ in range(extra)]
+                                        before_n = len(self.dataset_list)
+                                        self.dataset_list.extend(add_samples)
+                                        after_n = len(self.dataset_list)
+
+                                        # Recompute counts for logging
+                                        # (Only for valid boxed ids; duplicates are included)
+                                        new_counts = counts[:]
+                                        new_counts[lid] = new_counts[lid] + extra
+                                        new_total = int(sum(new_counts))
+                                        new_ratio = float(new_counts[lid]) / float(new_total) if new_total > 0 else 0.0
+                                        logger.info(
+                                            f"[HFEnv] Oversampled label_id={lid} on split='{self.dataset_split}': "
+                                            f"target_ratio={tgt:.3f}, current_ratio={cur:.3f} -> new_ratio={new_ratio:.3f}; "
+                                            f"added={extra}, size={before_n}->{after_n}, counts={counts}->{new_counts}, missing_boxed={missing}"
+                                        )
+                except Exception as e:
+                    logger.warning(f"[HFEnv] Oversampling failed (skipped): {e}")
                 self.dataset_iterator = None # Will be created in reset
                 self.current_data_idx = -1
                 self.num_samples = len(self.dataset_list)
@@ -118,22 +266,76 @@ class HuggingFaceDatasetEnv(gym.Env):
         self.max_question_length = kwargs.get("max_question_length", 1024)
         self.max_answer_length = kwargs.get("max_answer_length", 1024) # For action space
 
-        # Define action space - what the agent "outputs" to the environment
-        # For LLMs, this is typically the generated text.
-        # Using gym.spaces.Text requires gym version 0.26+
-        # As a placeholder, or if direct text passing is used, can be simplified.
-        self.action_space = spaces.Text(max_length=self.max_answer_length)
+        # ===== Runtime sample validation (helps rule out data issues that can cause NaNs) =====
+        # Some degenerate samples (e.g., empty question/answer) can lead to all-padding inputs and
+        # downstream NaNs in attention. We count and optionally skip such samples.
+        self._invalid_sample_skipped = 0
+        self._invalid_sample_last_reason = ""
+        self._invalid_sample_max_resample = int(kwargs.get("invalid_sample_max_resample", 2000))
+        self._invalid_sample_max_resample = max(1, self._invalid_sample_max_resample)
+        self._boxed_int_re = re.compile(r"\\boxed\{\s*([-+]?\d+)\s*\}")
 
-        # Define observation space - what the agent "sees"
-        # This will be the question text.
+        # ===== Optional: log stance label distribution (helps diagnose acc plateaus) =====
+        # Many stage-1/2 runs are pure stance-id classification (K=3). If the dataset is imbalanced
+        # (e.g., one label takes ~0.76), accuracy can appear "stuck" even when learning progresses slowly.
+        self.log_label_distribution = bool(kwargs.get("log_label_distribution", True))
+        try:
+            if (
+                self.log_label_distribution
+                and (not bool(getattr(self, "is_streaming", False)))
+                and hasattr(self, "dataset_list")
+                and isinstance(getattr(self, "dataset_list", None), list)
+            ):
+                na = int(getattr(self, "n_actions", 1))
+                if na and na > 1 and len(self.dataset_list) > 0:
+                    counts = [0 for _ in range(na)]
+                    missing = 0
+                    out_of_range = 0
+                    non_string = 0
+                    for s in self.dataset_list:
+                        if not isinstance(s, dict):
+                            continue
+                        a = s.get(self.answer_field, "")
+                        if not isinstance(a, str):
+                            non_string += 1
+                            continue
+                        m = self._boxed_int_re.search(a)
+                        if not m:
+                            missing += 1
+                            continue
+                        try:
+                            sid = int(m.group(1))
+                        except Exception:
+                            missing += 1
+                            continue
+                        if 0 <= sid < na:
+                            counts[sid] += 1
+                        else:
+                            out_of_range += 1
+
+                    total = int(sum(counts))
+                    if total > 0:
+                        props = [c / float(total) for c in counts]
+                        logger.info(
+                            f"[HFEnv] Label distribution (boxed id) over loaded split='{self.dataset_split}', "
+                            f"is_core_user={self.filter_is_core_user}, n_actions={na}: "
+                            + ", ".join([f"{i}:{counts[i]}({props[i]:.3f})" for i in range(na)])
+                            + f" | missing_boxed={missing}, out_of_range={out_of_range}, non_string={non_string}"
+                        )
+        except Exception as e:
+            logger.warning(f"[HFEnv] Failed to log label distribution: {e}")
+
+        # Define action/observation spaces - what the agent "outputs" / "sees"
+        # Using gym.spaces.Text requires gym version 0.26+
+        self.action_space = spaces.Text(max_length=self.max_answer_length)
         self.observation_space = spaces.Text(max_length=self.max_question_length)
-        
+
         # Current sample from the dataset
         self.current_sample: Optional[Dict] = None
         self.current_question: Optional[str] = None
         self.current_ground_truth_answer: Optional[str] = None
         self.episode_count = 0  # 添加episode计数器，用于追踪问题
-        
+
         # 数据集级别episode的状态追踪
         if self.use_dataset_episode:
             self.step_count = 0  # 当前episode内的步数
@@ -142,50 +344,106 @@ class HuggingFaceDatasetEnv(gym.Env):
             self.episode_results = []  # 当前episode的所有结果
         else:
             # Episode specifics (each question is an episode)
-            self.episode_length = 0 # Steps within current episode (always 1)
+            self.episode_length = 0  # Steps within current episode (always 1)
             self.episode_limit = 1
 
-    def _get_next_sample(self) -> Optional[Dict]:
-        if self.is_streaming:
+    def _validate_sample(self, sample: Any) -> Tuple[bool, str]:
+        """
+        Return (is_valid, reason_if_invalid).
+        - Requires non-empty question/answer strings
+        - If n_actions > 1 (classification), requires answer contains \\boxed{<id>} within [0, n_actions-1]
+        """
+        if not isinstance(sample, dict):
+            return False, f"sample_not_dict:{type(sample)}"
+        q = sample.get(self.question_field, "")
+        a = sample.get(self.answer_field, "")
+        if not isinstance(q, str) or not isinstance(a, str):
+            return False, f"non_string_fields:q={type(q)},a={type(a)}"
+        if q.strip() == "":
+            return False, "empty_question"
+        if a.strip() == "":
+            return False, "empty_answer"
+        # Only enforce boxed-id format for classification-like settings
+        try:
+            na = int(getattr(self, "n_actions", 1))
+        except Exception:
+            na = 1
+        if na > 1:
+            m = self._boxed_int_re.search(a)
+            if not m:
+                return False, "answer_missing_boxed_id"
             try:
-                # In streaming mode, loop until we find a matching sample if filtering is enabled
-                while True:
-                    sample = next(self.dataset_iterator)
-                    if self.filter_is_core_user is None:
-                        return sample
-                    want = bool(self.filter_is_core_user)
-                    if bool(sample.get("is_core_user", False)) == want:
-                        return sample
-            except StopIteration:
-                logger.info("Streaming dataset iterator exhausted.")
-                return None
-        else:
-            if self.use_dataset_episode:
-                # 数据集级别episode：顺序遍历所有样本
-                self.current_data_idx += 1
-                if self.current_data_idx < self.num_samples:
-                    return self.dataset_list[self.current_data_idx]
-                else:
-                    logger.info("Dataset-level episode completed: all samples processed.")
-                    return None
-            elif self.use_random_sampling:
-                # 随机采样：每次随机选择一个样本
-                if self.num_samples > 0:
-                    random_idx = random.randint(0, self.num_samples - 1)
-                    sample = self.dataset_list[random_idx]
-                    logger.debug(f"Random sampling: selected index {random_idx}")
-                    return sample
-                else:
-                    logger.info("Dataset is empty.")
+                sid = int(m.group(1))
+            except Exception:
+                return False, "boxed_id_parse_error"
+            if sid < 0 or sid >= na:
+                return False, f"boxed_id_out_of_range:{sid}"
+        return True, ""
+
+    def _get_next_sample(self) -> Optional[Dict]:
+        """Get next sample, skipping invalid ones (up to a max resample limit)."""
+
+        def _sample_once() -> Optional[Dict]:
+            # Original sampling logic
+            if self.is_streaming:
+                try:
+                    # In streaming mode, loop until we find a matching sample if filtering is enabled
+                    while True:
+                        sample = next(self.dataset_iterator)
+                        if self.filter_is_core_user is None:
+                            return sample
+                        want = bool(self.filter_is_core_user)
+                        if bool(sample.get("is_core_user", False)) == want:
+                            return sample
+                except StopIteration:
+                    logger.info("Streaming dataset iterator exhausted.")
                     return None
             else:
-                # 顺序采样：原有逻辑
-                self.current_data_idx += 1
-                if self.current_data_idx < self.num_samples:
-                    return self.dataset_list[self.current_data_idx]
+                if self.use_dataset_episode:
+                    # 数据集级别episode：顺序遍历所有样本
+                    self.current_data_idx += 1
+                    if self.current_data_idx < self.num_samples:
+                        return self.dataset_list[self.current_data_idx]
+                    else:
+                        logger.info("Dataset-level episode completed: all samples processed.")
+                        return None
+                elif self.use_random_sampling:
+                    # 随机采样：每次随机选择一个样本
+                    if self.num_samples > 0:
+                        random_idx = random.randint(0, self.num_samples - 1)
+                        sample = self.dataset_list[random_idx]
+                        logger.debug(f"Random sampling: selected index {random_idx}")
+                        return sample
+                    else:
+                        logger.info("Dataset is empty.")
+                        return None
                 else:
-                    logger.info("Non-streaming dataset iterator exhausted.")
-                    return None
+                    # 顺序采样：原有逻辑
+                    self.current_data_idx += 1
+                    if self.current_data_idx < self.num_samples:
+                        return self.dataset_list[self.current_data_idx]
+                    else:
+                        logger.info("Non-streaming dataset iterator exhausted.")
+                        return None
+
+        attempts = 0
+        while attempts < self._invalid_sample_max_resample:
+            attempts += 1
+            sample = _sample_once()
+            if sample is None:
+                return None
+            ok, reason = self._validate_sample(sample)
+            if ok:
+                return sample
+            self._invalid_sample_skipped += 1
+            self._invalid_sample_last_reason = str(reason)
+            if self._invalid_sample_skipped <= 3 or (self._invalid_sample_skipped % 200 == 0):
+                logger.warning(f"Skipped invalid sample (count={self._invalid_sample_skipped}): {reason}")
+        logger.error(
+            f"Too many invalid samples encountered (attempts={attempts}, skipped={self._invalid_sample_skipped}). "
+            f"Last reason: {self._invalid_sample_last_reason}"
+        )
+        return None
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Any, Dict[str, Any]]:
         super().reset(seed=seed) # Gym 0.26+
@@ -229,10 +487,12 @@ class HuggingFaceDatasetEnv(gym.Env):
         # 记录问题变化以便调试
         if self.use_dataset_episode:
             question_preview = self.current_question[:100] + "..." if len(self.current_question) > 100 else self.current_question
-            logger.info(f"Episode {self.episode_count}, Step {self.step_count + 1}/{self.num_samples}: {question_preview}")
+            if bool(getattr(self, "verbose_step_logging", True)):
+                logger.info(f"Episode {self.episode_count}, Step {self.step_count + 1}/{self.num_samples}: {question_preview}")
         else:
             question_preview = self.current_question[:100] + "..." if len(self.current_question) > 100 else self.current_question
-            logger.info(f"Episode {self.episode_count}: New question - {question_preview}")
+            if bool(getattr(self, "verbose_step_logging", True)):
+                logger.info(f"Episode {self.episode_count}: New question - {question_preview}")
         
         # Observation is the question text
         # Preprocess if necessary (e.g., tokenization if obs_space was Box)
@@ -240,6 +500,9 @@ class HuggingFaceDatasetEnv(gym.Env):
         observation = self.current_question 
         
         info = {"sample": self.current_sample} # Pass the whole sample for potential use in reward or logging
+        # Expose validation/skip counters to help diagnose data issues
+        info["invalid_sample_skipped"] = int(getattr(self, "_invalid_sample_skipped", 0))
+        info["invalid_sample_last_reason"] = str(getattr(self, "_invalid_sample_last_reason", ""))
         return observation, info
 
     def get_belief_tensor(self, belief_inputs: Optional[Dict[str, Any]], device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
@@ -334,10 +597,11 @@ class HuggingFaceDatasetEnv(gym.Env):
         if extra_info is None:
             extra_info = {}
 
-        # === 清晰显示完整推理过程 ===
-        logger.info("=" * 80)
-        logger.info(f"🔍 QUESTION: {self.current_question}")
-        logger.info("=" * 80)
+        # === Verbose step logging (VERY noisy for long social-media observations) ===
+        if self.verbose_step_logging:
+            logger.info("=" * 80)
+            logger.info(f"🔍 QUESTION: {self.current_question}")
+            logger.info("=" * 80)
         
         # Strategy will be logged by MAC
         
@@ -345,8 +609,9 @@ class HuggingFaceDatasetEnv(gym.Env):
         
         # Coordinator commitment will be logged by MAC
         
-        logger.info(f"📖 GROUND TRUTH: {self.current_ground_truth_answer}")
-        logger.info("=" * 80)
+        if self.verbose_step_logging:
+            logger.info(f"📖 GROUND TRUTH: {self.current_ground_truth_answer}")
+            logger.info("=" * 80)
 
         # --- Reward Calculation ---
         # 权重（如果某项权重为 0，则跳过该项的昂贵计算，尤其是 TF-IDF 相似度）
@@ -372,13 +637,14 @@ class HuggingFaceDatasetEnv(gym.Env):
 
         total_reward = al_weight * float(reward_al) + ts_weight * float(reward_ts) + cc_weight * float(reward_cc)
         
-        # 显示奖励信息
-        logger.info(f"🎯 REWARD BREAKDOWN:")
-        logger.info(f"   TS (Task-Specific): {reward_ts:.3f} * {ts_weight:.1f} = {reward_ts * ts_weight:.3f}")
-        logger.info(f"   AL (Action Likelihood): {reward_al:.3f} * {al_weight:.1f} = {reward_al * al_weight:.3f}")
-        logger.info(f"   CC (Collaborative): {reward_cc:.3f} * {cc_weight:.1f} = {reward_cc * cc_weight:.3f}")
-        logger.info(f"   TOTAL REWARD: {total_reward:.3f}")
-        logger.info("=" * 80)
+        # 显示奖励信息（可关闭）
+        if self.verbose_step_logging:
+            logger.info(f"🎯 REWARD BREAKDOWN:")
+            logger.info(f"   TS (Task-Specific): {reward_ts:.3f} * {ts_weight:.1f} = {reward_ts * ts_weight:.3f}")
+            logger.info(f"   AL (Action Likelihood): {reward_al:.3f} * {al_weight:.1f} = {reward_al * al_weight:.3f}")
+            logger.info(f"   CC (Collaborative): {reward_cc:.3f} * {cc_weight:.1f} = {reward_cc * cc_weight:.3f}")
+            logger.info(f"   TOTAL REWARD: {total_reward:.3f}")
+            logger.info("=" * 80)
         
         # --- 数据集级别episode的特殊处理 ---
         if self.use_dataset_episode:
@@ -439,6 +705,25 @@ class HuggingFaceDatasetEnv(gym.Env):
             "llm_answer": llm_answer_str,
             "ground_truth_answer": self.current_ground_truth_answer
         }
+
+        # Pass-through optional fields from dataset samples.
+        # - structured conditioning fields: used by encoder-only z_transition training
+        # - target_distribution_prob: used by Stage1/2 soft-label supervised training
+        try:
+            if isinstance(self.current_sample, dict):
+                for k in (
+                    "core_stance_id_t",
+                    "core_action_type_id_t",
+                    "has_user_history",
+                    "has_neighbors",
+                    "neighbor_action_type_counts_t",
+                    "neighbor_stance_counts_t",
+                    "target_distribution_prob",
+                ):
+                    if k in self.current_sample:
+                        info[k] = self.current_sample.get(k)
+        except Exception:
+            pass
 
         # Optional: emit belief/z supervision fields for offline transition training
         if self.emit_belief_fields and isinstance(self.current_sample, dict):

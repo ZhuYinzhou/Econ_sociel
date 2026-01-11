@@ -1,0 +1,105 @@
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# Stage3: Offline z(t)->z(t+1) transition supervision (K=3 distribution), conditioned on core-user context.
+t_max: 50000
+test_interval: 5000
+test_nepisode: 16
+
+n_agents: 3
+belief_dim: 128
+population_belief_dim: 3
+batch_size_run: 1
+
+# Keep top-level n_actions compatible; env uses 1 dummy action here.
+n_actions: 5
+env_action_source: "discrete_action_boxed"
+
+enable_llm_rollout: false
+together_api_key: ""
+coordinator_model: "gpt-4.1"
+executor_model: "gpt-4.1"
+llm_model_name: "gpt2"
+
+lr: 0.001
+encoder_lr: 0.001
+belief_net_lr: 0.0
+mixer_lr: 0.0
+weight_decay: 0.0
+lambda_sd: 0.0
+lambda_m: 0.0
+stage2_weight: 0.0
+bne_max_iterations: 0
+
+arch:
+  entity_dim: 256
+  attention_heads: 4
+  transformer_blocks: 2
+  key_dim: 64
+  mlp_hidden_size: 256
+  feedforward_size: 1024
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.00001
+
+prompt_attention_heads: 2
+commitment_embedding_dim: 1024
+
+train_encoder_only: true
+use_mixer: false
+
+# Stage3a hard constraints:
+# - Explicit stage conditioning in population_update_head
+# - Only train population_update_head (+ stage_embed / mixing gate), freeze the rest of encoder/agent
+population_update_use_stage: true
+train_population_update_head_only: true
+
+z_transition_loss_weight: 1.0
+z_transition_loss_type: "kl"
+
+env: "huggingface_dataset_env"
+env_args:
+  hf_dataset_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1_z_transition"  # <- replace with *_z_transition dir you generated
+  dataset_split: "train"
+  question_field_name: "question"
+  answer_field_name: "answer"
+  max_question_length: 1024
+  max_answer_length: 32
+  dataset_streaming: false
+  use_random_sampling: true
+  use_dataset_episode: false
+  filter_is_core_user: null
+  n_actions: 1
+  emit_belief_fields: true
+  population_belief_dim: 3
+  verbose_step_logging: false
+
+reward:
+  al_weight: 0.0
+  ts_weight: 0.0
+  cc_weight: 0.0
+
+train:
+  buffer_size: 32
+  batch_size: 16
+  update_interval: 10
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: false
+
+logging:
+  use_tensorboard: true
+  log_interval: 20
+  save_model: true
+  save_model_interval: 5000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-z-transition-dist-cond"
+

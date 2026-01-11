@@ -29,6 +29,9 @@ class BeliefEncoder(nn.Module):
         population_update_hidden_dim: int = 128,
         population_update_use_group_repr: bool = True,
         population_update_use_stage: bool = False,
+        # --- optional structured conditioning vector for z-transition ---
+        population_update_use_extra_cond: bool = False,
+        population_update_extra_cond_dim: int = 0,
         # residual mixing: z_next = mix * z_hat + (1-mix) * z_t
         population_update_residual_mixing: bool = True,
         population_update_mixing_init: float = 0.5,
@@ -73,6 +76,8 @@ class BeliefEncoder(nn.Module):
         self.population_update_hidden_dim = int(population_update_hidden_dim)
         self.population_update_use_group_repr = bool(population_update_use_group_repr)
         self.population_update_use_stage = bool(population_update_use_stage)
+        self.population_update_use_extra_cond = bool(population_update_use_extra_cond)
+        self.population_update_extra_cond_dim = int(population_update_extra_cond_dim)
         self.population_update_residual_mixing = bool(population_update_residual_mixing)
         self.population_update_mixing_init = float(population_update_mixing_init)
         self.population_update_mixing_learnable = bool(population_update_mixing_learnable)
@@ -102,8 +107,14 @@ class BeliefEncoder(nn.Module):
         else:
             self.population_proj = None
 
-        # 可选：stage token（时序条件化）
-        if self.use_stage_token:
+        # stage embedding (用于显式时序条件化)
+        #
+        # IMPORTANT:
+        # - 历史上 `stage_embed` 只在 use_stage_token=True 时初始化（用于 attention token）。
+        # - 但 Stage3a 希望 population_update_head 显式带 stage 条件，此时即使不把 stage 作为 token
+        #   融入 attention（use_stage_token=False），population_update_head 仍需要 stage_embed。
+        need_stage_embed = bool(self.use_stage_token or self.population_update_use_stage or self.secondary_action_use_stage)
+        if need_stage_embed:
             # stage_t 预期为 [0..n_stages-1]，额外留一个 padding/unknown
             self.stage_embed = nn.Embedding(max(1, self.n_stages) + 1, belief_dim)
         else:
@@ -120,6 +131,8 @@ class BeliefEncoder(nn.Module):
                 in_dim += belief_dim
             if self.population_update_use_stage:
                 in_dim += belief_dim
+            if self.population_update_use_extra_cond:
+                in_dim += max(0, int(self.population_update_extra_cond_dim))
             hid = max(8, self.population_update_hidden_dim)
             self.population_update_head = nn.Sequential(
                 nn.Linear(in_dim, hid),
@@ -283,6 +296,7 @@ class BeliefEncoder(nn.Module):
         *,
         group_repr: Optional[torch.Tensor] = None,
         stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
         return_logits: bool = False,
     ) -> torch.Tensor:
         """
@@ -329,6 +343,19 @@ class BeliefEncoder(nn.Module):
             st = st.to(z_t.device, dtype=torch.long).clamp(min=0, max=self.n_stages)
             st_tok = self.stage_embed(st)
             parts.append(st_tok)
+
+        if self.population_update_use_extra_cond and extra_cond is not None:
+            ec = extra_cond
+            if ec.ndim == 1:
+                ec = ec.unsqueeze(0)
+            if ec.ndim != 2:
+                raise ValueError(f"extra_cond 期望形状 [bs, D]，实际={tuple(extra_cond.shape)}")
+            # Best-effort check on dim if configured
+            if int(self.population_update_extra_cond_dim) > 0 and ec.size(-1) != int(self.population_update_extra_cond_dim):
+                raise ValueError(
+                    f"extra_cond dim 不匹配: expect D={int(self.population_update_extra_cond_dim)} got {ec.size(-1)}"
+                )
+            parts.append(ec)
 
         x = torch.cat(parts, dim=-1)
         logits = self.population_update_head(x)
@@ -460,6 +487,7 @@ class BeliefEncoder(nn.Module):
         *,
         group_repr: Optional[torch.Tensor] = None,
         stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
         loss_type: str = "kl",
     ) -> torch.Tensor:
         """
@@ -469,6 +497,7 @@ class BeliefEncoder(nn.Module):
             z_t,
             group_repr=group_repr,
             stage_t=stage_t,
+            extra_cond=extra_cond,
             return_logits=False,
         )
         return self.compute_population_belief_loss(z_pred, z_target, z_mask, loss_type=loss_type)

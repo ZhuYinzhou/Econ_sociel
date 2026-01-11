@@ -50,23 +50,31 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 自注意力层
-        # 处理注意力掩码：PyTorch的MultiheadAttention期望(seq_len, seq_len)形状的2D掩码
+        # IMPORTANT:
+        # - For padding masks, MultiheadAttention expects key_padding_mask with shape (bs, seq_len) (True=ignore)
+        # - attn_mask is for causal / pairwise masking with shape (seq_len, seq_len)
         attn_mask = None
+        key_padding_mask = None
         if mask is not None:
-            if mask.ndim == 2 and mask.shape[0] == x.shape[0]:  # (batch_size, seq_len)
-                # 转换为(seq_len, seq_len)，对于每个batch都相同
-                seq_len = mask.shape[1]
-                # 这里我们假设mask是一个padding mask，True表示需要忽略的位置
-                # 对于自注意力，我们需要一个(seq_len, seq_len)的掩码
-                # 简单处理：如果某个位置在任何batch中被mask，则在所有位置都mask它
-                # 或者我们可以直接使用第一个batch的mask
-                position_mask = mask[0]  # 取第一个batch的mask (seq_len,)
-                # 创建(seq_len, seq_len)的掩码
-                attn_mask = position_mask.unsqueeze(0).expand(seq_len, -1) | position_mask.unsqueeze(1).expand(-1, seq_len)
-            elif mask.ndim == 2 and mask.shape[0] == mask.shape[1]:  # 已经是(seq_len, seq_len)
+            if isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.shape[0] == x.shape[0]:
+                # This is a padding mask (bs, seq_len)
+                key_padding_mask = mask
+            elif isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.shape[0] == mask.shape[1]:
+                # This is an attention mask (seq_len, seq_len)
                 attn_mask = mask
-        
-        attended, _ = self.attention(x, x, x, attn_mask=attn_mask)
+
+        # Memory note:
+        # MultiheadAttention defaults to need_weights=True, which returns (and may materialize) attention weights
+        # of shape (bs, num_heads, seq_len, seq_len). For long seq_len (e.g., 1024) and large effective batch
+        # (bs*n_agents), this can easily OOM. We do NOT need attention weights here, so disable them.
+        attended, _ = self.attention(
+            x,
+            x,
+            x,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         
         # 残差连接和层归一化
         attended = self.norm1(x + attended)
@@ -256,12 +264,20 @@ class LLMTransformerAgent(nn.Module):
         )
         
         # 输出层（生成动作概率） - 这部分可能需要重新审视
-        # 在ECON中，动作是 prompt_embedding e_i。这里的 output_network 可能是用于离散动作空间。
-        # 如果框架完全依赖 e_i 作为动作，这个网络可能不需要或用途不同。
-        # 保留它以防万一，但标记为需要根据ECON的整体动作选择机制来确认。
-        self.output_network = nn.Sequential(
-            nn.Linear(self.belief_dim, args.n_actions)
-        )
+        # NOTE (重要): 为避免 Stage1(stance=3) 与 Stage4(action_type=5) 的 head 语义冲突，
+        # 这里拆分两个离散 head：
+        # - stance_head: K=3 (Neutral/Oppose/Support)，用于 Stage1/2 离线 stance 监督
+        # - action_type_head: A=5 (post/retweet/reply/like/do_nothing)，用于 Stage4 社交仿真离散动作选择（如使用）
+        self.stance_n_actions = int(getattr(args, "stance_n_actions", 3))
+        self.stance_n_actions = max(1, self.stance_n_actions)
+        self.action_type_n_actions = int(getattr(args, "action_type_n_actions", getattr(args, "n_actions", 5)))
+        self.action_type_n_actions = max(1, self.action_type_n_actions)
+
+        self.stance_head = nn.Linear(self.belief_dim, self.stance_n_actions)
+        self.action_type_head = nn.Linear(self.belief_dim, self.action_type_n_actions)
+        # Backward-compat alias: old checkpoints used "output_network" for discrete-action logits
+        # We keep an alias so state_dict keys can be loaded with strict=False.
+        self.output_network = self.action_type_head
         
         # 初始化 LLM 包装器
         self.llm_wrapper = ImprovedLLMWrapper(
@@ -369,10 +385,18 @@ class LLMTransformerAgent(nn.Module):
         # 如果是用于从 belief_state 派生其他类型的动作（例如离散动作选择），则保留。
         # 如果ECON框架中的动作 *仅仅* 是 e_i，那么 action_q_values 可能不直接用于最终动作选择，
         # 或者 Q_i^t 本身就是针对 e_i 的价值评估。
-        action_q_values = self.output_network(belief_state) # 这可能是用于辅助任务或不同的动作空间
+        # Discrete logits (two heads):
+        # - stance_action_q_values: shape (bs, 3)
+        # - action_type_q_values: shape (bs, 5)
+        stance_action_q_values = self.stance_head(belief_state)
+        action_type_q_values = self.action_type_head(belief_state)
         
         outputs = {
-            "action_q_values": action_q_values, # 可能是辅助输出
+            # Backward-compat key: keep "action_q_values" pointing to action_type head by default.
+            # BasicMAC will choose the correct head based on env avail_actions (3 vs 5).
+            "action_q_values": action_type_q_values,
+            "stance_action_q_values": stance_action_q_values,
+            "action_type_q_values": action_type_q_values,
             "belief_state": belief_state,       # b_i
             "prompt_embedding": prompt_embedding, # e_i = [T_i, p_i]
             "q_value": local_q_value,           # Q_i^t - 保持与BeliefNetwork一致的字段名
@@ -382,10 +406,16 @@ class LLMTransformerAgent(nn.Module):
         # 统一 hidden_state 返回为 None（Transformer 不需要 recurrent hidden）
         return outputs, None
     
-    def generate_answer(self, question: str, strategy: str, 
-                       belief_state: Optional[torch.Tensor] = None, # 可选，因为agent内部会生成
-                       temperature: Optional[float] = None, # 将从 self.current_prompt_embedding_tensor 获取
-                       repetition_penalty: Optional[float] = None) -> str: # 对应论文的 p_i
+    def generate_answer(
+        self,
+        question: str,
+        strategy: str,
+        belief_state: Optional[torch.Tensor] = None,  # 可选，因为agent内部会生成
+        temperature: Optional[float] = None,  # 将从 self.current_prompt_embedding_tensor 获取
+        repetition_penalty: Optional[float] = None,  # 对应论文的 p_i
+        forced_action_type: Optional[str] = None,
+        forced_stance_id: Optional[int] = None,
+    ) -> str:
         """
         使用 LLM 生成答案，基于当前的置信状态和动态生成的提示嵌入。
         
@@ -417,6 +447,24 @@ class LLMTransformerAgent(nn.Module):
         # 社交媒体仿真：executor prompt 要求输出严格 JSON（action_type + stance_id + post_text）
         # 注意：环境 observation 本身已包含 persona/neighbor/population 信息与 stance_id 映射。
         # 这里做“最后一道闸门”，确保输出格式可被 env 解析。
+        fa = str(forced_action_type).strip().lower() if forced_action_type is not None else ""
+        fs = None
+        try:
+            fs = int(forced_stance_id) if forced_stance_id is not None else None
+        except Exception:
+            fs = None
+
+        constraint_block = ""
+        if fa:
+            constraint_block += "\nPOLICY CONSTRAINTS (MUST FOLLOW):\n"
+            constraint_block += f'- You MUST output action_type exactly "{fa}".\n'
+            if fa in ("post", "retweet", "reply"):
+                constraint_block += f"- You MUST output stance_id exactly {int(fs) if fs is not None else 0}.\n"
+                constraint_block += "- You MUST output a non-empty post_text consistent with the observation.\n"
+            else:
+                constraint_block += '- You MUST output stance_id as null (or 0 if you cannot output null).\n'
+                constraint_block += '- You MUST output post_text as an empty string.\n'
+
         executor_prompt = f"""You are simulating a Twitter-like social media user in a multi-agent system.
 
 Context (observation):
@@ -427,6 +475,7 @@ Coordinator hint (optional):
 
 TASK:
 - Choose EXACTLY ONE action for the current user at the current stage.
+{constraint_block}
 
 OUTPUT FORMAT (STRICT):
 - Output JSON ONLY (no markdown, no extra text).
@@ -457,10 +506,10 @@ Return JSON only:"""
         )
         
         # 轻量校验/修复：确保返回可解析 JSON（env 侧也有解析，但这里尽量提高成功率）
-        fixed = self._ensure_social_json(answer)
+        fixed = self._ensure_social_json(answer, forced_action_type=fa if fa else None, forced_stance_id=fs)
         return fixed
 
-    def _ensure_social_json(self, s: Any) -> str:
+    def _ensure_social_json(self, s: Any, forced_action_type: Optional[str] = None, forced_stance_id: Optional[int] = None) -> str:
         """尽量把模型输出修复为 {"action_type": str, "stance_id": int|None, "post_text": str} 的 JSON 字符串。"""
         allowed_actions = {"post", "retweet", "reply", "like", "do_nothing"}
         stance_actions = {"post", "retweet", "reply"}
@@ -490,8 +539,12 @@ Return JSON only:"""
 
         def _normalize(obj: Dict[str, Any]) -> str:
             at = _coerce_action_type(obj)
+            # hard constraints (policy-guided): override action_type and stance_id
+            fa = str(forced_action_type).strip().lower() if forced_action_type else ""
+            if fa in allowed_actions:
+                at = fa
             if at in stance_actions:
-                sid = _coerce_stance_id(obj.get("stance_id"))
+                sid = forced_stance_id if forced_stance_id is not None else _coerce_stance_id(obj.get("stance_id"))
                 txt = _coerce_post_text(obj)
                 if sid is None:
                     sid = 0
@@ -563,7 +616,17 @@ Return JSON only:"""
         """
         agent_path = f"{path}/agent.th"
         if os.path.exists(agent_path):
-            self.load_state_dict(torch.load(agent_path, map_location=self.device))
+            # Backward/forward compatibility: checkpoints may have different head names.
+            sd = torch.load(agent_path, map_location=self.device)
+            try:
+                missing, unexpected = self.load_state_dict(sd, strict=False)
+                if missing:
+                    logger.warning(f"Agent checkpoint missing keys (ignored): {missing[:20]}{'...' if len(missing) > 20 else ''}")
+                if unexpected:
+                    logger.warning(f"Agent checkpoint unexpected keys (ignored): {unexpected[:20]}{'...' if len(unexpected) > 20 else ''}")
+            except Exception:
+                # ultra-safe fallback
+                self.load_state_dict(sd, strict=False)
             return
         # 兼容旧 checkpoint 命名
         bn = f"{path}/belief_network.th"
@@ -571,7 +634,15 @@ Return JSON only:"""
         if os.path.exists(bn):
             self.belief_network.load_state_dict(torch.load(bn, map_location=self.device))
         if os.path.exists(on):
-            self.output_network.load_state_dict(torch.load(on, map_location=self.device))
+            # Old behavior: output_network corresponded to discrete logits.
+            # Map it to action_type_head/output_network alias (and ignore shape mismatch via strict=False if needed).
+            try:
+                self.output_network.load_state_dict(torch.load(on, map_location=self.device), strict=False)
+            except Exception:
+                try:
+                    self.action_type_head.load_state_dict(torch.load(on, map_location=self.device), strict=False)
+                except Exception:
+                    pass
     
     def cuda(self):
         """

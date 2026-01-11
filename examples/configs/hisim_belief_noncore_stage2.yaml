@@ -1,0 +1,123 @@
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# Stage 2 (noncore) - offline supervised belief training
+# - Dataset: noncore users only (filter_is_core_user: "noncore")
+# - Target: stance_id classification (K=3) via boxed answer: \boxed{<id>}
+#
+# Notes:
+# - Top-level n_actions is kept at 5 for cross-stage compatibility with social sim,
+#   but env_args.n_actions=3 is the actual stance label space.
+# - If you want to load Stage1 weights, pass --load_model_path <stage1_ckpt_dir> to src/train.py
+
+t_max: 50000
+test_interval: 2000
+test_nepisode: 2000
+eval_dataset_split: "test"
+
+n_agents: 3
+belief_dim: 128
+batch_size_run: 1
+
+# Keep top-level action dim compatible with other stages
+n_actions: 5
+env_action_source: "discrete_action_boxed"
+
+# Offline only
+enable_llm_rollout: false
+together_api_key: ""
+coordinator_model: "gpt-4.1"
+executor_model: "gpt-4.1"
+llm_model_name: "gpt2"
+
+# === Stage1/2 supervised classification ===
+train_belief_supervised: true
+freeze_belief_encoder_in_supervised: true
+use_mixer: false
+belief_supervised_use_soft_labels: false
+belief_supervised_micro_batch_size: 4
+
+# ===== LRs / regularizers =====
+lr: 0.0003
+belief_net_lr: 0.0003
+encoder_lr: 0.0
+mixer_lr: 0.0
+weight_decay: 0.0
+lambda_sd: 0.0
+lambda_m: 0.0
+
+arch:
+  entity_dim: 256
+  attention_heads: 4
+  transformer_blocks: 2
+  key_dim: 64
+  mlp_hidden_size: 256
+  feedforward_size: 1024
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.00001
+
+prompt_attention_heads: 2
+commitment_embedding_dim: 1024
+
+env: "huggingface_dataset_env"
+env_args:
+  # Merge e1+e2 (optionally add blm) for Stage2 training
+  hf_dataset_path:
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_2_dataset_metoo_e1"
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_2_dataset_metoo_e2"
+    # - "/home/zhuyinzhou/MAS/ECON/data/stage_2_dataset_blm"
+  dataset_split: "train"
+  question_field_name: "question"
+  answer_field_name: "answer"
+  # OOM-safe setting (increase if you have headroom)
+  max_question_length: 256
+  max_answer_length: 64
+  dataset_streaming: false
+  use_random_sampling: true
+  verbose_step_logging: false
+  # noncore only
+  filter_is_core_user: "noncore"
+  # stance classification K=3
+  n_actions: 3
+  # optional: oversample minority label on TRAIN split only
+  oversample_enabled: true
+  oversample_only_train: true
+  oversample_label_id: 1
+  oversample_target_ratio: 0.10
+  oversample_seed: 42
+  oversample_max_multiplier: 50
+
+reward:
+  al_weight: 0.0
+  ts_weight: 1.0
+  cc_weight: 0.0
+
+train:
+  buffer_size: 256
+  batch_size: 64
+  update_interval: 1
+  supervised_min_label1_per_batch: 1
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: false
+
+logging:
+  use_tensorboard: true
+  log_interval: 50
+  save_model: true
+  save_model_interval: 5000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-belief-noncore-stage2"
+
+# Supervised CE class weights (K=3: [0,1,2])
+belief_supervised_class_weights: [1.8, 8.0, 1.5]
+

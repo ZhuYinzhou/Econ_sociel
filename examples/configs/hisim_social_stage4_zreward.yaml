@@ -1,0 +1,111 @@
+runner: "episode_runner"
+mac: "basic_mac"
+learner: "q_learner"
+
+# Stage4 (online): multi-agent RL for core users with policy→LLM decoupling and z-based reward.
+# This config is intentionally "safer" than hisim_social.yaml:
+# - Use categorical z (K=3 distribution) to match your Stage3a dist model
+# - Start with z-only reward (no text/GT imitation)
+# - Freeze representation modules to avoid noisy reward destabilizing beliefs
+# - Short curriculum (5-10 stages first) is controlled by curriculum block
+
+t_max: 5000
+test_interval: 2000
+test_nepisode: 2
+
+n_agents: 3
+belief_dim: 128
+population_belief_dim: 3
+text_embed_dim: 1024
+batch_size_run: 1
+n_actions: 5
+max_seq_length: 1024
+
+env_action_source: "llm_response_0"
+enable_llm_rollout: true
+llm_model_name: "gpt2"
+together_api_key: "${TOGETHER_API_KEY}"
+coordinator_model: "gpt-4.1"
+executor_model: "gpt-4.1"
+commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
+llm_response_format_json: true
+
+env: "hisim_social_env"
+env_args:
+  hisim_data_root: "/data/zhuyinzhou/HiSim/data"
+  topic: "metoo"
+  event: "e1"
+  max_question_length: 1024
+  max_answer_length: 512
+  label2id_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1/label2id.json"
+
+  # short episode first (curriculum below will extend)
+  n_stages: 10
+  max_neighbor_posts: 8
+  max_population_texts: 20
+  max_user_history_lines: 40
+  max_recent_self_posts: 6
+
+  # Use learnable dynamics from BeliefEncoder (Stage3a) to update z
+  use_secondary_belief_sim: true
+  secondary_sim_max_users: 700
+  secondary_sim_use_micro_texts: true
+  # Disable hand-written ABM updater (we still aggregate counts, but z update uses secondary_z_next)
+  population_belief_mode: "categorical3"
+  population_z_updater: "noop"
+
+  # Stage4 reward: start simple with z-only reward
+  reward_w_action_type: 0.0
+  reward_w_stance: 0.0
+  reward_w_text: 0.0
+  reward_w_z: 1.0
+  reward_z_on_stage_end_only: true
+  mask_missing_gt: true
+  min_edge_labels_for_z_target: 200
+
+# Curriculum: gradually increase number of stages once training is stable
+curriculum:
+  enabled: true
+  t_env_steps: [20000, 60000]
+  n_stages: [7, 10, 13]
+
+# Optional auxiliary: you can keep this loss for logging, but recommend freezing encoder params (below)
+z_transition_loss_weight: 0.0
+z_transition_loss_type: "kl"
+
+# === Stage4 freezing knobs (new; default false elsewhere) ===
+freeze_belief_encoder_in_rl: true
+freeze_belief_network_in_rl: true
+freeze_stance_head_in_rl: false
+freeze_action_type_head_in_rl: false
+freeze_mixer_in_rl: false
+
+# Ensure action heads are trained in RL
+train_policy_heads_in_rl: true
+train_stance_head_in_rl: true
+
+train:
+  episodes_per_task: 1
+  buffer_size: 32
+  batch_size: 8
+  update_interval: 10
+  optimizer: "adam"
+  learning_rate: 0.001
+  coordinator_learning_rate: 0.0005
+  gamma: 0.99
+
+system:
+  use_cuda: true
+  device_num: 0
+  seed: 42
+  debug: true
+
+logging:
+  use_tensorboard: true
+  log_interval: 1
+  save_model: true
+  save_model_interval: 2000
+  checkpoint_path: "./models"
+  log_path: "./logs"
+  experiment_name: "hisim-social-stage4-zreward"
+

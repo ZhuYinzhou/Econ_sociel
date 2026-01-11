@@ -80,13 +80,32 @@ class EpisodeBatch:
             return self.data[item]
         elif isinstance(item, slice):
             # 切片，返回一个新的EpisodeBatch对象包含切片后的数据
+            # IMPORTANT: batch_size must match the sliced first dimension; otherwise downstream
+            # code that relies on batch.batch_size will mismatch tensor shapes.
+            try:
+                indices = range(*item.indices(self.batch_size))
+                new_bs = len(list(indices))
+            except Exception:
+                # fallback: infer from first tensor after slicing
+                new_bs = None
             sliced_batch = EpisodeBatch(
                 self.scheme, self.groups, 
-                self.batch_size, self.max_seq_length, self.device
+                int(new_bs) if isinstance(new_bs, int) and new_bs > 0 else self.batch_size,
+                self.max_seq_length, self.device
             )
             # 对所有数据应用切片
             for key, tensor in self.data.items():
                 sliced_batch.data[key] = tensor[item]
+            # Ensure metadata is consistent with tensors
+            try:
+                if isinstance(new_bs, int) and new_bs > 0:
+                    sliced_batch.batch_size = int(new_bs)
+                else:
+                    # infer from any tensor
+                    any_k = next(iter(sliced_batch.data.keys()))
+                    sliced_batch.batch_size = int(sliced_batch.data[any_k].shape[0])
+            except Exception:
+                pass
             return sliced_batch
         else:
             # 其他索引类型，直接应用到所有数据
@@ -96,5 +115,13 @@ class EpisodeBatch:
                 self.max_seq_length, self.device
             )
             for key, tensor in self.data.items():
-                indexed_batch.data[key] = tensor[item]
+                v = tensor[item]
+                # If selecting a single element, keep a batch dimension of 1
+                if isinstance(item, int) and isinstance(v, torch.Tensor) and v.ndim >= 1:
+                    v = v.unsqueeze(0)
+                indexed_batch.data[key] = v
+            try:
+                indexed_batch.batch_size = 1 if isinstance(item, int) else int(indexed_batch.batch_size)
+            except Exception:
+                pass
             return indexed_batch

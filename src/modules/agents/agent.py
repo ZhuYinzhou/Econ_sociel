@@ -155,8 +155,14 @@ class LLMTransformerAgent(nn.Module):
             'top_p': top_p
         }
     
-    def generate_answer(self, question: str, strategy: str, 
-                       belief_state: Optional[torch.Tensor] = None) -> str:
+    def generate_answer(
+        self,
+        question: str,
+        strategy: str,
+        belief_state: Optional[torch.Tensor] = None,
+        forced_action_type: Optional[str] = None,
+        forced_stance_id: Optional[int] = None,
+    ) -> str:
         # Use belief state to adjust LLM parameters
         temperature = self.current_params['temperature']
         top_p = self.current_params['top_p']
