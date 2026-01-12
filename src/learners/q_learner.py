@@ -256,20 +256,43 @@ class ECONLearner:
 
         # Initialize Optimizers
         self.belief_optimizer = None
-        if self.belief_net_params:
-            self.belief_optimizer = Adam(
-                params=filter(lambda p: p.requires_grad, self.belief_net_params),
-                lr=getattr(args, "belief_net_lr", args.lr),
-                weight_decay=getattr(args, "weight_decay", 0.0)
-            )
+        try:
+            belief_lr = float(getattr(args, "belief_net_lr", getattr(args, "lr", 0.0)))
+        except Exception:
+            belief_lr = float(getattr(args, "lr", 0.0) or 0.0)
+        if self.belief_net_params and belief_lr > 0:
+            trainable_belief_params = [p for p in self.belief_net_params if getattr(p, "requires_grad", False)]
+            if trainable_belief_params:
+                self.belief_optimizer = Adam(
+                    params=trainable_belief_params,
+                    lr=belief_lr,
+                    weight_decay=getattr(args, "weight_decay", 0.0),
+                )
+            else:
+                # Common in Stage3a encoder-only when mac.agent is fully frozen.
+                self.logger.info("Belief optimizer skipped: no trainable belief/policy parameters (all requires_grad=False).")
+        else:
+            if belief_lr <= 0:
+                self.logger.info(f"Belief optimizer skipped: belief_net_lr={belief_lr} <= 0.")
         
         self.encoder_optimizer = None
-        if self.encoder_params and self.belief_encoder:
-            self.encoder_optimizer = Adam(
-                params=filter(lambda p: p.requires_grad, self.encoder_params),
-                lr=getattr(args, "encoder_lr", args.lr),
-                weight_decay=getattr(args, "weight_decay", 0.0)
-            )
+        try:
+            encoder_lr = float(getattr(args, "encoder_lr", getattr(args, "lr", 0.0)))
+        except Exception:
+            encoder_lr = float(getattr(args, "lr", 0.0) or 0.0)
+        if self.encoder_params and self.belief_encoder and encoder_lr > 0:
+            trainable_encoder_params = [p for p in self.encoder_params if getattr(p, "requires_grad", False)]
+            if trainable_encoder_params:
+                self.encoder_optimizer = Adam(
+                    params=trainable_encoder_params,
+                    lr=encoder_lr,
+                    weight_decay=getattr(args, "weight_decay", 0.0),
+                )
+            else:
+                self.logger.warning("Encoder optimizer skipped: no trainable encoder parameters (all requires_grad=False).")
+        else:
+            if encoder_lr <= 0:
+                self.logger.info(f"Encoder optimizer skipped: encoder_lr={encoder_lr} <= 0.")
         
         self.mixer_optimizer = None
         if self.mixer_params and self.mixer:
@@ -283,11 +306,22 @@ class ECONLearner:
                     self.logger.warning(f"Stage4: Failed to freeze mixer in RL: {e}")
                 self.mixer_params = [p for p in self.mixer.parameters() if p.requires_grad]
 
-            self.mixer_optimizer = Adam(
-                params=filter(lambda p: p.requires_grad, self.mixer_params),
-                lr=getattr(args, "mixer_lr", args.lr),
-                weight_decay=getattr(args, "weight_decay", 0.0)
-            )
+            try:
+                mixer_lr = float(getattr(args, "mixer_lr", getattr(args, "lr", 0.0)))
+            except Exception:
+                mixer_lr = float(getattr(args, "lr", 0.0) or 0.0)
+            if mixer_lr > 0:
+                trainable_mixer_params = [p for p in self.mixer_params if getattr(p, "requires_grad", False)]
+                if trainable_mixer_params:
+                    self.mixer_optimizer = Adam(
+                        params=trainable_mixer_params,
+                        lr=mixer_lr,
+                        weight_decay=getattr(args, "weight_decay", 0.0),
+                    )
+                else:
+                    self.logger.info("Mixer optimizer skipped: no trainable mixer parameters (all requires_grad=False).")
+            else:
+                self.logger.info(f"Mixer optimizer skipped: mixer_lr={mixer_lr} <= 0.")
 
         # Optimizer for belief supervised training (includes discrete action head + belief network)
         if self.train_belief_supervised:
@@ -322,8 +356,8 @@ class ECONLearner:
                             self.logger.warning(f"Stage3b: Failed to apply train_action_imitation freezing: {e}")
 
                     self.belief_supervised_optimizer = Adam(
-                        params=filter(lambda p: p.requires_grad, agent.parameters()),
-                        lr=getattr(args, "belief_net_lr", args.lr),
+                        params=[p for p in agent.parameters() if getattr(p, "requires_grad", False)],
+                        lr=belief_lr,
                         weight_decay=getattr(args, "weight_decay", 0.0),
                     )
                     self.logger.info("Initialized belief_supervised_optimizer for offline classification training.")
@@ -730,6 +764,20 @@ class ECONLearner:
             encoder_loss = torch.tensor(0.0, device=self.device)
             z_loss = torch.tensor(0.0, device=self.device)
             z_tr_loss = torch.tensor(0.0, device=self.device)
+            # diagnostics (initialized for safe logging)
+            z_pred_minus_z_t_l2 = None
+            z_target_minus_z_t_l2 = None
+            z_pred_entropy = None
+            z_pred_maxprob = None
+            z_pred_p0 = None
+            z_pred_p1 = None
+            z_pred_p2 = None
+            # stage-bucketed z_delta (masked mean L2)
+            z_pred_delta_l2_by_stage = {}
+            z_target_delta_l2_by_stage = {}
+            # population_update_head norms
+            pop_update_weight_l2 = None
+            pop_update_grad_l2 = None
 
             # Optional: z head supervision (group_repr -> z_target)
             if self.z_head is not None and "z_target" in batch.scheme and "z_mask" in batch.scheme:
@@ -754,7 +802,8 @@ class ECONLearner:
                 if (
                     self.z_transition_loss_weight
                     and self.z_transition_loss_weight > 0
-                    and hasattr(self.belief_encoder, "compute_loss")
+                    and hasattr(self.belief_encoder, "predict_next_population_belief")
+                    and hasattr(self.belief_encoder, "compute_population_belief_loss")
                     and "z_target" in batch.scheme
                     and "z_mask" in batch.scheme
                     and ("z_t" in batch.scheme or "belief_pre_population_z" in batch.scheme)
@@ -771,15 +820,69 @@ class ECONLearner:
                     gr_flat = group_representation_seq.reshape(bs * seq_len, -1)
                     st_flat = stage_t_seq.reshape(bs * seq_len, -1) if stage_t_seq is not None else None
 
-                    z_tr_loss = self.belief_encoder.compute_loss(
+                    # Compute z_pred explicitly so we can log ||z_pred - z_t|| / ||z_target - z_t||
+                    z_pred_flat = self.belief_encoder.predict_next_population_belief(
                         z_t_flat,
-                        z_target_flat,
-                        z_mask_flat,
                         group_repr=gr_flat,
                         stage_t=st_flat,
+                        return_logits=False,
+                    )
+                    z_tr_loss = self.belief_encoder.compute_population_belief_loss(
+                        z_pred_flat,
+                        z_target_flat,
+                        z_mask_flat,
                         loss_type=getattr(self.args, "z_transition_loss_type", "kl"),
                     )
                     encoder_loss = encoder_loss + self.z_transition_loss_weight * z_tr_loss
+
+                    # === Diagnostics for TensorBoard ===
+                    # We report masked mean L2 norms:
+                    # - ||z_pred - z_t||  : how much the model changes the current z
+                    # - ||z_target - z_t||: how much the true dynamics changes z (data baseline)
+                    try:
+                        zm = z_mask_flat.to(z_pred_flat.device, dtype=z_pred_flat.dtype).clamp(min=0.0, max=1.0)
+                        denom = torch.clamp(zm.sum(), min=1.0)
+                        # (N,K) -> (N,)
+                        dz_pred = torch.norm((z_pred_flat - z_t_flat), p=2, dim=-1)
+                        dz_tgt = torch.norm((z_target_flat - z_t_flat), p=2, dim=-1)
+                        # masked mean
+                        z_pred_minus_z_t_l2 = (dz_pred * zm).sum() / denom
+                        z_target_minus_z_t_l2 = (dz_tgt * zm).sum() / denom
+
+                        # z_pred distribution stats (categorical K=3): entropy + max prob + mean probs
+                        if int(z_pred_flat.shape[-1]) == 3:
+                            eps = 1e-8
+                            zp = torch.clamp(z_pred_flat, min=0.0)
+                            zp = zp / torch.clamp(zp.sum(dim=-1, keepdim=True), min=eps)
+                            ent = -torch.sum(zp * torch.log(zp + eps), dim=-1)  # (N,)
+                            mx = torch.max(zp, dim=-1)[0]  # (N,)
+                            z_pred_entropy = (ent * zm).sum() / denom
+                            z_pred_maxprob = (mx * zm).sum() / denom
+                            # mean probs per class
+                            z_pred_p0 = (zp[:, 0] * zm).sum() / denom
+                            z_pred_p1 = (zp[:, 1] * zm).sum() / denom
+                            z_pred_p2 = (zp[:, 2] * zm).sum() / denom
+
+                        # Stage-bucketed z_delta (pred and target) by stage_t
+                        # Note: st_flat is shape (N,1); if missing, we skip bucket metrics.
+                        if st_flat is not None:
+                            st1 = st_flat.reshape(-1).to(dtype=torch.long)
+                            # use dz_pred/dz_tgt already computed
+                            for s in torch.unique(st1).tolist():
+                                try:
+                                    s_int = int(s)
+                                except Exception:
+                                    continue
+                                sel = (st1 == s_int)
+                                if sel.any():
+                                    denom_s = torch.clamp(zm[sel].sum(), min=1.0)
+                                    z_pred_delta_l2_by_stage[s_int] = float((dz_pred[sel] * zm[sel]).sum().item() / denom_s.item())
+                                    z_target_delta_l2_by_stage[s_int] = float((dz_tgt[sel] * zm[sel]).sum().item() / denom_s.item())
+                    except Exception:
+                        z_pred_minus_z_t_l2 = None
+                        z_target_minus_z_t_l2 = None
+                        z_pred_entropy = None
+                        z_pred_maxprob = None
             except Exception as e:
                 self.logger.warning(f"train_encoder_only: z_transition_loss skipped due to error: {e}")
 
@@ -787,19 +890,70 @@ class ECONLearner:
             if self.encoder_optimizer:
                 self.encoder_optimizer.zero_grad()
                 encoder_loss.backward()
+                # population_update_head grad norm (Stage3a)
+                try:
+                    puh = getattr(self.belief_encoder, "population_update_head", None)
+                    if puh is not None:
+                        gn2 = 0.0
+                        for p in puh.parameters():
+                            if p.grad is None:
+                                continue
+                            g = p.grad.detach()
+                            gn2 += float(torch.sum(g * g).item())
+                        pop_update_grad_l2 = float(gn2 ** 0.5)
+                except Exception:
+                    pop_update_grad_l2 = None
                 torch.nn.utils.clip_grad_norm_(self.encoder_params, 10.0)
                 self.encoder_optimizer.step()
+
+            # population_update_head weight norm (Stage3a; after step)
+            try:
+                puh = getattr(self.belief_encoder, "population_update_head", None)
+                if puh is not None:
+                    wn2 = 0.0
+                    for p in puh.parameters():
+                        w = p.detach()
+                        wn2 += float(torch.sum(w * w).item())
+                    pop_update_weight_l2 = float(wn2 ** 0.5)
+            except Exception:
+                pop_update_weight_l2 = None
 
             train_stats = {
                 "status": "encoder_only",
                 "loss_total": float(encoder_loss.item()),
                 "loss_encoder": float(encoder_loss.item()),
-                "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
             }
             if self.z_head is not None:
                 train_stats["loss_z"] = float(z_loss.item())
             if self.z_transition_loss_weight and self.z_transition_loss_weight > 0:
                 train_stats["loss_z_transition"] = float(z_tr_loss.item())
+                # diagnostics (optional)
+                try:
+                    if z_pred_minus_z_t_l2 is not None:
+                        train_stats["z_pred_minus_z_t_l2"] = float(z_pred_minus_z_t_l2.item())
+                    if z_target_minus_z_t_l2 is not None:
+                        train_stats["z_target_minus_z_t_l2"] = float(z_target_minus_z_t_l2.item())
+                    if z_pred_entropy is not None:
+                        train_stats["z_pred_entropy"] = float(z_pred_entropy.item())
+                    if z_pred_maxprob is not None:
+                        train_stats["z_pred_maxprob"] = float(z_pred_maxprob.item())
+                    if z_pred_p0 is not None:
+                        train_stats["z_pred_p0_mean"] = float(z_pred_p0.item())
+                    if z_pred_p1 is not None:
+                        train_stats["z_pred_p1_mean"] = float(z_pred_p1.item())
+                    if z_pred_p2 is not None:
+                        train_stats["z_pred_p2_mean"] = float(z_pred_p2.item())
+                    if pop_update_weight_l2 is not None:
+                        train_stats["population_update_head_weight_l2"] = float(pop_update_weight_l2)
+                    if pop_update_grad_l2 is not None:
+                        train_stats["population_update_head_grad_l2"] = float(pop_update_grad_l2)
+                    # stage buckets
+                    for s, v in (z_pred_delta_l2_by_stage or {}).items():
+                        train_stats[f"z_pred_delta_l2_stage{s}"] = float(v)
+                    for s, v in (z_target_delta_l2_by_stage or {}).items():
+                        train_stats[f"z_target_delta_l2_stage{s}"] = float(v)
+                except Exception:
+                    pass
             return train_stats
 
         # ==============================

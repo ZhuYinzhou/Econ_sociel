@@ -5,7 +5,7 @@ learner: "q_learner"
 # Stage3: Offline z(t)->z(t+1) transition supervision (K=3 distribution), conditioned on core-user context.
 t_max: 50000
 test_interval: 5000
-test_nepisode: 16
+test_nepisode: 256
 
 n_agents: 3
 belief_dim: 128
@@ -59,12 +59,14 @@ z_transition_loss_type: "kl"
 
 env: "huggingface_dataset_env"
 env_args:
-  hf_dataset_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1_z_transition"  # <- replace with *_z_transition dir you generated
+  hf_dataset_path: 
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_3a_dataset_metoo_e1_z_transition"
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_3a_dataset_metoo_e2_z_transition"
   dataset_split: "train"
   question_field_name: "question"
   answer_field_name: "answer"
   max_question_length: 1024
-  max_answer_length: 32
+  max_answer_length: 64
   dataset_streaming: false
   use_random_sampling: true
   use_dataset_episode: false
@@ -74,14 +76,15 @@ env_args:
   population_belief_dim: 3
   verbose_step_logging: false
 
+
 reward:
   al_weight: 0.0
   ts_weight: 0.0
   cc_weight: 0.0
 
 train:
-  buffer_size: 32
-  batch_size: 16
+  buffer_size: 256
+  batch_size: 64
   update_interval: 10
   optimizer: "adam"
   learning_rate: 0.001
@@ -96,10 +99,10 @@ system:
 
 logging:
   use_tensorboard: true
-  log_interval: 20
+  log_interval: 50
   save_model: true
   save_model_interval: 5000
   checkpoint_path: "./models"
   log_path: "./logs"
-  experiment_name: "hisim-z-transition-dist-cond"
+  experiment_name: "hisim-z-transition-s3a-e"
 

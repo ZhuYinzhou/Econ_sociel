@@ -119,5 +119,5 @@ logging:
   experiment_name: "hisim-belief-noncore-stage2"
 
 # Supervised CE class weights (K=3: [0,1,2])
-belief_supervised_class_weights: [1.8, 8.0, 1.5]
+belief_supervised_class_weights: [2.0, 8.0, 2.0]
 

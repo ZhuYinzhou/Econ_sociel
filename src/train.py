@@ -612,6 +612,29 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     # z(t)->z(t+1) transition supervision (secondary users belief)
                     if "loss_z_transition" in train_stats:
                         logger.log_stat("train/loss_z_transition", float(train_stats["loss_z_transition"]), t_env)
+                    # Stage3a diagnostics: ||z_pred - z_t|| and ||z_target - z_t||
+                    if "z_pred_minus_z_t_l2" in train_stats:
+                        logger.log_stat("train/z_pred_minus_z_t_l2", float(train_stats["z_pred_minus_z_t_l2"]), t_env)
+                    if "z_target_minus_z_t_l2" in train_stats:
+                        logger.log_stat("train/z_target_minus_z_t_l2", float(train_stats["z_target_minus_z_t_l2"]), t_env)
+                    # Stage3a diagnostics: distribution + per-stage buckets + head norms
+                    for k in (
+                        "z_pred_entropy",
+                        "z_pred_maxprob",
+                        "z_pred_p0_mean",
+                        "z_pred_p1_mean",
+                        "z_pred_p2_mean",
+                        "population_update_head_weight_l2",
+                        "population_update_head_grad_l2",
+                    ):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
+                    # per-stage buckets (avoid hardcoding stage count; just scan keys)
+                    for k, v in train_stats.items():
+                        if not isinstance(k, str):
+                            continue
+                        if k.startswith("z_pred_delta_l2_stage") or k.startswith("z_target_delta_l2_stage"):
+                            logger.log_stat(f"train/{k}", float(v), t_env)
             except Exception as e:
                 logger.warning(f"Failed to log fixed train metrics: {e}")
             
@@ -651,6 +674,20 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "core_stance_acc",
                         "core_text_sim",
                         "secondary_z_kl",
+                        # Stage3a encoder-only eval keys
+                        "test_loss_z_transition",
+                        "test_kl_target_zt",
+                        "test_kl_target_zpred",
+                        "test_z_pred_minus_z_t_l2",
+                        "test_z_target_minus_z_t_l2",
+                        "test_z_pred_entropy",
+                        "test_z_pred_maxprob",
+                        "test_z_pred_p0_mean",
+                        "test_z_pred_p1_mean",
+                        "test_z_pred_p2_mean",
+                        "test_kl_target_zpred_nostage",
+                        "test_kl_target_zpred_nogr",
+                        "secondary_z_eval_steps",
                         # per-class stance metrics on eval split
                         "stance_gt0_frac",
                         "stance_gt1_frac",
@@ -682,6 +719,15 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     ):
                         if k in test_stats:
                             logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
+                    # Stage3a per-stage buckets (dynamic keys)
+                    try:
+                        for k, v in test_stats.items():
+                            if not isinstance(k, str):
+                                continue
+                            if k.startswith("test_z_pred_delta_l2_stage") or k.startswith("test_z_target_delta_l2_stage") or k.startswith("test_stage_mask_sum_stage"):
+                                logger.log_stat(f"test/{k}", float(v), t_env)
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.warning(f"Failed to log test metrics: {e}")
         
@@ -772,6 +818,193 @@ def run_test(runner, logger, config: SimpleNamespace):
         except Exception as e:
             logger.warning(f"Failed to create eval runner for split='{eval_split}', fallback to training runner: {e}")
             eval_runner = runner
+
+    # ==========================
+    # Stage3a encoder-only eval
+    # ==========================
+    # For z_transition dataset env, env_info doesn't naturally include z_pred.
+    # We therefore compute metrics directly from EpisodeBatch + MAC/BeliefEncoder.
+    try:
+        if bool(getattr(config, "train_encoder_only", False)) and float(getattr(config, "z_transition_loss_weight", 0.0) or 0.0) > 0:
+            import torch
+            import torch.nn.functional as F
+
+            test_episodes_eff = test_episodes
+            # weighted sums (by mask count) for stable aggregation
+            sum_loss = 0.0
+            sum_kl_tgt_zt = 0.0
+            sum_kl_tgt_zp = 0.0
+            sum_pred_ent = 0.0
+            sum_pred_max = 0.0
+            sum_p0 = 0.0
+            sum_p1 = 0.0
+            sum_p2 = 0.0
+            sum_dz_pred = 0.0
+            sum_dz_tgt = 0.0
+            sum_mask = 0.0
+
+            # per-stage buckets
+            stage_sum_dz_pred: Dict[int, float] = {}
+            stage_sum_dz_tgt: Dict[int, float] = {}
+            stage_sum_mask: Dict[int, float] = {}
+
+            # ablations
+            sum_kl_tgt_zp_nostage = 0.0
+            sum_kl_tgt_zp_nogr = 0.0
+
+            # helpers
+            def _renorm(p: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+                p = torch.clamp(p, min=0.0)
+                return p / torch.clamp(p.sum(dim=-1, keepdim=True), min=eps)
+
+            def _kl_tgt_pred(tgt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+                # returns (N,)
+                t = _renorm(tgt, eps=eps)
+                q = _renorm(pred, eps=eps)
+                return torch.sum(t * (torch.log(t + eps) - torch.log(q + eps)), dim=-1)
+
+            for _ in range(test_episodes_eff):
+                episode_batch = eval_runner.run(test_mode=True)
+                if episode_batch is None:
+                    continue
+
+                mac = getattr(eval_runner, "mac", None)
+                be = getattr(mac, "belief_encoder", None) if mac is not None else None
+                if be is None or (not hasattr(be, "predict_next_population_belief")):
+                    logger.warning("Stage3a eval: BeliefEncoder missing; skipping encoder-only eval.")
+                    break
+
+                # tensors: (bs, seq, K)
+                z_t = episode_batch["z_t"][:, :-1]
+                z_target = episode_batch["z_target"][:, :-1]
+                z_mask = episode_batch["z_mask"][:, :-1]  # (bs, seq, 1)
+                stage_t = episode_batch["stage_t"][:, :-1] if "stage_t" in episode_batch.scheme else None  # (bs, seq, 1)
+                gr = episode_batch["group_representation"][:, :-1] if "group_representation" in episode_batch.scheme else None
+
+                # flatten
+                bs0, sl0, k0 = z_t.shape
+                N = bs0 * sl0
+                zt_f = z_t.reshape(N, k0).to(getattr(config, "device", None) or torch.device("cpu"))
+                ztar_f = z_target.reshape(N, k0).to(zt_f.device)
+                zm_f = z_mask.reshape(N).to(zt_f.device, dtype=torch.float32).clamp(min=0.0, max=1.0)
+                denom = float(torch.clamp(zm_f.sum(), min=0.0).item())
+                if denom <= 0.0:
+                    continue
+
+                gr_f = gr.reshape(N, -1).to(zt_f.device) if gr is not None else None
+                st_f = stage_t.reshape(N, -1).to(zt_f.device) if stage_t is not None else None
+
+                # forward
+                with torch.no_grad():
+                    zpred_f = be.predict_next_population_belief(zt_f, group_repr=gr_f, stage_t=st_f, return_logits=False)
+
+                    # loss
+                    loss = be.compute_population_belief_loss(
+                        zpred_f,
+                        ztar_f,
+                        zm_f,
+                        loss_type=str(getattr(config, "z_transition_loss_type", "kl") or "kl"),
+                    )
+
+                    # KL baseline vs model
+                    kl_tgt_zt = _kl_tgt_pred(ztar_f, zt_f)
+                    kl_tgt_zp = _kl_tgt_pred(ztar_f, zpred_f)
+
+                    # deltas
+                    dz_pred = torch.norm((zpred_f - zt_f), p=2, dim=-1)
+                    dz_tgt = torch.norm((ztar_f - zt_f), p=2, dim=-1)
+
+                    # dist stats
+                    if int(zpred_f.shape[-1]) == 3:
+                        zp = _renorm(zpred_f)
+                        ent = -torch.sum(zp * torch.log(zp + 1e-8), dim=-1)
+                        mx = torch.max(zp, dim=-1)[0]
+                        # masked weighted sums
+                        sum_pred_ent += float((ent * zm_f).sum().item())
+                        sum_pred_max += float((mx * zm_f).sum().item())
+                        sum_p0 += float((zp[:, 0] * zm_f).sum().item())
+                        sum_p1 += float((zp[:, 1] * zm_f).sum().item())
+                        sum_p2 += float((zp[:, 2] * zm_f).sum().item())
+
+                    # aggregate masked sums
+                    sum_loss += float(loss.item()) * denom
+                    sum_kl_tgt_zt += float((kl_tgt_zt * zm_f).sum().item())
+                    sum_kl_tgt_zp += float((kl_tgt_zp * zm_f).sum().item())
+                    sum_dz_pred += float((dz_pred * zm_f).sum().item())
+                    sum_dz_tgt += float((dz_tgt * zm_f).sum().item())
+                    sum_mask += denom
+
+                    # stage buckets
+                    if st_f is not None:
+                        st1 = st_f.reshape(-1).to(dtype=torch.long)
+                        for s in torch.unique(st1).tolist():
+                            try:
+                                si = int(s)
+                            except Exception:
+                                continue
+                            sel = (st1 == si)
+                            if not bool(sel.any().item()):
+                                continue
+                            m_s = zm_f[sel]
+                            d_s = float(torch.clamp(m_s.sum(), min=0.0).item())
+                            if d_s <= 0:
+                                continue
+                            stage_sum_mask[si] = float(stage_sum_mask.get(si, 0.0) + d_s)
+                            stage_sum_dz_pred[si] = float(stage_sum_dz_pred.get(si, 0.0) + float((dz_pred[sel] * m_s).sum().item()))
+                            stage_sum_dz_tgt[si] = float(stage_sum_dz_tgt.get(si, 0.0) + float((dz_tgt[sel] * m_s).sum().item()))
+
+                    # stage ablation (strongly suggested): set all stage to 0
+                    try:
+                        if st_f is not None:
+                            st0 = torch.zeros_like(st_f)
+                            zpred_nostage = be.predict_next_population_belief(zt_f, group_repr=gr_f, stage_t=st0, return_logits=False)
+                            kl_nostage = _kl_tgt_pred(ztar_f, zpred_nostage)
+                            sum_kl_tgt_zp_nostage += float((kl_nostage * zm_f).sum().item())
+                    except Exception:
+                        pass
+
+                    # group_repr sensitivity: zero-out group_repr
+                    try:
+                        if gr_f is not None:
+                            gr0 = torch.zeros_like(gr_f)
+                            zpred_nogr = be.predict_next_population_belief(zt_f, group_repr=gr0, stage_t=st_f, return_logits=False)
+                            kl_nogr = _kl_tgt_pred(ztar_f, zpred_nogr)
+                            sum_kl_tgt_zp_nogr += float((kl_nogr * zm_f).sum().item())
+                    except Exception:
+                        pass
+
+            if sum_mask <= 0:
+                return {"secondary_z_eval_steps": 0}
+
+            out: Dict[str, Any] = {}
+            out["test_loss_z_transition"] = float(sum_loss / sum_mask)
+            out["test_kl_target_zt"] = float(sum_kl_tgt_zt / sum_mask)          # identity baseline
+            out["test_kl_target_zpred"] = float(sum_kl_tgt_zp / sum_mask)       # model
+            out["test_z_pred_minus_z_t_l2"] = float(sum_dz_pred / sum_mask)
+            out["test_z_target_minus_z_t_l2"] = float(sum_dz_tgt / sum_mask)
+            out["test_z_pred_entropy"] = float(sum_pred_ent / sum_mask) if sum_pred_ent > 0 else 0.0
+            out["test_z_pred_maxprob"] = float(sum_pred_max / sum_mask) if sum_pred_max > 0 else 0.0
+            out["test_z_pred_p0_mean"] = float(sum_p0 / sum_mask) if sum_p0 > 0 else 0.0
+            out["test_z_pred_p1_mean"] = float(sum_p1 / sum_mask) if sum_p1 > 0 else 0.0
+            out["test_z_pred_p2_mean"] = float(sum_p2 / sum_mask) if sum_p2 > 0 else 0.0
+            # ablations
+            if sum_kl_tgt_zp_nostage > 0:
+                out["test_kl_target_zpred_nostage"] = float(sum_kl_tgt_zp_nostage / sum_mask)
+            if sum_kl_tgt_zp_nogr > 0:
+                out["test_kl_target_zpred_nogr"] = float(sum_kl_tgt_zp_nogr / sum_mask)
+
+            # per-stage buckets (mean)
+            for s, m in stage_sum_mask.items():
+                if m <= 0:
+                    continue
+                out[f"test_z_pred_delta_l2_stage{s}"] = float(stage_sum_dz_pred.get(s, 0.0) / m)
+                out[f"test_z_target_delta_l2_stage{s}"] = float(stage_sum_dz_tgt.get(s, 0.0) / m)
+                out[f"test_stage_mask_sum_stage{s}"] = float(m)
+
+            out["secondary_z_eval_steps"] = int(sum_mask)
+            return out
+    except Exception as e:
+        logger.warning(f"Stage3a encoder-only eval failed; falling back to legacy run_test: {e}")
 
     returns: List[float] = []
     # core-user metrics

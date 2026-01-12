@@ -881,7 +881,36 @@ Final Answer (max 50 tokens):"""
                     self.belief_encoder.load_state_dict(sd, strict=True)
                 except Exception as e_strict:
                     logger.warning(f"Strict load for belief_encoder failed ({e_strict}); retrying strict=False")
-                    self.belief_encoder.load_state_dict(sd, strict=False)
+                    # NOTE:
+                    # strict=False still errors on size mismatch. This commonly happens across stages, e.g.:
+                    # - Stage3a enables population_update_use_stage => adds stage_embed and changes population_update_head input dim
+                    # We therefore do a "shape-filtered" partial load: keep only keys that exist and match shapes.
+                    try:
+                        cur = self.belief_encoder.state_dict()
+                        filtered = {}
+                        skipped_mismatch = 0
+                        skipped_missing = 0
+                        for k, v in sd.items():
+                            if k not in cur:
+                                skipped_missing += 1
+                                continue
+                            try:
+                                if tuple(cur[k].shape) != tuple(v.shape):
+                                    skipped_mismatch += 1
+                                    continue
+                            except Exception:
+                                skipped_mismatch += 1
+                                continue
+                            filtered[k] = v
+                        missing, unexpected = self.belief_encoder.load_state_dict(filtered, strict=False)
+                        logger.warning(
+                            "BeliefEncoder partial-load (shape-filtered) applied: "
+                            f"kept={len(filtered)}/{len(sd)}, skipped_missing={skipped_missing}, skipped_mismatch={skipped_mismatch}. "
+                            f"missing_after={len(missing)}, unexpected_after={len(unexpected)}"
+                        )
+                    except Exception as e_partial:
+                        logger.warning(f"BeliefEncoder partial-load failed ({e_partial}); retrying strict=False without filtering.")
+                        self.belief_encoder.load_state_dict(sd, strict=False)
         except Exception as e:
             logger.warning(f"Failed to load belief_encoder: {e}")
         # Additional loading logic for other components if needed

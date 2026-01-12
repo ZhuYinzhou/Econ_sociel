@@ -1355,6 +1355,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 neighbors = neighbors[:max_neighbor_users]
                             neighbor_texts: List[Tuple[str, str]] = []
                             neighbor_label_counter: Counter = Counter()
+                            # action-type features aligned to ["post","retweet","reply","like","do_nothing"]
+                            self_action_counts = _action_counts_from_stage(stage_ut)
+                            self_action_ratio = _counts_to_ratio(self_action_counts)
+                            neighbor_action_counts = [0, 0, 0, 0, 0]
                             for nb in neighbors:
                                 nb_dict = macro.get(nb)
                                 if not isinstance(nb_dict, dict):
@@ -1369,8 +1373,16 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 for txt in nb_texts:
                                     if txt:
                                         neighbor_texts.append((str(nb), txt))
+                                # macro-inferred action counts for neighbors at stage t (sum across neighbors)
+                                try:
+                                    c = _action_counts_from_stage(nb_stage)
+                                    for i in range(5):
+                                        neighbor_action_counts[i] += int(c[i])
+                                except Exception:
+                                    pass
                                 if max_neighbor_tweets_total > 0 and len(neighbor_texts) >= max_neighbor_tweets_total:
                                     break
+                            neighbor_action_ratio = _counts_to_ratio(neighbor_action_counts)
 
                             pop = population_cache.get(t, {}) if use_population_observation else {}
                             pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
@@ -1387,6 +1399,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 self_label_t=self_label_t,
                                 neighbor_texts=neighbor_texts,
                                 neighbor_label_counter=dict(neighbor_label_counter),
+                                self_action_counts=self_action_counts,
+                                self_action_ratio=self_action_ratio,
+                                neighbor_action_counts=neighbor_action_counts,
+                                neighbor_action_ratio=neighbor_action_ratio,
                                 population_texts=pop_texts,
                                 population_label_counter=pop_label_counter,
                                 label2id=label2id,
