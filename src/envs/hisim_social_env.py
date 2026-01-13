@@ -445,6 +445,19 @@ class HiSimSocialEnv(gym.Env):
         self.max_user_history_lines = int(kwargs.get("max_user_history_lines", 40))
         self.max_recent_self_posts = int(kwargs.get("max_recent_self_posts", 6))
 
+        # === HiSim-style synchronous round update (Stage4 option) ===
+        # If True:
+        # - One env.step() corresponds to ONE stage-round where ALL core users act once (conceptually concurrent).
+        # - Each core user's observation at stage t is generated from the PRE-round state (no same-stage neighbor leakage).
+        # This is intended to strictly replicate HiSim's "same-round concurrent -> unified update" semantics.
+        self.sync_stage_update = bool(kwargs.get("sync_stage_update", False))
+        # Optional: limit number of core users for debugging/smoke tests (e.g., 5)
+        self.max_core_users = int(kwargs.get("max_core_users", -1))
+        # Optional: shuffle core user order at each stage boundary (mainly for legacy sequential mode).
+        # In sync mode, order does not affect information availability (all see pre-round state).
+        self.shuffle_core_users_each_stage = bool(kwargs.get("shuffle_core_users_each_stage", False))
+        self.core_users_shuffle_seed = int(kwargs.get("core_users_shuffle_seed", 42))
+
         # ABM/latent z update (baseline; can be swapped later)
         # population_belief_mode (new preferred name; keep backward compatibility with population_z_mode):
         # - "categorical3": legacy, z is a prob vector over K=3 labels
@@ -518,6 +531,8 @@ class HiSimSocialEnv(gym.Env):
                 self.follower_dict = json.load(f)
 
         self.core_users = sorted(list(self.role_desc.keys()))
+        if self.max_core_users and self.max_core_users > 0 and len(self.core_users) > int(self.max_core_users):
+            self.core_users = self.core_users[: int(self.max_core_users)]
         self.all_users = sorted(list(self.macro.keys()))
         self.edge_users = [u for u in self.all_users if u not in set(self.core_users)]
         logger.info(f"[HiSimSocialEnv] topic={self.topic} event={self.event} macro_users={len(self.all_users)} core={len(self.core_users)} edge={len(self.edge_users)}")
@@ -696,7 +711,10 @@ class HiSimSocialEnv(gym.Env):
         self.stage_t = 0
         self.core_idx = 0
         self.episode_steps = 0
-        self.episode_limit = self.n_stages * len(self.core_users)
+        # episode_limit definition depends on sync mode:
+        # - sync_stage_update=False (legacy): one step per core user, so T = n_stages * |core_users|
+        # - sync_stage_update=True:  one step per stage-round, so T = n_stages
+        self.episode_limit = int(self.n_stages) if self.sync_stage_update else (self.n_stages * len(self.core_users))
 
         # social state
         # (user, stage)-> {"action_type":str, "stance_id":Optional[int], "text":str}
@@ -808,6 +826,7 @@ class HiSimSocialEnv(gym.Env):
             "n_actions": len(self.action_types),
             "obs_shape": (self.max_question_length,),
             "state_shape": (1,),
+            "sync_stage_update": bool(getattr(self, "sync_stage_update", False)),
         }
 
     def _current_user(self) -> str:
@@ -1003,12 +1022,139 @@ class HiSimSocialEnv(gym.Env):
             self.population_z = self.z_updater.reset(self.num_labels)
             self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
+        # Sync mode: return per-core-user observations (aligned to core_users order).
+        if bool(getattr(self, "sync_stage_update", False)):
+            # Optional shuffle (kept deterministic via seed); mostly irrelevant for sync semantics but helps match HiSim "random order".
+            if bool(getattr(self, "shuffle_core_users_each_stage", False)):
+                rnd = random.Random(int(getattr(self, "core_users_shuffle_seed", 42)) + int(self.stage_t))
+                rnd.shuffle(self.core_users)
+            obs_list: List[str] = [self._build_observation_sync(str(u), int(self.stage_t)) for u in self.core_users]
+            self.current_obs = obs_list
+            self.current_info = {
+                "t": int(self.stage_t),
+                "is_core_user": True,
+                "agent_infos": [{"user": str(u), "t": int(self.stage_t), "is_core_user": True} for u in self.core_users],
+            }
+            # Provide a global belief_inputs snapshot (population_z/stage) for runner compatibility.
+            self.current_info["belief_inputs"] = {
+                "t": int(self.stage_t),
+                "is_core_user": True,
+                "neighbor_stance_counts": [0, 0, 0],
+                "population_z": self.population_z,
+            }
+            return obs_list, {"sample": self.current_info}
+
         user = self._current_user()
         self.current_obs = self._build_observation(user, self.stage_t)
         self.current_info = {"user": user, "t": self.stage_t, "is_core_user": True}
         # 显式 belief inputs（与 current_obs 对齐）
         self.current_info["belief_inputs"] = self._collect_belief_inputs(user, self.stage_t)
         return self.current_obs, {"sample": self.current_info}
+
+    def _neighbor_context_prev_stage(self, user: str, t: int) -> Tuple[Dict[str, int], List[Tuple[str, str]]]:
+        """
+        Sync semantics: at stage t, each core user can only see neighbors' posts from the PREVIOUS stage (t-1),
+        never from the current stage (to avoid same-stage leakage).
+        """
+        tt = int(t) - 1
+        if tt < 0:
+            return {}, []
+        return self._neighbor_context(user, tt)
+
+    def _build_observation_sync(self, user: str, t: int) -> str:
+        """
+        HiSim-style synchronous observation:
+        - At stage t, observation is built from PRE-round state only.
+        - Neighbor context comes from stage (t-1).
+        - Population observation uses current latent z (already updated at end of t-1).
+        This intentionally differs from _build_observation (legacy sequential), which uses same-stage neighbor posts.
+        """
+        persona = self.role_desc.get(user, "")
+        user_history = self.user_histories.get(str(user), "")
+        neighbor_counter, neighbor_texts = self._neighbor_context_prev_stage(user, t)
+        pop_dist, pop_texts = self._population_obs(t)
+
+        lines: List[str] = []
+        lines.append("You are simulating a Twitter-like social media user in a SYNCHRONOUS round-based simulation.")
+        lines.append("IMPORTANT: All core users act concurrently in the same stage-round.")
+        lines.append("You only observe information from the PREVIOUS stage (t-1), not from the current stage t.")
+        lines.append(f"Topic: {self.topic}")
+        lines.append(f"Event: {self.event}")
+        lines.append(f"Stage t: {t}")
+        lines.append(f"User: {user} (core user)")
+        lines.append("")
+
+        if persona:
+            lines.append("Profile / persona:")
+            lines.append(str(persona).strip())
+            lines.append("")
+
+        if user_history:
+            lines.append("Memory / historical posts (observed):")
+            hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
+            if self.max_user_history_lines > 0:
+                hs = hs[: self.max_user_history_lines]
+            for ln in hs:
+                lines.append(str(ln))
+            lines.append("")
+
+        # recent self actions (previous stages only)
+        if self.max_recent_self_posts > 0:
+            recent: List[Tuple[int, str, str]] = []
+            for tt in range(max(0, int(t) - 6), int(t)):
+                p = self.core_posts.get((str(user), tt))
+                if not p:
+                    continue
+                at = str(p.get("action_type") or "").strip()
+                txt = str(p.get("text") or "").strip()
+                if at:
+                    recent.append((tt, at, txt))
+            if recent:
+                lines.append("Memory / recent self actions (simulated, previous stages):")
+                for tt, at, txt in recent[-self.max_recent_self_posts :]:
+                    lines.append(f"- stage{tt}: {at}" + (f" | {txt}" if txt else ""))
+                lines.append("")
+
+        if neighbor_counter:
+            top = sorted(neighbor_counter.items(), key=lambda x: -x[1])[:10]
+            lines.append("Neighbor stance summary from PREVIOUS stage (t-1):")
+            lines.append(", ".join([f"{k}:{v}" for k, v in top]))
+            lines.append("")
+        if neighbor_texts:
+            lines.append("Neighbor posts from PREVIOUS stage (t-1):")
+            for nb, txt in neighbor_texts:
+                lines.append(f"- [{nb}] {txt}")
+            lines.append("")
+
+        if pop_dist:
+            if self.population_z_mode == "continuous":
+                zc = float(pop_dist.get("z_scalar", 0.0))
+                lines.append("Population latent z scalar (edge users, simulated):")
+                lines.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
+                lines.append("")
+            else:
+                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
+                lines.append("Population latent z distribution (edge users, simulated):")
+                lines.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
+                lines.append("")
+
+        if pop_texts:
+            lines.append("Population observed texts (from micro, aligned to stage t):")
+            for txt in pop_texts:
+                lines.append(f"- {txt}")
+            lines.append("")
+
+        lines.append("Task: Choose ONE action for this user at this stage.")
+        lines.append("You must output JSON only, with keys:")
+        lines.append('- "action_type": one of ["post","retweet","reply","like","do_nothing"]')
+        lines.append('- "stance_id": (optional) integer stance class id; REQUIRED when action_type in ["post","retweet","reply"]')
+        lines.append('- "post_text": (optional) tweet content; REQUIRED when action_type in ["post","retweet","reply"], empty otherwise')
+        lines.append("Valid stance_id mapping:")
+        for lab, idx in sorted(self.label2id.items(), key=lambda x: x[1]):
+            lines.append(f"- {idx}: {lab}")
+        lines.append("")
+        lines.append('Return only JSON, e.g. {"action_type":"post","stance_id": 2, "post_text": "..."}')
+        return "\n".join(lines)
 
     def _normalize_prob_vec(self, v: Any, k: int) -> List[float]:
         """Normalize a vector-like object into a valid probability vector of length k."""
@@ -1152,6 +1298,273 @@ class HiSimSocialEnv(gym.Env):
     def step(self, action: Any, extra_info: Optional[Dict[str, Any]] = None):
         if extra_info is None:
             extra_info = {}
+        # === HiSim-style synchronous stage update ===
+        if bool(getattr(self, "sync_stage_update", False)):
+            t = int(self.stage_t)
+            # pre-state belief snapshot (global)
+            belief_inputs_pre = {
+                "t": int(t),
+                "is_core_user": True,
+                "neighbor_stance_counts": [0, 0, 0],
+                "population_z": self.population_z,
+            }
+
+            # Normalize incoming actions into a list aligned to self.core_users
+            acts: List[Any] = []
+            if isinstance(action, dict):
+                # allow mapping {user: action_dict}
+                for u in self.core_users:
+                    acts.append(action.get(str(u), {}))
+            elif isinstance(action, (list, tuple)):
+                acts = list(action)
+            else:
+                # single action broadcast (debug)
+                acts = [action for _ in self.core_users]
+
+            if len(acts) != len(self.core_users):
+                # best-effort pad/truncate
+                if len(acts) < len(self.core_users):
+                    acts = acts + [{} for _ in range(len(self.core_users) - len(acts))]
+                else:
+                    acts = acts[: len(self.core_users)]
+
+            # stage-round: apply all core user actions (conceptually concurrent)
+            # store simulated posts at (user, t) and accumulate z aggregator
+            sum_reward = 0.0
+            sum_at = 0.0
+            sum_st = 0.0
+            sum_txt = 0.0
+            valid = 0
+
+            for u, a in zip(self.core_users, acts):
+                action_type, pred_sid, post_text = self._parse_action(a)
+                expresses_stance = action_type in ("post", "retweet", "reply")
+                if not expresses_stance:
+                    pred_sid = None
+                if expresses_stance:
+                    if pred_sid is None or pred_sid < 0 or pred_sid >= self.num_labels:
+                        pred_sid = 0
+
+                self.core_posts[(str(u), int(t))] = {
+                    "action_type": str(action_type),
+                    "stance_id": int(pred_sid) if pred_sid is not None else None,
+                    "text": str(post_text)[:4000] if expresses_stance else "",
+                }
+
+                # accumulate for z update (stage end)
+                if self._z_agg is None or not isinstance(self._z_agg, dict):
+                    if self.population_z_mode == "continuous":
+                        self._z_agg = (
+                            self.z_scalar_updater.init_aggregator()
+                            if self.z_scalar_updater is not None
+                            else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+                        )
+                    else:
+                        self._z_agg = self.z_updater.init_aggregator(self.num_labels)
+
+                post_for_agg = ""
+                if self.z_agg_max_texts > 0:
+                    post_for_agg = str(post_text or "")
+                    texts = self._z_agg.get("post_texts")
+                    if isinstance(texts, list) and len(texts) >= self.z_agg_max_texts:
+                        post_for_agg = ""
+                if expresses_stance and pred_sid is not None:
+                    self._z_agg = self._z_accumulator.accumulate(
+                        self._z_agg,
+                        int(pred_sid),
+                        t=int(t),
+                        user=str(u),
+                        post_text=post_for_agg,
+                    )
+
+                # optional imitation-style reward against gt at t+1 (averaged across users)
+                gt_t = int(t) + 1
+                if gt_t < self.n_stages:
+                    gt_sid, gt_lab, gt_text = self._gt_for(str(u), gt_t)
+                    gt_available = bool((gt_sid is not None) or (gt_text is not None and str(gt_text).strip() != ""))
+                    if (not gt_available) and self.mask_missing_gt:
+                        pass
+                    else:
+                        gt_action_type = self._infer_action_type_from_text(gt_text)
+                        r_at = 1.0 if str(action_type) == str(gt_action_type) else 0.0
+                        r_st = 1.0 if (expresses_stance and (gt_sid is not None) and (pred_sid is not None) and int(pred_sid) == int(gt_sid)) else 0.0
+                        r_txt = _jaccard_sim(str(post_text), str(gt_text)) if (expresses_stance and gt_text) else 0.0
+                        sum_at += float(r_at)
+                        sum_st += float(r_st)
+                        sum_txt += float(r_txt)
+                        valid += 1
+
+            # advance stage pointer (one step per stage)
+            self.episode_steps += 1
+            self.stage_t += 1
+            terminated = bool(self.stage_t >= self.n_stages)
+            truncated = False
+
+            # delayed population_z update happens at stage boundary (always true in sync mode)
+            is_end_of_stage = True
+            z_next_from_belief = extra_info.get("secondary_z_next") if isinstance(extra_info, dict) else None
+            if self.population_z_mode == "continuous":
+                if self.use_secondary_belief_sim and z_next_from_belief is not None:
+                    try:
+                        if isinstance(z_next_from_belief, torch.Tensor):
+                            z_next_val = float(z_next_from_belief.detach().flatten()[0].item())
+                        else:
+                            z_next_val = float(z_next_from_belief)
+                    except Exception:
+                        z_next_val = float(self.population_z) if self.population_z is not None else 0.0
+                    self.population_z = float(max(-1.0, min(1.0, z_next_val)))
+                else:
+                    if self.z_scalar_updater is not None:
+                        self.population_z = float(
+                            self.z_scalar_updater.update(
+                                float(self.population_z) if self.population_z is not None else 0.0,
+                                self._z_agg,
+                                id2label=self.id2label,
+                                stage_end=True,
+                            )
+                        )
+                    else:
+                        try:
+                            self.population_z = float(max(-1.0, min(1.0, float(self.population_z))))
+                        except Exception:
+                            self.population_z = 0.0
+            else:
+                if self.use_secondary_belief_sim and z_next_from_belief is not None:
+                    self.population_z = self._normalize_prob_vec(z_next_from_belief, self.num_labels)
+                else:
+                    self.population_z = self.z_updater.update(
+                        self.population_z,
+                        self._z_agg,
+                        t=int(t),
+                        stage_end=True,
+                    )
+
+            # reset aggregator for next stage
+            if self.population_z_mode == "continuous":
+                self._z_agg = (
+                    self.z_scalar_updater.init_aggregator()
+                    if self.z_scalar_updater is not None
+                    else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
+                )
+            else:
+                self._z_agg = self.z_updater.init_aggregator(self.num_labels)
+
+            # simulate secondary users for the NEXT stage (after population_z updated)
+            if self.use_secondary_belief_sim and (not terminated):
+                ap = extra_info.get("secondary_action_probs") if isinstance(extra_info, dict) else None
+                if isinstance(ap, torch.Tensor) and ap.ndim >= 2:
+                    ap = ap[0]
+                if isinstance(z_next_from_belief, torch.Tensor) and z_next_from_belief.ndim >= 2:
+                    z_use = z_next_from_belief[0]
+                else:
+                    z_use = z_next_from_belief
+                sim_stage = int(self.stage_t)
+                self._simulate_secondary_stage(sim_stage, z_probs=z_use, action_probs=ap)
+
+            # build next observation list (PRE-round state for next stage)
+            if not terminated:
+                if bool(getattr(self, "shuffle_core_users_each_stage", False)):
+                    rnd = random.Random(int(getattr(self, "core_users_shuffle_seed", 42)) + int(self.stage_t))
+                    rnd.shuffle(self.core_users)
+                obs_list = [self._build_observation_sync(str(u), int(self.stage_t)) for u in self.core_users]
+                self.current_obs = obs_list
+            else:
+                self.current_obs = []
+
+            # reward aggregation
+            if valid > 0:
+                r_action_type = sum_at / float(valid)
+                r_stance = sum_st / float(valid)
+                r_text = sum_txt / float(valid)
+            else:
+                r_action_type = 0.0
+                r_stance = 0.0
+                r_text = 0.0
+
+            total_reward = (
+                self.reward_w_action_type * float(r_action_type)
+                + self.reward_w_stance * float(r_stance)
+                + self.reward_w_text * float(r_text)
+            )
+
+            # post-state belief snapshot (global)
+            belief_inputs_post = None
+            if not terminated:
+                belief_inputs_post = {
+                    "t": int(self.stage_t),
+                    "is_core_user": True,
+                    "neighbor_stance_counts": [0, 0, 0],
+                    "population_z": self.population_z,
+                }
+
+            # z supervision: one per stage boundary (always in sync mode when t+1 exists)
+            z_mask = 1.0 if ((t + 1) < self.n_stages) else 0.0
+            z_target_stage = int(t) + 1
+            labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
+            if z_mask > 0 and self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
+                z_mask = 0.0
+            if self.population_z_mode == "continuous":
+                z_target = [float(self.edge_z_scalar_by_stage.get(z_target_stage, 0.0))] if z_mask > 0 else [0.0]
+                z_pred = [float(self.population_z) if self.population_z is not None else 0.0]
+            else:
+                z_target = (
+                    self.edge_dist_by_stage.get(z_target_stage, [1.0 / self.num_labels for _ in range(self.num_labels)])
+                    if z_mask > 0
+                    else [0.0 for _ in range(self.num_labels)]
+                )
+                z_pred = list(self.population_z)
+
+            info = {
+                "t": int(t),
+                "is_core_user": True,
+                "n_core_users": int(len(self.core_users)),
+                "reward_action_type": float(r_action_type),
+                "reward_ts": float(r_stance),
+                "reward_text": float(r_text),
+                "population_z": float(self.population_z) if self.population_z_mode == "continuous" else list(self.population_z),
+                "belief_inputs_pre": belief_inputs_pre,
+                "belief_inputs_post": belief_inputs_post,
+                "z_pred": z_pred,
+                "z_target": z_target,
+                "z_mask": float(z_mask),
+                "z_target_labeled_edge_n": int(labeled_edge_n),
+            }
+
+            # Optional z-based reward
+            try:
+                if float(getattr(self, "reward_w_z", 0.0)) > 0.0:
+                    do_z = True
+                    if bool(getattr(self, "reward_z_on_stage_end_only", True)) and not (z_mask > 0):
+                        do_z = False
+                    if do_z:
+                        reward_z = 0.0
+                        if self.population_z_mode == "continuous":
+                            zt = float(z_target[0]) if isinstance(z_target, list) and len(z_target) > 0 else 0.0
+                            zp = float(z_pred[0]) if isinstance(z_pred, list) and len(z_pred) > 0 else 0.0
+                            reward_z = -float((zp - zt) ** 2)
+                        else:
+                            import math
+
+                            eps = 1e-8
+                            pt = [max(0.0, float(x)) for x in (z_target or [])]
+                            pp = [max(0.0, float(x)) for x in (z_pred or [])]
+                            spt = float(sum(pt))
+                            spp = float(sum(pp))
+                            if spt > 0 and spp > 0:
+                                pt = [x / spt for x in pt]
+                                pp = [x / spp for x in pp]
+                                kl = 0.0
+                                for i in range(min(len(pt), len(pp))):
+                                    kl += pt[i] * (math.log(max(eps, pt[i])) - math.log(max(eps, pp[i])))
+                                reward_z = -float(max(0.0, kl))
+                        total_reward = float(total_reward) + float(self.reward_w_z) * float(reward_z)
+                        info["reward_z"] = float(reward_z)
+            except Exception:
+                pass
+
+            info.update(extra_info)
+            return self.current_obs, float(total_reward), bool(terminated), bool(truncated), info
+
         user = self._current_user()
         t = self.stage_t
         # whether this step finishes the current stage (i.e., last core user posts)

@@ -506,6 +506,25 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     # Stage1/2 supervised accuracy (if present)
                     if "belief_sup_acc" in train_stats:
                         logger.log_stat("train/belief_sup_acc", float(train_stats["belief_sup_acc"]), t_env)
+                        # Stage3b-friendly alias (masked supervision)
+                        logger.log_stat("train/action_sup_acc_masked", float(train_stats["belief_sup_acc"]), t_env)
+                    # Stage3b masked CE loss alias (same as loss_total in supervised mode)
+                    if bool(getattr(config, "train_action_imitation", False)):
+                        # Prefer loss_belief (explicit supervised CE) to avoid confusion across modes.
+                        if "loss_belief" in train_stats:
+                            logger.log_stat("train/action_sup_loss_masked", float(train_stats["loss_belief"]), t_env)
+                        elif "loss_total" in train_stats:
+                            logger.log_stat("train/action_sup_loss_masked", float(train_stats["loss_total"]), t_env)
+                        # Sanity: log difference if both exist (should be ~0 in S3b supervised mode)
+                        if ("loss_belief" in train_stats) and ("loss_total" in train_stats):
+                            try:
+                                logger.log_stat(
+                                    "train/action_sup_loss_minus_loss_belief",
+                                    float(train_stats["loss_total"]) - float(train_stats["loss_belief"]),
+                                    t_env,
+                                )
+                            except Exception:
+                                pass
                     # Stage1/2 supervised diagnostics (if present)
                     for k in (
                         "belief_sup_soft_available_frac",
@@ -546,9 +565,19 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "belief_sup_has_gt0",
                         "belief_sup_has_gt1",
                         "belief_sup_has_gt2",
+                        # Stage3b masked-supervision diagnostics
+                        "belief_sup_possible_count",
+                        "belief_sup_supervised_count",
+                        "belief_sup_coverage",
+                        "belief_sup_skipped_ratio",
                     ):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
+                    # Stage3b: expose coverage/skipped under action_sup namespace too
+                    if "belief_sup_coverage" in train_stats:
+                        logger.log_stat("train/action_sup_coverage", float(train_stats["belief_sup_coverage"]), t_env)
+                    if "belief_sup_skipped_ratio" in train_stats:
+                        logger.log_stat("train/action_sup_skipped_ratio", float(train_stats["belief_sup_skipped_ratio"]), t_env)
 
                     # sliding moving averages (smoothed curves)
                     if "loss_total" in train_stats:
@@ -557,6 +586,7 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     if "belief_sup_acc" in train_stats:
                         ma_acc = _ma_update("belief_sup_acc", float(train_stats["belief_sup_acc"]))
                         logger.log_stat(f"train/belief_sup_acc_ma{moving_avg_window}", ma_acc, t_env)
+                        logger.log_stat(f"train/action_sup_acc_masked_ma{moving_avg_window}", ma_acc, t_env)
                     # Optional: moving averages for supervised diagnostics (helps when noisy)
                     for k in (
                         "belief_sup_soft_available_frac",
@@ -688,6 +718,12 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "test_kl_target_zpred_nostage",
                         "test_kl_target_zpred_nogr",
                         "secondary_z_eval_steps",
+                        # Stage3b masked eval (HF datasets)
+                        "hf_eval_acc_masked",
+                        "hf_eval_total_masked",
+                        "hf_eval_skipped_unsup",
+                        "hf_eval_coverage",
+                        "hf_eval_skipped_ratio",
                         # per-class stance metrics on eval split
                         "stance_gt0_frac",
                         "stance_gt1_frac",
@@ -1016,11 +1052,17 @@ def run_test(runner, logger, config: SimpleNamespace):
     z_kl_list: List[float] = []
     z_eval_steps: int = 0
 
-    # HF stance-id eval (per-class stats on eval split)
-    stance_k = 3
-    stance_gt_counts = [0 for _ in range(stance_k)]
-    stance_pred_counts = [0 for _ in range(stance_k)]
-    stance_correct_counts = [0 for _ in range(stance_k)]
+    # HF dataset eval (per-class stats on eval split).
+    # - Stage1/2 stance classification: K=3
+    # - Stage3b action imitation: K=5
+    try:
+        hf_k = int(getattr(getattr(config, "env_args", SimpleNamespace()), "n_actions", getattr(config, "n_actions", 3)))
+    except Exception:
+        hf_k = 3
+    hf_k = max(1, hf_k)
+    hf_gt_counts = [0 for _ in range(hf_k)]
+    hf_pred_counts = [0 for _ in range(hf_k)]
+    hf_correct_counts = [0 for _ in range(hf_k)]
     
     def _is_boxed_int(s: Any) -> bool:
         """Return True if string contains a \\boxed{<int>} (allows whitespace)."""
@@ -1046,6 +1088,11 @@ def run_test(runner, logger, config: SimpleNamespace):
         except Exception:
             return None
 
+    # Aggregate masked-eval counters across ALL test episodes (stable + interpretable).
+    hf_eval_total_all = 0
+    hf_eval_correct_all = 0
+    hf_eval_skipped_unsup_all = 0
+
     for _ in range(test_episodes):
         episode_batch = eval_runner.run(test_mode=True)
         if episode_batch is not None:
@@ -1062,6 +1109,21 @@ def run_test(runner, logger, config: SimpleNamespace):
             # - Legacy social-sim envs may emit gt_t/gt_available/reward_action_type/reward_text.
             # - HuggingFaceDatasetEnv emits is_correct/reward_ts/reward_al/reward_cc (+ optional z_*).
             use_legacy_schema = False
+            # Optional: Stage3b adjustment — only count post/retweet as supervised labels during evaluation.
+            sup_ids = None
+            try:
+                if (not use_legacy_schema) and bool(getattr(config, "train_action_imitation", False)):
+                    only_ids = getattr(config, "action_imitation_supervised_action_ids", None)
+                    if isinstance(only_ids, (list, tuple)) and len(only_ids) > 0:
+                        sup_ids = set(int(x) for x in only_ids)
+            except Exception:
+                sup_ids = None
+
+            # Per-episode counters (will be accumulated into *_all)
+            hf_eval_total = 0
+            hf_eval_correct = 0
+            hf_eval_skipped_unsup = 0
+
             for info in env_infos:
                 if not isinstance(info, dict):
                     continue
@@ -1109,29 +1171,41 @@ def run_test(runner, logger, config: SimpleNamespace):
                     sum_txt += float(info.get("reward_text", 0.0))
                 else:
                     # HuggingFaceDatasetEnv schema: treat each step as valid.
+                    # If sup_ids is set, only evaluate those labels; others are treated as latent (skipped).
+                    gt = _parse_boxed_int(info.get("ground_truth_answer", "")) or _parse_boxed_int(info.get("ground_truth", ""))
+                    if sup_ids is not None and gt is not None and int(gt) not in sup_ids:
+                        hf_eval_skipped_unsup += 1
+                        continue
+
                     valid += 1
-                    # "action type" here means output format is usable (\\boxed{<id>}).
-                    sum_at += 1.0 if _is_boxed_int(info.get("llm_answer", "")) else 0.0
-                    # stance correctness: prefer reward_ts; fallback to is_correct
-                    try:
-                        sum_st += float(info.get("reward_ts", 1.0 if info.get("is_correct", False) else 0.0))
-                    except Exception:
-                        sum_st += 0.0
+                    # IMPORTANT: For HF datasets, evaluate boxed-id accuracy, not just "is boxed".
+                    pr = _parse_boxed_int(info.get("llm_answer", ""))
+                    sum_at += 1.0 if (gt is not None and pr is not None and int(gt) == int(pr)) else 0.0
+                    # keep legacy "stance" slot as is_correct (HF env sets is_correct based on boxed-id equality)
+                    sum_st += 1.0 if bool(info.get("is_correct", False)) else 0.0
                     # no explicit reward_text; use reward_al as a proxy (often 0 when al_weight=0)
                     try:
                         sum_txt += float(info.get("reward_al", 0.0))
                     except Exception:
                         sum_txt += 0.0
 
-                    # Also compute per-class stance stats on eval split (boxed ids)
+                    # Also compute per-class stats on eval split (boxed ids)
                     try:
-                        gt = _parse_boxed_int(info.get("ground_truth_answer", "")) or _parse_boxed_int(info.get("ground_truth", ""))
-                        pr = _parse_boxed_int(info.get("llm_answer", ""))
-                        if gt is not None and pr is not None and 0 <= int(gt) < stance_k and 0 <= int(pr) < stance_k:
-                            stance_gt_counts[int(gt)] += 1
-                            stance_pred_counts[int(pr)] += 1
-                            if int(gt) == int(pr):
-                                stance_correct_counts[int(gt)] += 1
+                        if gt is not None and 0 <= int(gt) < hf_k:
+                            hf_gt_counts[int(gt)] += 1
+                        if pr is not None and 0 <= int(pr) < hf_k:
+                            hf_pred_counts[int(pr)] += 1
+                        if gt is not None and pr is not None and 0 <= int(gt) < hf_k and int(gt) == int(pr):
+                            hf_correct_counts[int(gt)] += 1
+                    except Exception:
+                        pass
+
+                    # additional masked-eval stats for Stage3b
+                    try:
+                        if gt is not None:
+                            hf_eval_total += 1
+                            if pr is not None and int(gt) == int(pr):
+                                hf_eval_correct += 1
                     except Exception:
                         pass
 
@@ -1149,6 +1223,13 @@ def run_test(runner, logger, config: SimpleNamespace):
                 core_action_type_acc.append(sum_at / valid)
                 core_stance_acc.append(sum_st / valid)
                 core_text_sim.append(sum_txt / valid)
+            # accumulate masked-eval counters across episodes
+            try:
+                hf_eval_total_all += int(hf_eval_total)
+                hf_eval_correct_all += int(hf_eval_correct)
+                hf_eval_skipped_unsup_all += int(hf_eval_skipped_unsup)
+            except Exception:
+                pass
     
     # Calculate averages
     avg_return = float(np.mean(returns)) if returns else 0.0
@@ -1162,23 +1243,23 @@ def run_test(runner, logger, config: SimpleNamespace):
 
     z_kl = float(np.mean(z_kl_list)) if z_kl_list else 0.0
     
-    # Per-class stance metrics on eval split (HF schema only; best-effort)
-    stance_total_gt = float(sum(stance_gt_counts))
-    stance_total_pred = float(sum(stance_pred_counts))
-    stance_gt_frac = [float(c) / stance_total_gt if stance_total_gt > 0 else float("nan") for c in stance_gt_counts]
-    stance_pred_frac = [float(c) / stance_total_pred if stance_total_pred > 0 else float("nan") for c in stance_pred_counts]
-    stance_has_gt = [1.0 if stance_gt_counts[i] > 0 else 0.0 for i in range(stance_k)]
-    stance_has_pred = [1.0 if stance_pred_counts[i] > 0 else 0.0 for i in range(stance_k)]
-    stance_recall = [
-        (float(stance_correct_counts[i]) / float(stance_gt_counts[i])) if stance_gt_counts[i] > 0 else 0.0
-        for i in range(stance_k)
+    # Per-class HF metrics on eval split (best-effort)
+    hf_total_gt = float(sum(hf_gt_counts))
+    hf_total_pred = float(sum(hf_pred_counts))
+    hf_gt_frac = [float(c) / hf_total_gt if hf_total_gt > 0 else float("nan") for c in hf_gt_counts]
+    hf_pred_frac = [float(c) / hf_total_pred if hf_total_pred > 0 else float("nan") for c in hf_pred_counts]
+    hf_has_gt = [1.0 if hf_gt_counts[i] > 0 else 0.0 for i in range(hf_k)]
+    hf_has_pred = [1.0 if hf_pred_counts[i] > 0 else 0.0 for i in range(hf_k)]
+    hf_recall = [
+        (float(hf_correct_counts[i]) / float(hf_gt_counts[i])) if hf_gt_counts[i] > 0 else 0.0
+        for i in range(hf_k)
     ]
-    stance_precision = [
-        (float(stance_correct_counts[i]) / float(stance_pred_counts[i])) if stance_pred_counts[i] > 0 else 0.0
-        for i in range(stance_k)
+    hf_precision = [
+        (float(hf_correct_counts[i]) / float(hf_pred_counts[i])) if hf_pred_counts[i] > 0 else 0.0
+        for i in range(hf_k)
     ]
 
-    return {
+    out = {
         "test_return_mean": avg_return,
         "test_success_rate": success_rate,
         "test_episodes": len(returns),
@@ -1189,39 +1270,69 @@ def run_test(runner, logger, config: SimpleNamespace):
         "core_stance_acc": core_st,
         "core_text_sim": core_txt,
         "core_eval_steps_mean": avg_core_steps,
-        # stance per-class metrics (eval split)
-        "stance_gt0_frac": float(stance_gt_frac[0]) if len(stance_gt_frac) > 0 else float("nan"),
-        "stance_gt1_frac": float(stance_gt_frac[1]) if len(stance_gt_frac) > 1 else float("nan"),
-        "stance_gt2_frac": float(stance_gt_frac[2]) if len(stance_gt_frac) > 2 else float("nan"),
-        "stance_pred0_frac": float(stance_pred_frac[0]) if len(stance_pred_frac) > 0 else float("nan"),
-        "stance_pred1_frac": float(stance_pred_frac[1]) if len(stance_pred_frac) > 1 else float("nan"),
-        "stance_pred2_frac": float(stance_pred_frac[2]) if len(stance_pred_frac) > 2 else float("nan"),
-        "stance_recall0": float(stance_recall[0]) if len(stance_recall) > 0 else float("nan"),
-        "stance_recall1": float(stance_recall[1]) if len(stance_recall) > 1 else float("nan"),
-        "stance_recall2": float(stance_recall[2]) if len(stance_recall) > 2 else float("nan"),
-        "stance_precision0": float(stance_precision[0]) if len(stance_precision) > 0 else float("nan"),
-        "stance_precision1": float(stance_precision[1]) if len(stance_precision) > 1 else float("nan"),
-        "stance_precision2": float(stance_precision[2]) if len(stance_precision) > 2 else float("nan"),
-        # counts + validity flags (helps interpret recall/precision)
-        "stance_gt0_count": float(stance_gt_counts[0]) if len(stance_gt_counts) > 0 else 0.0,
-        "stance_gt1_count": float(stance_gt_counts[1]) if len(stance_gt_counts) > 1 else 0.0,
-        "stance_gt2_count": float(stance_gt_counts[2]) if len(stance_gt_counts) > 2 else 0.0,
-        "stance_pred0_count": float(stance_pred_counts[0]) if len(stance_pred_counts) > 0 else 0.0,
-        "stance_pred1_count": float(stance_pred_counts[1]) if len(stance_pred_counts) > 1 else 0.0,
-        "stance_pred2_count": float(stance_pred_counts[2]) if len(stance_pred_counts) > 2 else 0.0,
-        "stance_correct0_count": float(stance_correct_counts[0]) if len(stance_correct_counts) > 0 else 0.0,
-        "stance_correct1_count": float(stance_correct_counts[1]) if len(stance_correct_counts) > 1 else 0.0,
-        "stance_correct2_count": float(stance_correct_counts[2]) if len(stance_correct_counts) > 2 else 0.0,
-        "stance_has_gt0": float(stance_has_gt[0]) if len(stance_has_gt) > 0 else 0.0,
-        "stance_has_gt1": float(stance_has_gt[1]) if len(stance_has_gt) > 1 else 0.0,
-        "stance_has_gt2": float(stance_has_gt[2]) if len(stance_has_gt) > 2 else 0.0,
-        "stance_has_pred0": float(stance_has_pred[0]) if len(stance_has_pred) > 0 else 0.0,
-        "stance_has_pred1": float(stance_has_pred[1]) if len(stance_has_pred) > 1 else 0.0,
-        "stance_has_pred2": float(stance_has_pred[2]) if len(stance_has_pred) > 2 else 0.0,
         # secondary belief evaluation
         "secondary_z_kl": z_kl,
         "secondary_z_eval_steps": int(z_eval_steps),
     }
+    # Stage3b masked-eval helpers (only meaningful for HF schema + action_imitation_supervised_action_ids)
+    try:
+        if hf_eval_total_all > 0:
+            out["hf_eval_acc_masked"] = float(hf_eval_correct_all / max(1, hf_eval_total_all))
+        out["hf_eval_total_masked"] = int(hf_eval_total_all)
+        out["hf_eval_skipped_unsup"] = int(hf_eval_skipped_unsup_all)
+        denom = float(hf_eval_total_all + hf_eval_skipped_unsup_all)
+        out["hf_eval_coverage"] = float(hf_eval_total_all / denom) if denom > 0 else 0.0
+        out["hf_eval_skipped_ratio"] = float(hf_eval_skipped_unsup_all / denom) if denom > 0 else 0.0
+    except Exception:
+        pass
+    # Per-class keys:
+    # - K=3: keep backward-compatible stance_* keys (Stage1/2).
+    # - K!=3: emit action_* keys (Stage3b action imitation).
+    if hf_k == 3:
+        out.update(
+            {
+                "stance_gt0_frac": float(hf_gt_frac[0]) if len(hf_gt_frac) > 0 else float("nan"),
+                "stance_gt1_frac": float(hf_gt_frac[1]) if len(hf_gt_frac) > 1 else float("nan"),
+                "stance_gt2_frac": float(hf_gt_frac[2]) if len(hf_gt_frac) > 2 else float("nan"),
+                "stance_pred0_frac": float(hf_pred_frac[0]) if len(hf_pred_frac) > 0 else float("nan"),
+                "stance_pred1_frac": float(hf_pred_frac[1]) if len(hf_pred_frac) > 1 else float("nan"),
+                "stance_pred2_frac": float(hf_pred_frac[2]) if len(hf_pred_frac) > 2 else float("nan"),
+                "stance_recall0": float(hf_recall[0]) if len(hf_recall) > 0 else float("nan"),
+                "stance_recall1": float(hf_recall[1]) if len(hf_recall) > 1 else float("nan"),
+                "stance_recall2": float(hf_recall[2]) if len(hf_recall) > 2 else float("nan"),
+                "stance_precision0": float(hf_precision[0]) if len(hf_precision) > 0 else float("nan"),
+                "stance_precision1": float(hf_precision[1]) if len(hf_precision) > 1 else float("nan"),
+                "stance_precision2": float(hf_precision[2]) if len(hf_precision) > 2 else float("nan"),
+                "stance_gt0_count": float(hf_gt_counts[0]) if len(hf_gt_counts) > 0 else 0.0,
+                "stance_gt1_count": float(hf_gt_counts[1]) if len(hf_gt_counts) > 1 else 0.0,
+                "stance_gt2_count": float(hf_gt_counts[2]) if len(hf_gt_counts) > 2 else 0.0,
+                "stance_pred0_count": float(hf_pred_counts[0]) if len(hf_pred_counts) > 0 else 0.0,
+                "stance_pred1_count": float(hf_pred_counts[1]) if len(hf_pred_counts) > 1 else 0.0,
+                "stance_pred2_count": float(hf_pred_counts[2]) if len(hf_pred_counts) > 2 else 0.0,
+                "stance_correct0_count": float(hf_correct_counts[0]) if len(hf_correct_counts) > 0 else 0.0,
+                "stance_correct1_count": float(hf_correct_counts[1]) if len(hf_correct_counts) > 1 else 0.0,
+                "stance_correct2_count": float(hf_correct_counts[2]) if len(hf_correct_counts) > 2 else 0.0,
+                "stance_has_gt0": float(hf_has_gt[0]) if len(hf_has_gt) > 0 else 0.0,
+                "stance_has_gt1": float(hf_has_gt[1]) if len(hf_has_gt) > 1 else 0.0,
+                "stance_has_gt2": float(hf_has_gt[2]) if len(hf_has_gt) > 2 else 0.0,
+                "stance_has_pred0": float(hf_has_pred[0]) if len(hf_has_pred) > 0 else 0.0,
+                "stance_has_pred1": float(hf_has_pred[1]) if len(hf_has_pred) > 1 else 0.0,
+                "stance_has_pred2": float(hf_has_pred[2]) if len(hf_has_pred) > 2 else 0.0,
+            }
+        )
+    else:
+        for i in range(hf_k):
+            out[f"action_gt{i}_frac"] = float(hf_gt_frac[i]) if i < len(hf_gt_frac) else float("nan")
+            out[f"action_pred{i}_frac"] = float(hf_pred_frac[i]) if i < len(hf_pred_frac) else float("nan")
+            out[f"action_recall{i}"] = float(hf_recall[i]) if i < len(hf_recall) else float("nan")
+            out[f"action_precision{i}"] = float(hf_precision[i]) if i < len(hf_precision) else float("nan")
+            out[f"action_gt{i}_count"] = float(hf_gt_counts[i]) if i < len(hf_gt_counts) else 0.0
+            out[f"action_pred{i}_count"] = float(hf_pred_counts[i]) if i < len(hf_pred_counts) else 0.0
+            out[f"action_correct{i}_count"] = float(hf_correct_counts[i]) if i < len(hf_correct_counts) else 0.0
+            out[f"action_has_gt{i}"] = float(hf_has_gt[i]) if i < len(hf_has_gt) else 0.0
+            out[f"action_has_pred{i}"] = float(hf_has_pred[i]) if i < len(hf_has_pred) else 0.0
+
+    return out
 
 def setup_wandb(config: SimpleNamespace, logger):
     """Initialize wandb for experiment tracking"""

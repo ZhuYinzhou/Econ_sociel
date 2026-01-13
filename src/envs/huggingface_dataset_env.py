@@ -719,6 +719,8 @@ class HuggingFaceDatasetEnv(gym.Env):
                     "neighbor_action_type_counts_t",
                     "neighbor_stance_counts_t",
                     "target_distribution_prob",
+                    # Stage3b partial supervision: 1.0 for supervised samples, 0.0 for latent samples
+                    "action_mask",
                 ):
                     if k in self.current_sample:
                         info[k] = self.current_sample.get(k)

@@ -260,6 +260,7 @@ class ECONLearner:
             belief_lr = float(getattr(args, "belief_net_lr", getattr(args, "lr", 0.0)))
         except Exception:
             belief_lr = float(getattr(args, "lr", 0.0) or 0.0)
+
         if self.belief_net_params and belief_lr > 0:
             trainable_belief_params = [p for p in self.belief_net_params if getattr(p, "requires_grad", False)]
             if trainable_belief_params:
@@ -270,11 +271,13 @@ class ECONLearner:
                 )
             else:
                 # Common in Stage3a encoder-only when mac.agent is fully frozen.
-                self.logger.info("Belief optimizer skipped: no trainable belief/policy parameters (all requires_grad=False).")
+                self.logger.info(
+                    "Belief optimizer skipped: no trainable belief/policy parameters (all requires_grad=False)."
+                )
         else:
             if belief_lr <= 0:
                 self.logger.info(f"Belief optimizer skipped: belief_net_lr={belief_lr} <= 0.")
-        
+
         self.encoder_optimizer = None
         try:
             encoder_lr = float(getattr(args, "encoder_lr", getattr(args, "lr", 0.0)))
@@ -426,6 +429,11 @@ class ECONLearner:
             total_loss = torch.tensor(0.0, device=self.device)
             total_correct = 0.0
             total_count = 0.0
+            # Stage3b masked-supervision diagnostics:
+            # - possible_count: how many (masked) agent-rows existed (by env mask), regardless of label filtering
+            # - supervised_count: how many agent-rows actually contributed to CE after label filtering
+            possible_count = 0.0
+            supervised_count = 0.0
             # Soft-label diagnostics (for verifying Scheme-B actually takes effect)
             soft_available_steps = 0  # timesteps where gt_action_dist has any valid mass
             soft_used_steps = 0       # timesteps where we actually used soft CE (not fallback hard CE)
@@ -458,7 +466,37 @@ class ECONLearner:
                 m_t_full = mask[:, t]
                 if m_t_full.ndim > 1:
                     m_t_full = m_t_full.view(bs_total)
-                total_w = torch.clamp(m_t_full.float().sum() * float(self.args.n_agents), min=1.0).to(self.device)
+                # Optional: Stage3b adjustment — supervise only a subset of action ids (e.g., post/retweet),
+                # and treat other actions as latent (no supervised loss/acc).
+                # This does NOT change the action space; it only masks which labels contribute to CE.
+                sup_full = None
+                try:
+                    if bool(getattr(self.args, "train_action_imitation", False)):
+                        only_ids = getattr(self.args, "action_imitation_supervised_action_ids", None)
+                        if isinstance(only_ids, (list, tuple)) and len(only_ids) > 0:
+                            y_full = batch["gt_action"][:, t].to(self.device)
+                            if y_full.ndim > 1:
+                                y_full = y_full.view(bs_total)
+                            y_full = y_full.long()
+                            sup_full = torch.zeros_like(y_full, dtype=torch.bool)
+                            for _i in only_ids:
+                                try:
+                                    ii = int(_i)
+                                except Exception:
+                                    continue
+                                sup_full |= (y_full == ii)
+                except Exception:
+                    sup_full = None
+
+                if isinstance(sup_full, torch.Tensor):
+                    total_w = torch.clamp((m_t_full.float() * sup_full.float()).sum() * float(self.args.n_agents), min=1.0).to(self.device)
+                else:
+                    total_w = torch.clamp(m_t_full.float().sum() * float(self.args.n_agents), min=1.0).to(self.device)
+                # Track possible rows (unfiltered) for coverage ratio.
+                try:
+                    possible_count += float((m_t_full.float().sum() * float(self.args.n_agents)).item())
+                except Exception:
+                    pass
 
                 # Loss for logging (detached)
                 loss_t_val = 0.0
@@ -502,6 +540,11 @@ class ECONLearner:
 
                     m_t = m_t_full[s0:s1]
                     w = m_t.float().unsqueeze(1).expand(bs, na).reshape(-1)
+                    # Apply supervised-label mask (Stage3b): only ids in action_imitation_supervised_action_ids contribute.
+                    if isinstance(sup_full, torch.Tensor):
+                        sup_s = sup_full[s0:s1].to(self.device)
+                        sup_w = sup_s.float().unsqueeze(1).expand(bs, na).reshape(-1)
+                        w = w * sup_w
 
                     use_soft = bool(getattr(self.args, "belief_supervised_use_soft_labels", False)) and ("gt_action_dist" in batch.scheme)
                     if use_soft:
@@ -559,6 +602,7 @@ class ECONLearner:
                     pred = logits_flat.argmax(dim=-1)
                     total_correct += float(((pred == y_exp).float() * w).sum().item())
                     total_count += float(w.sum().item())
+                    supervised_count += float(w.sum().item())
                     try:
                         with torch.no_grad():
                             if pred_counts is None:
@@ -586,6 +630,24 @@ class ECONLearner:
             # mean over timesteps (avoid dependence on seq_len)
             steps = max(1, int(batch.max_seq_length - 1))
             total_loss = total_loss / float(steps)
+
+            # If we masked out all labels (e.g., dataset contains no supervised classes), skip the step.
+            if float(total_count) <= 0.0:
+                self.logger.warning("belief_supervised: effective_count==0 after label-masking; skipping optimizer step.")
+                try:
+                    self.belief_supervised_optimizer.zero_grad(set_to_none=True)
+                except Exception:
+                    self.belief_supervised_optimizer.zero_grad()
+                return {
+                    "status": "belief_supervised_skipped_no_labeled",
+                    "loss_total": 0.0,
+                    "loss_belief": 0.0,
+                    "loss_encoder": 0.0,
+                    "loss_mixer": 0.0,
+                    "belief_sup_acc": 0.0,
+                    "belief_sup_effective_count": 0.0,
+                    "reward_mean": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+                }
 
             # Safety: if loss is NaN/Inf (often caused by degenerate all-masked attention),
             # skip optimizer step to avoid corrupting weights.
@@ -680,6 +742,11 @@ class ECONLearner:
                 "loss_encoder": 0.0,
                 "loss_mixer": 0.0,
                 "belief_sup_acc": float(acc),
+                # Masked-supervision summary (useful for Stage3b partial supervision)
+                "belief_sup_possible_count": float(possible_count),
+                "belief_sup_supervised_count": float(supervised_count),
+                "belief_sup_coverage": float(supervised_count / max(1.0, possible_count)) if possible_count > 0 else 0.0,
+                "belief_sup_skipped_ratio": float(1.0 - (supervised_count / max(1.0, possible_count))) if possible_count > 0 else 0.0,
                 # how many (masked) samples actually contributed to CE/acc this update
                 # (if this is ~1, pred*_frac will naturally jump between 0/1)
                 "belief_sup_effective_count": float(total_count),
@@ -986,7 +1053,7 @@ class ECONLearner:
             else:
                 a = actions_t.long().reshape(actions_t.shape[0], actions_t.shape[1], 1)
             return q_all.gather(-1, a).squeeze(-1)
-
+        
         # Collect data from forward passes - Stage 1
         list_belief_states_stage1, list_prompt_embeddings_stage1, list_local_q_values_stage1, list_group_repr_stage1 = [], [], [], []
         list_belief_states_stage1_next, list_prompt_embeddings_stage1_next, list_local_q_values_stage1_next, list_group_repr_stage1_next = [], [], [], []

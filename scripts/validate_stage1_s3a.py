@@ -276,6 +276,12 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     sum_dz_tgt = 0.0
     sum_kl_nostage = 0.0
     sum_kl_nogr = 0.0
+    sum_kl_randstage = 0.0
+    sum_kl_shiftstage = 0.0
+    # fixed-stage probes help diagnose "stage embeddings for late stages are untrained/misaligned"
+    fixed_stage_ids = list(getattr(cfg2, "stage3a_fixed_stages", [11, 12]) or [11, 12])
+    fixed_stage_ids = [int(x) for x in fixed_stage_ids if str(x).strip() != ""]
+    fixed_stage_sums: Dict[int, float] = {int(s): 0.0 for s in fixed_stage_ids}
 
     stage_sum_mask: Dict[int, float] = {}
     stage_sum_dz_pred: Dict[int, float] = {}
@@ -286,6 +292,13 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
         batch = runner.run(test_mode=True)
         if batch is None:
             continue
+        # Stage3a: 必须有至少 2 个时间步，否则 [:, :-1] 会变空，eval 结果没有意义
+        try:
+            seq_len = int(batch["z_t"].shape[1])
+        except Exception as e:
+            raise RuntimeError(f"Stage3a eval: failed to read batch['z_t'].shape[1]: {e}")
+        if seq_len < 2:
+            raise AssertionError(f"Stage3a eval requires seq_len>=2, got seq_len={seq_len}. Check dataset episode length.")
         # (bs, seq, K)
         z_t = batch["z_t"][:, :-1].to(device)
         z_target = batch["z_target"][:, :-1].to(device)
@@ -358,6 +371,34 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
                 kl_nostage = _kl_tgt_pred(ztar, zpred_nostage)
                 sum_kl_nostage += float((kl_nostage * zm).sum().item())
 
+                # ablation: random-stage (shuffle stage_t across steps; preserves marginal distribution)
+                perm = torch.randperm(stf.shape[0], device=stf.device)
+                st_rand = stf[perm]
+                zpred_randstage = be.predict_next_population_belief(zt, group_repr=grf, stage_t=st_rand, return_logits=False)
+                kl_rand = _kl_tgt_pred(ztar, zpred_randstage)
+                sum_kl_randstage += float((kl_rand * zm).sum().item())
+
+                # ablation: shift-stage (use stage_t + 1, clamped to n_stages)
+                # Note: BeliefEncoder internally clamps to [0..n_stages]; we clamp here for clarity.
+                nst = int(getattr(be, "n_stages", 13))
+                st_shift = (stf.to(dtype=torch.long) + 1).clamp(min=0, max=nst).to(dtype=stf.dtype)
+                zpred_shiftstage = be.predict_next_population_belief(zt, group_repr=grf, stage_t=st_shift, return_logits=False)
+                kl_shift = _kl_tgt_pred(ztar, zpred_shiftstage)
+                sum_kl_shiftstage += float((kl_shift * zm).sum().item())
+
+                # probes: fixed-stage constants (e.g., stage 11/12)
+                if fixed_stage_ids:
+                    for sid in fixed_stage_ids:
+                        s_clamped = int(max(0, min(int(sid), int(nst))))
+                        st_fixed = torch.full(stf.shape, s_clamped, device=stf.device, dtype=stf.dtype)
+                        zpred_fixed = be.predict_next_population_belief(
+                            zt, group_repr=grf, stage_t=st_fixed, return_logits=False
+                        )
+                        kl_fixed = _kl_tgt_pred(ztar, zpred_fixed)
+                        fixed_stage_sums[int(sid)] = float(
+                            fixed_stage_sums.get(int(sid), 0.0) + float((kl_fixed * zm).sum().item())
+                        )
+
             # sensitivity: no-group-repr
             if grf is not None:
                 gr0 = torch.zeros_like(grf)
@@ -381,6 +422,13 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     out["eval_z_pred_p2_mean"] = float(sum_p2 / sum_mask) if sum_p2 > 0 else 0.0
     out["eval_kl_target_zpred_nostage"] = float(sum_kl_nostage / sum_mask) if sum_kl_nostage > 0 else 0.0
     out["eval_kl_target_zpred_nogr"] = float(sum_kl_nogr / sum_mask) if sum_kl_nogr > 0 else 0.0
+    out["eval_kl_target_zpred_randstage"] = float(sum_kl_randstage / sum_mask) if sum_kl_randstage > 0 else 0.0
+    out["eval_kl_target_zpred_shiftstage"] = float(sum_kl_shiftstage / sum_mask) if sum_kl_shiftstage > 0 else 0.0
+    for sid in fixed_stage_ids:
+        s = int(sid)
+        v = float(fixed_stage_sums.get(s, 0.0))
+        if v > 0:
+            out[f"eval_kl_target_zpred_fixedstage{s}"] = float(v / sum_mask)
     out["eval_mask_sum"] = float(sum_mask)
     # per-stage buckets
     for s, m in stage_sum_mask.items():
@@ -411,6 +459,111 @@ def _find_metrics_jsonl(logdir: str) -> Optional[str]:
     return None
 
 
+def _ckpt_must_have(ckpt_dir: str, filenames: List[str]) -> None:
+    missing = []
+    for fn in filenames:
+        p = os.path.join(ckpt_dir, fn)
+        if not os.path.exists(p):
+            missing.append(fn)
+    if missing:
+        raise FileNotFoundError(f"ckpt={ckpt_dir} missing required files: {missing}")
+
+
+def _stage_counts_from_hf(cfg: Any) -> Dict[str, Dict[int, int]]:
+    """
+    统计 HF dataset 各 split 的 stage_t 分布（用于检测 train/test 是否按 stage 切分导致 OOD）。
+    返回: {split: {stage: count}}
+    """
+    try:
+        from datasets import load_from_disk, concatenate_datasets  # type: ignore
+    except Exception:
+        return {}
+    env_args = getattr(cfg, "env_args", None)
+    if env_args is None:
+        return {}
+    paths = getattr(env_args, "hf_dataset_path", None)
+    if isinstance(paths, str):
+        paths = [paths]
+    if not isinstance(paths, list):
+        return {}
+    paths = [p for p in paths if isinstance(p, str) and os.path.isdir(p)]
+    if not paths:
+        return {}
+
+    out: Dict[str, Dict[int, int]] = {}
+    for split in ["train", "validation", "test"]:
+        parts = []
+        for p in paths:
+            try:
+                dd = load_from_disk(p)
+            except Exception:
+                continue
+            if hasattr(dd, "keys") and split in dd:
+                parts.append(dd[split])
+        if not parts:
+            continue
+        ds = parts[0] if len(parts) == 1 else concatenate_datasets(parts)
+        cnt: Dict[int, int] = {}
+        for ex in ds:
+            st = ex.get("stage_t", None)
+            if st is None:
+                continue
+            try:
+                st_i = int(st)
+            except Exception:
+                continue
+            cnt[st_i] = cnt.get(st_i, 0) + 1
+        out[split] = cnt
+    return out
+
+
+def _print_and_assert_stage_flags(cfg: Any, mode: str) -> None:
+    """
+    打印并硬断言关键阶段/冻结开关，避免 config–ckpt 用错（这是最常见的 silent failure）。
+    """
+    def _gf(name: str, default: Any = None) -> Any:
+        return getattr(cfg, name, default)
+
+    flags = {
+        "train_belief_supervised": bool(_gf("train_belief_supervised", False)),
+        "train_encoder_only": bool(_gf("train_encoder_only", False)),
+        "train_action_imitation": bool(_gf("train_action_imitation", False)),
+        "train_population_update_head_only": bool(_gf("train_population_update_head_only", False)),
+        "freeze_belief_encoder_in_supervised": bool(_gf("freeze_belief_encoder_in_supervised", False)),
+        "freeze_belief_encoder_in_rl": bool(_gf("freeze_belief_encoder_in_rl", False)),
+        "freeze_belief_network_in_rl": bool(_gf("freeze_belief_network_in_rl", False)),
+        "z_transition_loss_weight": float(_gf("z_transition_loss_weight", 0.0) or 0.0),
+        "z_transition_loss_type": str(_gf("z_transition_loss_type", "kl") or "kl"),
+    }
+    print("\n=== Config stage/freeze flags (sanity) ===")
+    for k in sorted(flags.keys()):
+        print(f"- {k}: {flags[k]}")
+
+    if mode == "stage1":
+        # Stage1 应该是 belief supervised（非 encoder-only / 非 imitation）
+        if (not flags["train_belief_supervised"]) or flags["train_encoder_only"] or flags["train_action_imitation"]:
+            raise AssertionError(
+                "Stage1 config sanity failed: expected train_belief_supervised=True AND "
+                "train_encoder_only=False AND train_action_imitation=False"
+            )
+        # 强制 test_mode argmax（非 sampling）：依赖 MultinomialActionSelector(test_mode && test_greedy -> epsilon=0)
+        # 这里不强制 action_selector 名称，但会在运行前把 test_greedy/epsilon 置为确定性。
+        return
+
+    # stage3a
+    if mode == "stage3a":
+        # Stage3a 必须是 encoder-only 且有 z_transition loss
+        if (not flags["train_encoder_only"]) or flags["train_belief_supervised"] or flags["train_action_imitation"]:
+            raise AssertionError(
+                "Stage3a config sanity failed: expected train_encoder_only=True AND "
+                "train_belief_supervised=False AND train_action_imitation=False"
+            )
+        if flags["z_transition_loss_weight"] <= 0:
+            raise AssertionError("Stage3a config sanity failed: z_transition_loss_weight must be > 0")
+        # 强烈建议：只训练 update head；这里不强制，但打印出来帮助发现不一致
+        return
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", type=str, required=True, choices=["stage1", "stage3a"])
@@ -420,6 +573,12 @@ def main() -> int:
     ap.add_argument("--eval_split", type=str, default="test", choices=["train", "validation", "test"])
     ap.add_argument("--eval_episodes", type=int, default=200)
     ap.add_argument("--min_margin", type=float, default=0.05, help="Stage1: required margin over majority baseline.")
+    ap.add_argument(
+        "--stage3a_fixed_stages",
+        type=str,
+        default="11,12",
+        help="Stage3a: comma-separated fixed stage ids for diagnostic probes (e.g., '11,12').",
+    )
     args = ap.parse_args()
 
     # load config using src/train.py loader (supports SimpleNamespace)
@@ -427,6 +586,13 @@ def main() -> int:
     from train import load_config  # type: ignore
 
     cfg = load_config(str(args.config))
+    # Stage3a diagnostic probe stages (passed via cfg for simplicity)
+    try:
+        fixed = [int(x) for x in str(args.stage3a_fixed_stages).split(",") if str(x).strip() != ""]
+    except Exception:
+        fixed = [11, 12]
+    cfg.stage3a_fixed_stages = fixed
+    _print_and_assert_stage_flags(cfg, str(args.mode))
 
     # --- trend checks from logs (best-effort) ---
     if args.logdir:
@@ -448,10 +614,23 @@ def main() -> int:
             print(f"[WARN] 未找到 metrics.jsonl 于 logdir={args.logdir}（趋势检查跳过）")
 
     if args.mode == "stage1":
+        # --- 强制 test_mode 使用 argmax（非 sampling） ---
+        # 1) 固定 action selector 相关随机性（MultinomialActionSelector 在 test_mode && test_greedy 下会 epsilon=0 -> 纯 argmax）
+        cfg.test_greedy = True
+        cfg.epsilon_start = 0.0
+        cfg.epsilon_finish = 0.0
+        cfg.epsilon_anneal_time = 1
+        # 2) 明确 action_selector（避免 config 里被改成其它采样器）
+        cfg.action_selector = str(getattr(cfg, "action_selector", "multinomial") or "multinomial")
+        if str(cfg.action_selector).strip().lower() != "multinomial":
+            raise AssertionError(f"Stage1: for deterministic argmax, require action_selector=multinomial, got {cfg.action_selector}")
+
+        _ckpt_must_have(str(args.ckpt), ["agent.th"])
         res = _stage1_eval_confusion(cfg, str(args.ckpt), str(args.eval_split), int(args.eval_episodes))
         print("")
         print("=== Stage1(core belief) eval ===")
         print(f"- eval_split: {args.eval_split}")
+        print(f"- action_selector: {cfg.action_selector} (forced deterministic via test_greedy/epsilon=0)")
         print(f"- eval_acc: {res.eval_acc:.4f}")
         print(f"- majority_baseline: {res.majority_baseline:.4f}")
         print(f"- margin: {res.eval_acc - res.majority_baseline:+.4f}")
@@ -471,6 +650,25 @@ def main() -> int:
         return 0 if ok else 2
 
     # stage3a
+    # --- dataset stage distribution sanity (detect OOD-by-stage split) ---
+    stage_cnts = _stage_counts_from_hf(cfg)
+    if stage_cnts:
+        print("\n=== Stage3a dataset stage_t distribution (from HF) ===")
+        for sp in ["train", "validation", "test"]:
+            if sp in stage_cnts:
+                items = sorted(stage_cnts[sp].items())
+                print(f"- {sp}: {items[:30]}")
+        tr_stages = set(stage_cnts.get("train", {}).keys())
+        ev_stages = set(stage_cnts.get(str(args.eval_split), {}).keys())
+        if tr_stages and ev_stages and (not ev_stages.issubset(tr_stages)):
+            missing = sorted(list(ev_stages - tr_stages))
+            print(
+                f"[WARN] eval_split={args.eval_split} contains stages not present in train: {missing}. "
+                "This is an OOD-by-stage split; stage_embed for these stages is likely untrained -> "
+                "with-stage KL can look worse than nostage/fixedstage0 even if training loss decreases."
+            )
+
+    _ckpt_must_have(str(args.ckpt), ["belief_encoder.th"])
     out = _stage3a_eval_z_transition(cfg, str(args.ckpt), str(args.eval_split), int(args.eval_episodes))
     print("")
     print("=== Stage3a(z_transition) held-out eval (no_grad) ===")
@@ -484,11 +682,17 @@ def main() -> int:
         "eval_z_pred_minus_z_t_l2",
         "eval_z_target_minus_z_t_l2",
         "eval_kl_target_zpred_nostage",
+        "eval_kl_target_zpred_randstage",
+        "eval_kl_target_zpred_shiftstage",
         "eval_kl_target_zpred_nogr",
         "eval_mask_sum",
     ):
         if k in out:
             print(f"- {k}: {out[k]:.6f}")
+    # print fixed-stage probes (if present)
+    fixed_keys = sorted([k for k in out.keys() if k.startswith("eval_kl_target_zpred_fixedstage")])
+    for k in fixed_keys:
+        print(f"- {k}: {out[k]:.6f}")
     # a few stage buckets (print only those present)
     stages = sorted({int(k.split("stage")[-1]) for k in out.keys() if k.startswith("eval_z_pred_delta_l2_stage")})
     if stages:

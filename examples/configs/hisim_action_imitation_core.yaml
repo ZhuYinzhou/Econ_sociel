@@ -5,6 +5,12 @@ learner: "q_learner"
 # Stage3b: Core Action Policy Imitation (offline behavior cloning)
 # Goal: learn core-user action_type (5-way) conditioned on (frozen) belief representations.
 
+# IMPORTANT:
+# Stage3b 冻结 belief_network / z_transition 后，必须从 Stage2（或你认可的 belief 稳定版本）加载 checkpoint，
+# 否则 belief 表征是随机的，action imitation 训练没有意义。
+# 你也可以在命令行用 --load_model_path 覆盖这里的值。
+load_model_path: ""
+
 t_max: 50000
 test_interval: 2000
 test_nepisode: 2000
@@ -36,6 +42,12 @@ belief_supervised_micro_batch_size: 4
 freeze_belief_encoder_in_supervised: true
 train_action_imitation: true
 
+# Stage3b adjustment:
+# Only supervise a subset of action ids (post/retweet) during offline imitation.
+# Other actions (reply/like/do_nothing) are treated as latent (no supervised loss),
+# but the policy head still outputs 5-way logits and Stage4 RL keeps the full action space.
+action_imitation_supervised_action_ids: [0, 1]
+
 # ===== LRs / regularizers =====
 lr: 0.0003
 belief_net_lr: 0.0003
@@ -62,9 +74,10 @@ env: "huggingface_dataset_env"
 env_args:
   # Point this to the action imitation dataset you exported via convert_hisim_to_econ_dataset.py
   # (must contain: question/answer (\\boxed{action_id}), is_core_user=True)
+  # NOTE: convert 脚本默认输出目录是 <out-dir>_action_imitation_core（除非你显式传 --action-imitation-out-dir）
   hf_dataset_path:
-    - "/home/zhuyinzhou/MAS/ECON/data/hisim_action_imitation_dataset_metoo_e1"
-    - "/home/zhuyinzhou/MAS/ECON/data/hisim_action_imitation_dataset_metoo_e2"
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_3b_action_metoo_e1"
+    - "/home/zhuyinzhou/MAS/ECON/data/stage_3b_action_metoo_e2"
   dataset_split: "train"
   question_field_name: "question"
   answer_field_name: "answer"
@@ -106,4 +119,4 @@ logging:
   save_model_interval: 5000
   checkpoint_path: "./models"
   log_path: "./logs"
-  experiment_name: "hisim-action-imitation-core"
+  experiment_name: "hisim-action-imitation-s3b"

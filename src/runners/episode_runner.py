@@ -193,7 +193,10 @@ class EpisodeRunner:
             self.env.n_stages = int(ns)
             # keep env episode_limit consistent
             if hasattr(self.env, "core_users"):
-                self.env.episode_limit = int(ns) * len(getattr(self.env, "core_users"))
+                if bool(getattr(self.env, "sync_stage_update", False)):
+                    self.env.episode_limit = int(ns)
+                else:
+                    self.env.episode_limit = int(ns) * len(getattr(self.env, "core_users"))
         except Exception as e:
             self.logger.warning(f"Failed to set env.n_stages={ns}: {e}")
             return
@@ -245,7 +248,10 @@ class EpisodeRunner:
                 pre_transition_data = self._get_pre_transition_data(_next_obs)
                 self.batch.update(pre_transition_data, ts=self.t)
 
-                discrete_actions, mac_extra_info = self._get_actions(test_mode, raw_observation_text=_next_obs)
+                # Sync-stage social env may return observation as list[str] (per-agent).
+                # Also, in sync-stage mode we typically disable LLM rollout and drive env with discrete policy only.
+                raw_for_mac = _next_obs if isinstance(_next_obs, str) else None
+                discrete_actions, mac_extra_info = self._get_actions(test_mode, raw_observation_text=raw_for_mac)
 
                 # Determine action for env.step()
                 # Default: use coordinator commitment_text (string).
@@ -253,6 +259,50 @@ class EpisodeRunner:
                 # you can set args.env_action_source="discrete_action_boxed" to use the chosen discrete action.
                 action_source = str(getattr(self.args, "env_action_source", "commitment")).strip().lower()
                 action_for_env_step = ""
+                # HiSimSocialEnv sync-stage mode: pass list[dict] actions aligned to env.core_users.
+                try:
+                    if bool(getattr(self.env, "sync_stage_update", False)):
+                        a = discrete_actions
+                        if isinstance(a, torch.Tensor) and a.ndim >= 2:
+                            a0 = a[0]
+                        else:
+                            a0 = a
+
+                        stance_q = mac_extra_info.get("stance_action_q_values")
+                        if isinstance(stance_q, torch.Tensor) and stance_q.ndim >= 3:
+                            stance_q0 = stance_q[0]
+                        elif isinstance(stance_q, torch.Tensor) and stance_q.ndim == 2:
+                            stance_q0 = stance_q
+                        else:
+                            stance_q0 = None
+
+                        at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+                        stance_actions = {"post", "retweet", "reply"}
+                        acts = []
+                        for i in range(int(self.n_agents)):
+                            try:
+                                if isinstance(a0, torch.Tensor):
+                                    aid = int(a0[i].item()) if a0.numel() > i else 4
+                                else:
+                                    aid = int(a0)
+                            except Exception:
+                                aid = 4
+                            aid = int(max(0, min(4, aid)))
+                            at = at_names[aid]
+                            sid = None
+                            if at in stance_actions:
+                                try:
+                                    if isinstance(stance_q0, torch.Tensor) and stance_q0.ndim == 2 and stance_q0.shape[0] > i:
+                                        sid = int(stance_q0[i].argmax(dim=-1).item())
+                                    else:
+                                        sid = 0
+                                except Exception:
+                                    sid = 0
+                            acts.append({"action_type": at, "stance_id": sid, "post_text": ""})
+                        action_for_env_step = acts
+                        action_source = "sync_stage_policy"
+                except Exception:
+                    pass
                 if action_source in ("discrete_action_boxed", "boxed", "discrete"):
                     try:
                         # discrete_actions is typically shape (bs, n_agents) or (n_agents,)
@@ -416,26 +466,30 @@ class EpisodeRunner:
             logger.exception("Exception details:")
             raise
 
-    def _get_pre_transition_data(self, current_observation_text: str) -> Dict:
-        """Get pre-transition data (current observation)."""
-        # Preprocess (tokenize) the observation text using the MAC's preprocessor
-        # Ensure obs_tensor is on the correct device (preprocess_observation should handle this)
-        # The shape of obs_tensor should be (max_token_length,)
-        obs_tensor = self.mac.preprocess_observation(current_observation_text) 
-
-        # Other fields for scheme if needed (often placeholders for text envs)
+    def _get_pre_transition_data(self, current_observation_text: Any) -> Dict:
+        """Get pre-transition data (current observation). Supports str or list[str] (per-agent)."""
         default_state_vshape = self.env_info.get("state_shape", (1,))
         default_avail_actions_vshape = (self.env_info.get("n_actions", 1),)
 
+        if isinstance(current_observation_text, (list, tuple)):
+            obs_list = [str(x) for x in list(current_observation_text)]
+            # pad/truncate to n_agents
+            if len(obs_list) < self.n_agents:
+                obs_list = obs_list + ["" for _ in range(self.n_agents - len(obs_list))]
+            if len(obs_list) > self.n_agents:
+                obs_list = obs_list[: self.n_agents]
+            obs_tensors = [self.mac.preprocess_observation(s) for s in obs_list]
+            obs_field = obs_tensors
+        else:
+            obs_tensor = self.mac.preprocess_observation(str(current_observation_text))
+            obs_field = [obs_tensor for _ in range(self.n_agents)]
+
         return {
-            # obs_tensor will be grouped by agent and batched by EpisodeBuffer.
-            # For bs=1, EpisodeBuffer.update expects data for "obs" to be a list of tensors,
-            # one for each agent, or a single tensor if "group" is not "agents".
-            # If scheme["obs"] has "group": "agents", then obs_tensor should be provided for each agent.
-            # Since the observation is global, we replicate it for each agent.
-            "obs": [obs_tensor for _ in range(self.n_agents)],
-            "state": [torch.zeros(*default_state_vshape, device=self.args.device)], 
-            "avail_actions": [torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)]
+            "obs": obs_field,
+            "state": [torch.zeros(*default_state_vshape, device=self.args.device)],
+            "avail_actions": [
+                torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)
+            ],
         }
 
     def _get_actions(self, test_mode: bool, raw_observation_text: Optional[str] = None) -> Tuple[torch.Tensor, Dict]:
@@ -525,6 +579,19 @@ class EpisodeRunner:
                 post_data_dict["gt_action"] = torch.tensor([gt], dtype=torch.int64, device=self.args.device)
         except Exception as e:
             self.logger.debug(f"Failed to parse gt_action from env_info: {e}")
+
+        # === optional partial supervision mask (Stage3b) ===
+        # action_mask=1.0 => supervised CE applies; action_mask=0.0 => treat as latent (no CE / no acc)
+        try:
+            am = None
+            if isinstance(env_info, dict):
+                am = env_info.get("action_mask")
+            if am is None:
+                # backward-compatible default: fully supervised
+                am = 1.0
+            post_data_dict["action_mask"] = torch.tensor([float(am)], dtype=torch.float32, device=self.args.device)
+        except Exception:
+            post_data_dict["action_mask"] = torch.tensor([1.0], dtype=torch.float32, device=self.args.device)
 
         # === offline supervised soft label distribution (HF dataset) ===
         # Prefer env_info["target_distribution_prob"] which is a dict like {"0":0.2,"1":0.1,"2":0.7}
@@ -803,6 +870,8 @@ class EpisodeRunner:
             # === offline supervised label (global) ===
             # For HuggingFaceDatasetEnv stance-id training: ground-truth \\boxed{<id>} parsed to int.
             "gt_action": {"vshape": (1,), "dtype": torch.int64},
+            # Optional: partial supervision mask for Stage3b action imitation
+            "action_mask": {"vshape": (1,), "dtype": torch.float32},
             # Optional soft-label distribution over stance ids (aligned to env_info["n_actions"])
             "gt_action_dist": {"vshape": (self.env_info.get("n_actions", 1),), "dtype": torch.float32},
             # latent z supervision (global)

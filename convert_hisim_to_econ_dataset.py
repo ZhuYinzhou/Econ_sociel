@@ -126,6 +126,22 @@ def _infer_action_type_from_macro_tweet(tweet: Dict[str, Any]) -> str:
     - Macro data usually cannot observe "like" or "do_nothing" explicitly.
     - We map quotedTweet to retweet (user request: quote ≈ retweet for action-type).
     """
+    def _is_missing(v: Any) -> bool:
+        # Treat None / NaN / empty-string as missing.
+        if v is None:
+            return True
+        if isinstance(v, str):
+            return len(v.strip()) == 0
+        # pandas/numpy may store NaN as float('nan')
+        try:
+            import math
+
+            if isinstance(v, float) and math.isnan(v):
+                return True
+        except Exception:
+            pass
+        return False
+
     # If there is no text, treat as do_nothing
     txt = _extract_text(tweet)
     if not txt:
@@ -133,10 +149,10 @@ def _infer_action_type_from_macro_tweet(tweet: Dict[str, Any]) -> str:
 
     # Prefer explicit structure
     try:
-        if tweet.get("retweetedTweet") is not None:
+        if not _is_missing(tweet.get("retweetedTweet")):
             return "retweet"
         # quotedTweet 表示引用 -> 映射为 retweet（合并到转发类）
-        if tweet.get("quotedTweet") is not None:
+        if not _is_missing(tweet.get("quotedTweet")):
             return "retweet"
     except Exception:
         pass
@@ -839,9 +855,35 @@ def convert_hisim_macro_to_belief_hf_dataset(
     # - "core_user": build a z-transition sample per (core_user, t) using build_belief_input as question,
     #               and label with secondary-population z_t/z_{t+1}.
     z_transition_conditioning: str = "population_only",
+    # z-transition dataset split strategy:
+    # - "by_stage": legacy behavior, split by stage id (train:0-9, val:10, test:11-12)  ⚠️ may cause OOD-by-stage
+    # - "random":  random split across ALL stages (recommended for "normal dynamics validation")
+    # - "random_by_user": random split but grouped by user (same core_user never crosses splits; recommended when conditioning=core_user)
+    z_transition_split_strategy: str = "by_stage",
+    z_transition_split_seed: int = 42,
+    # ratios for random split: "train,validation,test" (e.g., "0.8,0.1,0.1")
+    z_transition_split_ratios: str = "0.8,0.1,0.1",
     # === Stage4 (offline) action policy imitation dataset (core users only) ===
     export_action_imitation_dataset: bool = False,
     action_imitation_out_dir: str = "",
+    # action imitation dataset options (Stage3b):
+    # - observation_mode:
+    #   - "legacy": observation uses same-stage (t) self/neighbor context (old behavior)
+    #   - "sync_prev_stage": observation mimics sync-stage env: use previous-stage (t-1) self/neighbor context
+    # - target_mode:
+    #   - "tp1": label is action_type at next stage (t+1) (old behavior; next-step prediction)
+    #   - "t":   label is action_type at current stage (t) (recommended for behavior cloning under sync-stage env)
+    action_imitation_observation_mode: str = "legacy",
+    action_imitation_target_mode: str = "tp1",
+    # Partial supervision for Stage3b:
+    # If True, only compute supervised loss on {post, retweet} (ids 0/1).
+    # Other actions (reply/like/do_nothing) remain in the label space but are treated as latent (mask=0).
+    action_imitation_supervise_post_retweet_only: bool = False,
+    # More general partial supervision (preferred): comma-separated ids like "0,1".
+    # If non-empty, it overrides action_imitation_supervise_post_retweet_only.
+    action_imitation_supervised_action_ids: str = "0,1",
+    # If True, drop unsupervised samples (mask=0) instead of keeping them.
+    action_imitation_drop_unsupervised: bool = False,
     # === Preview (auto-generated after export) ===
     export_preview: bool = True,
     preview_num_per_split: int = 3,
@@ -904,6 +946,28 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     # split buckets (z-transition dataset)
     z_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
+    z_all_examples: List[Dict[str, Any]] = []
+
+    z_split_strategy = str(z_transition_split_strategy or "by_stage").strip().lower()
+    if z_split_strategy not in ("by_stage", "random", "random_by_user"):
+        print(f"[WARN] z_transition_split_strategy={z_transition_split_strategy} invalid; fallback to 'by_stage'")
+        z_split_strategy = "by_stage"
+
+    def _parse_ratios(s: str) -> Tuple[float, float, float]:
+        try:
+            parts = [p.strip() for p in str(s or "").split(",")]
+            vals = [float(p) for p in parts if p]
+            if len(vals) != 3:
+                raise ValueError("need 3 floats")
+            a, b, c = vals
+            sm = float(a + b + c)
+            if sm <= 0:
+                raise ValueError("sum<=0")
+            return float(a / sm), float(b / sm), float(c / sm)
+        except Exception:
+            return 0.8, 0.1, 0.1
+
+    z_r_train, z_r_val, z_r_test = _parse_ratios(str(z_transition_split_ratios or "0.8,0.1,0.1"))
 
     # split buckets (action imitation dataset; core users only)
     a_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
@@ -1019,6 +1083,9 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "z_transition_population_mode": str(z_transition_population_mode),
         "z_transition_definition": "scalar: z in [-1,1] or dist: z in Δ^3; computed from SECONDARY users at each stage (per-user stage-majority label), aligned to label2id",
         "z_transition_conditioning": str(z_transition_conditioning),
+        "z_transition_split_strategy": str(z_split_strategy),
+        "z_transition_split_seed": int(z_transition_split_seed),
+        "z_transition_split_ratios": [float(z_r_train), float(z_r_val), float(z_r_test)],
     }
 
     a_stats = {
@@ -1026,8 +1093,40 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "num_examples": 0,
         "num_examples_core": 0,
         "action_id_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
-        "definition": "Predict CORE user's next-stage (t+1) action_type id from stage-t context; action_type in [post,retweet,reply,like,do_nothing].",
+        "definition": "Predict CORE user's action_type id from context; action_type in [post,retweet,reply,like,do_nothing].",
     }
+    # record action imitation options
+    try:
+        a_stats["action_imitation_observation_mode"] = str(action_imitation_observation_mode or "legacy")
+        a_stats["action_imitation_target_mode"] = str(action_imitation_target_mode or "tp1")
+        a_stats["action_imitation_supervise_post_retweet_only"] = bool(action_imitation_supervise_post_retweet_only)
+        a_stats["action_imitation_supervised_action_ids"] = str(action_imitation_supervised_action_ids or "").strip()
+        a_stats["action_imitation_drop_unsupervised"] = bool(action_imitation_drop_unsupervised)
+    except Exception:
+        pass
+    a_stats["num_examples_supervised"] = 0
+    a_stats["num_examples_dropped_unsupervised"] = 0
+
+    # Parse supervised ids (None => no masking). Note: this only affects dataset fields / optional dropping;
+    # the actual Stage3b training mask is controlled in learner via config.
+    supervised_ids: Optional[set] = None
+    try:
+        s_ids = str(action_imitation_supervised_action_ids or "").strip()
+        if s_ids:
+            ids = []
+            for tok in s_ids.replace(" ", "").split(","):
+                if not tok:
+                    continue
+                try:
+                    ids.append(int(tok))
+                except Exception:
+                    continue
+            if ids:
+                supervised_ids = set(int(x) for x in ids)
+    except Exception:
+        supervised_ids = None
+    if supervised_ids is None and bool(action_imitation_supervise_post_retweet_only):
+        supervised_ids = {0, 1}
 
     def _load_user_history_snippet(topic: str, user: str) -> str:
         """
@@ -1423,6 +1522,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 "answer": "\\boxed{0}",
                                 "topic": str(topic),
                                 "event": str(event),
+                                "user": str(user),
                                 "t": int(t),
                                 "stage_t": int(t),
                                 "is_core_user": True,
@@ -1439,9 +1539,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 "has_neighbors": 1 if bool(neighbors) else 0,
                                 "neighbor_action_type_counts_t": neigh_action_counts,
                             }
-                            # Split by stage to avoid leakage
-                            split = "train" if t <= 9 else ("validation" if t == 10 else "test")
-                            z_split_examples[split].append(ex)
+                            # z_transition split
+                            if z_split_strategy in ("random", "random_by_user"):
+                                z_all_examples.append(ex)
+                            else:
+                                # legacy: split by stage (may cause OOD-by-stage)
+                                split = "train" if t <= 9 else ("validation" if t == 10 else "test")
+                                z_split_examples[split].append(ex)
                             z_stats["num_examples"] += 1
                     else:
                         # population-only (current behavior)
@@ -1475,6 +1579,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             "answer": "\\boxed{0}",
                             "topic": str(topic),
                             "event": str(event),
+                            "user": "__population__",
                             "t": int(t),
                             "stage_t": int(t),
                             "is_core_user": False,
@@ -1484,8 +1589,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             "labeled_secondary_users_t": int(labeled_t),
                             "labeled_secondary_users_tp1": int(labeled_tp1),
                         }
-                        split = "train" if t <= 9 else ("validation" if t == 10 else "test")
-                        z_split_examples[split].append(ex)
+                        if z_split_strategy in ("random", "random_by_user"):
+                            z_all_examples.append(ex)
+                        else:
+                            split = "train" if t <= 9 else ("validation" if t == 10 else "test")
+                            z_split_examples[split].append(ex)
                         z_stats["num_examples"] += 1
 
             users = list(macro.keys())
@@ -1717,25 +1825,117 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     # === Optional: Stage4 action imitation dataset (core users only) ===
                     if export_action_imitation_dataset and bool(is_core_user):
                         try:
-                            # Target action_type is inferred from stage t+1 macro items (mode action id).
-                            # If no actions observed, treat as do_nothing (4).
-                            action_counts_tp1 = _action_counts_from_stage(stage_tp1)
-                            aid = _action_type_id_from_counts(action_counts_tp1)
+                            # === S3b/S4 action imitation target definition ===
+                            # Default (legacy): target is stage (t+1) action_type (next-step prediction).
+                            # Sync-stage env (recommended): target is stage (t) action_type (behavior cloning).
+                            tgt_mode = str(action_imitation_target_mode or "tp1").strip().lower()
+                            if tgt_mode not in ("tp1", "t", "curr", "current"):
+                                tgt_mode = "tp1"
+                            if tgt_mode in ("t", "curr", "current"):
+                                action_counts = _action_counts_from_stage(stage_t)
+                            else:
+                                action_counts = _action_counts_from_stage(stage_tp1)
+                            aid = _action_type_id_from_counts(action_counts)
                             if aid is None or int(aid) < 0:
                                 aid = 4
                             aid = int(max(0, min(4, int(aid))))
-                            q_action = build_action_imitation_input(bargs)
+                            # === S3b observation definition ===
+                            # Sync-stage env semantics: at stage t, observation should only include previous-stage (t-1)
+                            # self/neighbor simulated content (no same-stage leakage).
+                            obs_mode = str(action_imitation_observation_mode or "legacy").strip().lower()
+                            if obs_mode not in ("legacy", "sync_prev_stage", "prev_stage", "prev"):
+                                obs_mode = "legacy"
+                            if obs_mode in ("sync_prev_stage", "prev_stage", "prev"):
+                                # build a separate BuildArgs using (t-1) self/neighbor, but keep population obs aligned to stage t
+                                t_prev = int(t) - 1
+                                if t_prev >= 0 and isinstance(user_dict.get(t_prev), list):
+                                    stage_self_prev = user_dict.get(t_prev) or []
+                                else:
+                                    stage_self_prev = []
+                                # neighbor texts/counters at (t-1)
+                                neighbors_prev: List[str] = []
+                                if follower_dict and str(user) in follower_dict:
+                                    try:
+                                        neighbors_prev = list(follower_dict.get(str(user), []))
+                                    except Exception:
+                                        neighbors_prev = []
+                                neighbors_prev = [nb for nb in (neighbors_prev or []) if nb in macro]
+                                if max_neighbor_users > 0 and len(neighbors_prev) > max_neighbor_users:
+                                    neighbors_prev = neighbors_prev[:max_neighbor_users]
+                                neighbor_texts_prev: List[Tuple[str, str]] = []
+                                neighbor_label_counter_prev: Counter = Counter()
+                                for nb in neighbors_prev:
+                                    nb_dict = macro.get(nb)
+                                    if not isinstance(nb_dict, dict):
+                                        continue
+                                    nb_stage = nb_dict.get(t_prev) or []
+                                    if not isinstance(nb_stage, list) or not nb_stage:
+                                        continue
+                                    nb_lab = _stage_label(nb_stage)
+                                    nb_lab = _normalize_label(nb_lab)
+                                    if nb_lab:
+                                        neighbor_label_counter_prev[nb_lab] += 1
+                                    nb_texts = _stage_texts(nb_stage, max_tweets=2)
+                                    for txt in nb_texts:
+                                        if txt:
+                                            neighbor_texts_prev.append((str(nb), txt))
+                                    if max_neighbor_tweets_total > 0 and len(neighbor_texts_prev) >= max_neighbor_tweets_total:
+                                        break
+                                # population obs at stage t (aligned to env _population_obs(t))
+                                pop = population_cache.get(t, {}) if use_population_observation else {}
+                                pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
+                                pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
+                                bargs_action = BuildArgs(
+                                    topic=str(topic),
+                                    event=str(event),
+                                    user=str(user),
+                                    t=int(t),
+                                    persona=str(persona),
+                                    user_history=str(user_history),
+                                    self_texts=_stage_texts(stage_self_prev, max_tweets=max_self_tweets),
+                                    self_label_t=_stage_label(stage_self_prev),
+                                    neighbor_texts=neighbor_texts_prev,
+                                    neighbor_label_counter=dict(neighbor_label_counter_prev),
+                                    self_action_counts=_action_counts_from_stage(stage_self_prev),
+                                    self_action_ratio=_counts_to_ratio(_action_counts_from_stage(stage_self_prev)),
+                                    neighbor_action_counts=[0, 0, 0, 0, 0],
+                                    neighbor_action_ratio=[0.0, 0.0, 0.0, 0.0, 0.0],
+                                    population_texts=pop_texts,
+                                    population_label_counter=pop_label_counter,
+                                    label2id=label2id,
+                                    is_core_user=True,
+                                    target_mode="neighbor_tp1",
+                                )
+                                q_action = build_action_imitation_input(bargs_action)
+                            else:
+                                q_action = build_action_imitation_input(bargs)
                             a_ex = {
                                 "question": q_action,
                                 "answer": f"\\boxed{{{aid}}}",
                                 "target_action_type_id": int(aid),
-                                "target_action_counts_tp1": [int(x) for x in (action_counts_tp1 or [0, 0, 0, 0, 0])],
+                                "target_action_counts": [int(x) for x in (action_counts or [0, 0, 0, 0, 0])],
                                 "topic": bargs.topic,
                                 "event": bargs.event,
                                 "user": bargs.user,
                                 "t": int(bargs.t),
                                 "is_core_user": True,
                             }
+                            # === Stage3b partial supervision mask ===
+                            # Only ids in supervised_ids are considered supervised; others are latent.
+                            if isinstance(supervised_ids, set) and len(supervised_ids) > 0:
+                                is_sup = bool(int(aid) in supervised_ids)
+                                a_ex["is_supervised"] = bool(is_sup)
+                                a_ex["supervised_mask"] = 1.0 if is_sup else 0.0
+                                # backward-compatible field name
+                                a_ex["action_mask"] = float(a_ex["supervised_mask"])
+                                if (not is_sup) and bool(action_imitation_drop_unsupervised):
+                                    a_stats["num_examples_dropped_unsupervised"] = int(a_stats.get("num_examples_dropped_unsupervised", 0)) + 1
+                                    continue
+                                a_stats["num_examples_supervised"] = int(a_stats.get("num_examples_supervised", 0)) + (1 if is_sup else 0)
+                            else:
+                                a_ex["is_supervised"] = True
+                                a_ex["supervised_mask"] = 1.0
+                                a_ex["action_mask"] = 1.0
                             a_split_examples[split].append(a_ex)
                             a_stats["num_examples"] += 1
                             a_stats["num_examples_core"] += 1
@@ -1780,6 +1980,98 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     # === save z-transition dataset (optional) ===
     if export_z_transition_dataset and z_stats.get("num_examples", 0) > 0:
+        # if requested, build random splits across ALL stages (recommended for "normal dynamics validation")
+        if z_split_strategy in ("random", "random_by_user"):
+            items = list(z_all_examples)
+            rnd = random.Random(int(z_transition_split_seed))
+
+            def _assign_by_counts(flat_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+                rnd.shuffle(flat_items)
+                n0 = int(len(flat_items))
+                n_train0 = int(round(z_r_train * n0))
+                n_val0 = int(round(z_r_val * n0))
+                n_train0 = max(0, min(n_train0, n0))
+                n_val0 = max(0, min(n_val0, n0 - n_train0))
+                return {
+                    "train": flat_items[:n_train0],
+                    "validation": flat_items[n_train0 : n_train0 + n_val0],
+                    "test": flat_items[n_train0 + n_val0 :],
+                }
+
+            def _assign_grouped_by_user(flat_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+                # Group key: (topic,event,user). This prevents leakage of the same core_user across splits.
+                groups: Dict[str, List[Dict[str, Any]]] = {}
+                for ex in flat_items:
+                    key = f"{ex.get('topic','')}::{ex.get('event','')}::{ex.get('user','')}"
+                    groups.setdefault(key, []).append(ex)
+                keys = list(groups.keys())
+                rnd.shuffle(keys)
+
+                # target sizes in number of examples (approximate; exact ratio may not be possible due to grouping)
+                n0 = int(len(flat_items))
+                n_train0 = int(round(z_r_train * n0))
+                n_val0 = int(round(z_r_val * n0))
+                n_train0 = max(0, min(n_train0, n0))
+                n_val0 = max(0, min(n_val0, n0 - n_train0))
+                n_test0 = n0 - n_train0 - n_val0
+
+                out = {"train": [], "validation": [], "test": []}
+                c_train = 0
+                c_val = 0
+                # assign by filling train then val then test
+                for k in keys:
+                    g = groups[k]
+                    if c_train < n_train0:
+                        out["train"].extend(g)
+                        c_train += len(g)
+                    elif c_val < n_val0:
+                        out["validation"].extend(g)
+                        c_val += len(g)
+                    else:
+                        out["test"].extend(g)
+                return out
+
+            if z_split_strategy == "random_by_user":
+                z_split_examples = _assign_grouped_by_user(items)
+                print(
+                    f"[z_transition][random_by_user] n={len(items)} -> train={len(z_split_examples['train'])}, "
+                    f"val={len(z_split_examples['validation'])}, test={len(z_split_examples['test'])} "
+                    f"(ratios={z_r_train:.3f},{z_r_val:.3f},{z_r_test:.3f}, seed={int(z_transition_split_seed)})"
+                )
+            else:
+                z_split_examples = _assign_by_counts(items)
+                print(
+                    f"[z_transition][random_split] n={len(items)} -> train={len(z_split_examples['train'])}, "
+                    f"val={len(z_split_examples['validation'])}, test={len(z_split_examples['test'])} "
+                    f"(ratios={z_r_train:.3f},{z_r_val:.3f},{z_r_test:.3f}, seed={int(z_transition_split_seed)})"
+                )
+
+        # add split/stage distribution stats (helps detect OOD-by-stage)
+        try:
+            split_counts = {k: int(len(v)) for k, v in z_split_examples.items()}
+            stage_counts_by_split: Dict[str, Dict[int, int]] = {}
+            user_counts_by_split: Dict[str, int] = {}
+            for sp, items in z_split_examples.items():
+                cnt: Dict[int, int] = {}
+                users: set = set()
+                for ex in items:
+                    st = ex.get("stage_t", ex.get("t", None))
+                    try:
+                        st_i = int(st)
+                    except Exception:
+                        continue
+                    cnt[st_i] = cnt.get(st_i, 0) + 1
+                    u = ex.get("user", None)
+                    if u is not None:
+                        users.add(str(u))
+                stage_counts_by_split[str(sp)] = dict(sorted(cnt.items(), key=lambda x: x[0]))
+                user_counts_by_split[str(sp)] = int(len(users))
+            z_stats["split_counts"] = split_counts
+            z_stats["stage_counts_by_split"] = stage_counts_by_split
+            z_stats["user_counts_by_split"] = user_counts_by_split
+        except Exception:
+            pass
+
         z_out = str(z_transition_out_dir or "").strip()
         if not z_out:
             z_out = output_dir.rstrip("/") + "_z_transition"
@@ -2024,6 +2316,50 @@ def main():
         help="action imitation 数据集输出目录（留空则使用 <out-dir>_action_imitation_core）。",
     )
     parser.add_argument(
+        "--action-imitation-observation-mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "sync_prev_stage"],
+        help=(
+            "Stage3b action imitation 的 observation 模式："
+            "legacy=使用同 stage(t) 的 self/neighbor context（旧行为）；"
+            "sync_prev_stage=对齐你新的同步回合制环境：使用上一 stage(t-1) 的 self/neighbor context（无同stage泄漏）。"
+        ),
+    )
+    parser.add_argument(
+        "--action-imitation-target-mode",
+        type=str,
+        default="tp1",
+        choices=["tp1", "t"],
+        help=(
+            "Stage3b action imitation 的监督目标："
+            "tp1=预测下一 stage(t+1) 的 action_type（旧的 next-step 设定）；"
+            "t=克隆当前 stage(t) 的 action_type（推荐用于同步回合制 env）。"
+        ),
+    )
+    parser.add_argument(
+        "--action-imitation-supervise-post-retweet-only",
+        action="store_true",
+        help=(
+            "Stage3b 部分监督：只对 post/retweet (id 0/1) 计算 supervised loss；"
+            "reply/like/do_nothing 仍保留在动作空间，但 action_mask=0 视为 latent，不要求可观测监督。"
+        ),
+    )
+    parser.add_argument(
+        "--action-imitation-supervised-action-ids",
+        type=str,
+        default="0,1",
+        help=(
+            "Stage3b 部分监督（更通用）：逗号分隔的 action id 列表（例如 '0,1' 表示只监督 post/retweet）。"
+            "若非空，将覆盖 --action-imitation-supervise-post-retweet-only。"
+        ),
+    )
+    parser.add_argument(
+        "--action-imitation-drop-unsupervised",
+        action="store_true",
+        help="若启用部分监督（supervised_action_ids 非空），则丢弃未监督样本（mask=0），以加速训练。",
+    )
+    parser.add_argument(
         "--noncore-target-mode",
         type=str,
         default="self",
@@ -2061,6 +2397,30 @@ def main():
         default="scalar",
         choices=["scalar", "dist"],
         help="z_transition 的 z 表示：scalar=z∈[-1,1]；dist=z∈Δ^3（由 secondary 用户 stance 分布归一化得到，形如 [p_neu,p_opp,p_sup]，按 label2id 的 id 顺序）。",
+    )
+    parser.add_argument(
+        "--z-transition-split-strategy",
+        type=str,
+        default="by_stage",
+        choices=["by_stage", "random", "random_by_user"],
+        help=(
+            "z_transition 数据集划分策略："
+            "by_stage=旧逻辑(train:0-9,val:10,test:11-12；可能导致 stage OOD，stage_embed 未训练)；"
+            "random=跨所有 stage 随机切分（推荐用于“正常验证动力学”）；"
+            "random_by_user=跨所有 stage 随机切分，但按 (topic,event,user) 分组，同一 core_user 不跨 split（推荐用于 conditioning=core_user）。"
+        ),
+    )
+    parser.add_argument(
+        "--z-transition-split-seed",
+        type=int,
+        default=42,
+        help="当 --z-transition-split-strategy=random 时，用于随机打乱的种子（可复现）。",
+    )
+    parser.add_argument(
+        "--z-transition-split-ratios",
+        type=str,
+        default="0.8,0.1,0.1",
+        help="当 --z-transition-split-strategy=random 时，train,validation,test 的比例（逗号分隔，例如 0.8,0.1,0.1）。",
     )
     parser.add_argument(
         "--no-preview",
@@ -2127,6 +2487,11 @@ def main():
         z_transition_population_mode=str(getattr(args, "z_transition_population_mode", "scalar") or "scalar"),
         export_action_imitation_dataset=bool(getattr(args, "export_action_imitation_dataset", False)),
         action_imitation_out_dir=str(getattr(args, "action_imitation_out_dir", "") or ""),
+        action_imitation_observation_mode=str(getattr(args, "action_imitation_observation_mode", "legacy") or "legacy"),
+        action_imitation_target_mode=str(getattr(args, "action_imitation_target_mode", "tp1") or "tp1"),
+        action_imitation_supervise_post_retweet_only=bool(getattr(args, "action_imitation_supervise_post_retweet_only", False)),
+        action_imitation_supervised_action_ids=str(getattr(args, "action_imitation_supervised_action_ids", "0,1") or "0,1"),
+        action_imitation_drop_unsupervised=bool(getattr(args, "action_imitation_drop_unsupervised", False)),
         export_preview=(not bool(getattr(args, "no_preview", False))),
         preview_num_per_split=int(getattr(args, "preview_num_per_split", 3)),
         preview_seed=int(getattr(args, "preview_seed", 42)),
@@ -2137,6 +2502,9 @@ def main():
         shuffle_neighbors_before_truncation=(not bool(args.no_shuffle_neighbors)),
         neighbor_shuffle_seed=int(args.neighbor_shuffle_seed),
         z_transition_conditioning=str(args.z_transition_conditioning or "population_only"),
+        z_transition_split_strategy=str(getattr(args, "z_transition_split_strategy", "by_stage") or "by_stage"),
+        z_transition_split_seed=int(getattr(args, "z_transition_split_seed", 42)),
+        z_transition_split_ratios=str(getattr(args, "z_transition_split_ratios", "0.8,0.1,0.1") or "0.8,0.1,0.1"),
     )
 
 

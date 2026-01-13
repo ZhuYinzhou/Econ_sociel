@@ -13,7 +13,9 @@ t_max: 5000
 test_interval: 2000
 test_nepisode: 2
 
-n_agents: 3
+# In sync-stage mode, we treat EACH core user as an "agent slot" with shared weights.
+# HiSim default core_users=300 for metoo; keep these consistent.
+n_agents: 300
 belief_dim: 128
 population_belief_dim: 3
 text_embed_dim: 1024
@@ -21,8 +23,8 @@ batch_size_run: 1
 n_actions: 5
 max_seq_length: 1024
 
-env_action_source: "llm_response_0"
-enable_llm_rollout: true
+env_action_source: "sync_stage_policy"
+enable_llm_rollout: false
 llm_model_name: "gpt2"
 together_api_key: "${TOGETHER_API_KEY}"
 coordinator_model: "gpt-4.1"
@@ -41,6 +43,15 @@ env_args:
 
   # short episode first (curriculum below will extend)
   n_stages: 10
+  # Strict HiSim semantics: same-round concurrent -> unified update (one env.step per stage)
+  sync_stage_update: true
+  # Safety: assert core user count if you want (set strict_user_counts: true to raise)
+  expected_core_users: 300
+  # Optional: cap for debugging/smoke; set to 300 for real runs
+  max_core_users: 300
+  # Optional: mimic HiSim's per-round random order (order does NOT affect info availability in sync mode)
+  shuffle_core_users_each_stage: true
+  core_users_shuffle_seed: 42
   max_neighbor_posts: 8
   max_population_texts: 20
   max_user_history_lines: 40
