@@ -14,6 +14,8 @@ set -euo pipefail
 ROOT="/home/zhuyinzhou/MAS/ECON"
 HISIM_DATA_ROOT="/data/zhuyinzhou/HiSim/data"
 
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
 TOPIC="${TOPIC:-metoo}"
 EVENTS=(${EVENTS:-e1 e2})
 
@@ -34,13 +36,28 @@ CLEAN="${CLEAN:-0}"
 cd "${ROOT}"
 
 run_py () {
-  if command -v conda >/dev/null 2>&1; then
-    # Default to HiSim env if available
-    ENV_NAME="${ENV_NAME:-HiSim}"
-    conda run -n "${ENV_NAME}" python "$@"
-  else
+  # By default we *try* conda-run (if available) but auto-fallback to plain python when:
+  # - conda is a pip-installed shim (common error: "pip install conda is not compatible")
+  # - conda run is not functional in this shell
+  #
+  # You can force-disable conda with: USE_CONDA=0 ./scripts/gen_stage123a_data.sh
+  #
+  # If you're already inside an activated conda env (CONDA_PREFIX is set), prefer the current python
+  # and DO NOT call `conda run` (more robust and avoids conda-run issues).
+  if [[ -n "${CONDA_PREFIX:-}" ]]; then
     python "$@"
+    return 0
   fi
+  if [[ "${USE_CONDA:-1}" == "1" ]] && command -v conda >/dev/null 2>&1; then
+    ENV_NAME="${ENV_NAME:-HiSim}"
+    if conda run -n "${ENV_NAME}" python -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+      conda run -n "${ENV_NAME}" python "$@"
+      return 0
+    else
+      echo "[WARN] conda run not usable in this shell; falling back to plain python. (Tip: USE_CONDA=0 to silence this)"
+    fi
+  fi
+  python "$@"
 }
 
 maybe_clean_dir () {

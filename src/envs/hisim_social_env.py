@@ -986,7 +986,7 @@ class HiSimSocialEnv(gym.Env):
         return v
 
     # === Prompt budget truncation (fast, approximate) ===
-    # Goal: ensure any truncation happens in low-priority sections (history/persona/long texts),
+    # Goal: ensure any truncation happens in low-priority sections (history/long texts),
     # never in critical constraints (task/output format) or critical state summaries (z/pop/neighbor summary).
     def _approx_token_len_lines(self, lines: List[str]) -> int:
         try:
@@ -1051,13 +1051,14 @@ class HiSimSocialEnv(gym.Env):
         if self._approx_token_len_lines(_flatten()) <= mt:
             return _flatten()
 
-        # 2) drop other truncatable sections entirely (persona/recent) if still too long
+        # 2) drop other truncatable sections entirely (recent) if still too long
         for i in order:
             if self._approx_token_len_lines(_flatten()) <= mt:
                 break
             if not ss[i]["truncatable"]:
                 continue
-            if ss[i]["name"] in ("medium", "persona", "recent"):
+            # NOTE: persona is treated as high-priority and should not be dropped wholesale here.
+            if ss[i]["name"] in ("medium", "recent"):
                 ss[i]["lines"] = []
 
         if self._approx_token_len_lines(_flatten()) <= mt:
@@ -1135,6 +1136,15 @@ class HiSimSocialEnv(gym.Env):
             pop_texts_sec.append("")
 
         # =========================
+        # Persona (high priority; should survive truncation when possible)
+        # =========================
+        persona_sec: List[str] = []
+        if persona:
+            persona_sec.append("Profile / persona:")
+            persona_sec.append(str(persona).strip())
+            persona_sec.append("")
+
+        # =========================
         # Medium-priority context
         # =========================
         # recent self actions from simulation (previous stages)
@@ -1157,11 +1167,6 @@ class HiSimSocialEnv(gym.Env):
                     else:
                         medium.append(f"- t={tt} {at}")
                 medium.append("")
-
-        if persona:
-            medium.append("Profile / persona:")
-            medium.append(str(persona).strip())
-            medium.append("")
 
         # =========================
         # Low-priority (should be truncated first)
@@ -1194,6 +1199,7 @@ class HiSimSocialEnv(gym.Env):
             sections=[
                 {"name": "header", "priority": 100, "truncatable": False, "lines": header},
                 {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+                {"name": "persona", "priority": 80, "truncatable": True, "lines": persona_sec},
                 {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
                 {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
                 {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},
@@ -1317,6 +1323,15 @@ class HiSimSocialEnv(gym.Env):
             neighbor_texts_sec.append("")
 
         # =========================
+        # Persona (high priority; should survive truncation when possible)
+        # =========================
+        persona_sec: List[str] = []
+        if persona:
+            persona_sec.append("Profile / persona:")
+            persona_sec.append(str(persona).strip())
+            persona_sec.append("")
+
+        # =========================
         # Medium-priority context
         # =========================
         # recent self actions (previous stages only)
@@ -1336,11 +1351,6 @@ class HiSimSocialEnv(gym.Env):
                 for tt, at, txt in recent[-self.max_recent_self_posts :]:
                     medium.append(f"- stage{tt}: {at}" + (f" | {txt}" if txt else ""))
                 medium.append("")
-
-        if persona:
-            medium.append("Profile / persona:")
-            medium.append(str(persona).strip())
-            medium.append("")
 
         # =========================
         # Low-priority (should be truncated first)
@@ -1380,6 +1390,7 @@ class HiSimSocialEnv(gym.Env):
             sections=[
                 {"name": "header", "priority": 100, "truncatable": False, "lines": header},
                 {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+                {"name": "persona", "priority": 80, "truncatable": True, "lines": persona_sec},
                 {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
                 {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
                 {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},

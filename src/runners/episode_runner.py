@@ -565,6 +565,49 @@ class EpisodeRunner:
                         pre_data["belief_pre_neighbor_counts"] = bt_pre["neighbor_stance_counts"].to(self.args.device)
                     if "is_core_user" in bt_pre:
                         pre_data["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
+
+            # === Sanity/diagnostic: z_t ablation modes (for validate script / appendix) ===
+            # This ONLY affects the policy input (EpisodeBatch fields), not the env's internal state update.
+            # Modes:
+            # - none: use original z_t
+            # - zero: replace with zeros (remove z signal)
+            # - shuffle: replace with a previously-seen z_t (sample-level shuffle) to break alignment
+            try:
+                mode = str(getattr(self.args, "z_ablation_mode", "none") or "none").strip().lower()
+            except Exception:
+                mode = "none"
+            if mode not in ("none", "off", "0", "false", "") and ("z_t" in pre_data):
+                z = pre_data.get("z_t")
+                if isinstance(z, torch.Tensor):
+                    if not hasattr(self, "_z_shuffle_pool"):
+                        self._z_shuffle_pool = []
+                    if mode in ("zero", "zeros"):
+                        pre_data["z_t"] = torch.zeros_like(z)
+                        pre_data["belief_pre_population_z"] = torch.zeros_like(z) if "belief_pre_population_z" in pre_data else pre_data.get("belief_pre_population_z", z)
+                    elif mode in ("shuffle", "shuffled"):
+                        # Use a deterministic RNG if provided; otherwise fallback to random.
+                        if len(self._z_shuffle_pool) >= 1:
+                            try:
+                                seed0 = int(getattr(self.args, "z_shuffle_seed", 0) or 0)
+                                # vary with t_env to avoid constant reuse
+                                rnd = np.random.RandomState(seed0 + int(getattr(self, "t_env", 0)))
+                                j = int(rnd.randint(0, len(self._z_shuffle_pool)))
+                            except Exception:
+                                j = int(np.random.randint(0, len(self._z_shuffle_pool)))
+                            z2 = self._z_shuffle_pool[j]
+                            if isinstance(z2, torch.Tensor) and (z2.shape == z.shape):
+                                pre_data["z_t"] = z2.to(self.args.device)
+                                if "belief_pre_population_z" in pre_data and isinstance(pre_data["belief_pre_population_z"], torch.Tensor):
+                                    pre_data["belief_pre_population_z"] = z2.to(self.args.device)
+                        # push current z after sampling
+                        try:
+                            self._z_shuffle_pool.append(z.detach().float().cpu().view_as(z))
+                            # cap pool size
+                            if len(self._z_shuffle_pool) > 4096:
+                                self._z_shuffle_pool = self._z_shuffle_pool[-2048:]
+                        except Exception:
+                            pass
+            # --- end z_ablation ---
         except Exception as e:
             self.logger.debug(f"Failed to inject pre-transition conditioning fields: {e}")
 

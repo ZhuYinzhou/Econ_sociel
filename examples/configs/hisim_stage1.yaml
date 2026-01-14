@@ -127,5 +127,5 @@ logging:
 
 # Supervised CE class weights (K=3: [0,1,2])
 # Keep class-2 weight reasonable; otherwise the model can "never predict 2" (pred2_frac->0).
-belief_supervised_class_weights: [1.8, 8.0, 1.5]
+belief_supervised_class_weights: [2.0, 8.0, 2.0]
 

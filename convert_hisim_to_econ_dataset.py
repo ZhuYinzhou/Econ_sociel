@@ -41,7 +41,7 @@ import random
 from functools import lru_cache
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set, Literal
 
 try:
@@ -548,6 +548,46 @@ class BuildArgs:
     prompt_tokenizer_name: str = "gpt2"
     # Optional: non-parametric stage-level group representation (core-aggregate) used to condition z-transition
     group_representation: Optional[List[float]] = None
+    # Optional: prompt truncation statistics accumulator (mutated in-place during data generation).
+    # If provided, _truncate_sections_to_budget will record how many prompts were over budget and how many tokens were dropped.
+    truncation_stats: Optional[Dict[str, Any]] = None
+
+
+def _init_prompt_truncation_stats(*, max_tokens: int, tokenizer_name: str) -> Dict[str, Any]:
+    """Create a JSON-serializable accumulator for prompt truncation statistics."""
+    bins = [0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    return {
+        "max_tokens": int(max_tokens),
+        "tokenizer_name": str(tokenizer_name or "gpt2"),
+        "n_prompts": 0,
+        "n_over_budget_estimated": 0,
+        "n_over_budget_exact": 0,
+        "n_estimated_over_but_exact_within": 0,
+        "n_truncated": 0,
+        "tokens_before_total_truncated": 0,
+        "tokens_after_total_truncated": 0,
+        "tokens_dropped_total": 0,
+        "tokens_dropped_max": 0,
+        "tokens_dropped_hist_bins": bins,
+        "tokens_dropped_hist_counts": [0 for _ in bins],
+        "removed_lines_by_section": {},  # name -> total removed lines
+        "dropped_sections_count": {},  # name -> times section became empty after truncation
+    }
+
+
+def _finalize_prompt_truncation_stats(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Add derived metrics (ratios/means) in-place and return the same dict."""
+    try:
+        n = int(s.get("n_prompts", 0))
+        n_tr = int(s.get("n_truncated", 0))
+        dropped = int(s.get("tokens_dropped_total", 0))
+        s["truncated_ratio"] = float(n_tr / n) if n > 0 else 0.0
+        s["avg_tokens_dropped_per_truncated"] = float(dropped / n_tr) if n_tr > 0 else 0.0
+        s["avg_tokens_before_truncated"] = float(int(s.get("tokens_before_total_truncated", 0)) / n_tr) if n_tr > 0 else 0.0
+        s["avg_tokens_after_truncated"] = float(int(s.get("tokens_after_total_truncated", 0)) / n_tr) if n_tr > 0 else 0.0
+    except Exception:
+        pass
+    return s
 
 
 def _nonparam_group_repr_from_core_macro(
@@ -684,6 +724,16 @@ def _get_tokenizer(name: str):
         # Ensure we can encode plain text robustly
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
+        # IMPORTANT:
+        # We use the tokenizer here mainly for token counting / budgeting during dataset generation.
+        # For very long raw texts, transformers may warn:
+        #   "Token indices sequence length is longer than the specified maximum sequence length..."
+        # This warning is about feeding long sequences into a model, not about token counting.
+        # To avoid noisy warnings while still counting accurately, set an effectively-unbounded max length.
+        try:
+            tok.model_max_length = int(10**9)
+        except Exception:
+            pass
         return tok
     except Exception:
         return None
@@ -704,6 +754,7 @@ def _truncate_sections_to_budget(
     sections: List[Dict[str, Any]],
     max_tokens: int,
     tokenizer_name: str,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """
     Enforce a hard token budget while ensuring truncation happens in low-priority sections first.
@@ -714,21 +765,24 @@ def _truncate_sections_to_budget(
     """
     mt = int(max_tokens)
     if mt <= 0:
-        # no truncation requested
         out: List[str] = []
         for s in sections:
             out.extend([str(x) for x in (s.get("lines") or [])])
+        if isinstance(stats, dict):
+            try:
+                stats["n_prompts"] = int(stats.get("n_prompts", 0)) + 1
+            except Exception:
+                pass
         return out
 
-    # helper: rebuild full text and count
-    def _flatten(ss: List[Dict[str, Any]]) -> List[str]:
+    def _flatten(ss0: List[Dict[str, Any]]) -> List[str]:
         out0: List[str] = []
-        for s in ss:
-            out0.extend([str(x) for x in (s.get("lines") or [])])
+        for s0 in ss0:
+            out0.extend([str(x) for x in (s0.get("lines") or [])])
         return out0
 
-    # Work on a mutable copy
-    ss = []
+    # Mutable copy
+    ss: List[Dict[str, Any]] = []
     for s in sections:
         ss.append(
             {
@@ -739,79 +793,190 @@ def _truncate_sections_to_budget(
             }
         )
 
-    # Fast path
-    cur_lines = _flatten(ss)
-    if _count_tokens("\n".join(cur_lines), tokenizer_name) <= mt:
-        return cur_lines
-
-    # Sort sections to truncate from lowest priority to highest
     order = sorted(range(len(ss)), key=lambda i: (ss[i]["priority"], ss[i]["name"]))
 
-    # Step 1: drop whole low-priority sections if allowed
+    # stats: snapshot original section lengths (in lines)
+    orig_lens: Dict[str, int] = {}
+    if isinstance(stats, dict):
+        try:
+            stats["n_prompts"] = int(stats.get("n_prompts", 0)) + 1
+        except Exception:
+            pass
+        try:
+            for s0 in ss:
+                nm = str(s0.get("name", ""))
+                orig_lens[nm] = int(len(s0.get("lines") or []))
+        except Exception:
+            orig_lens = {}
+
+    def _record_after(out_lines: List[str], *, exact_before: Optional[int]) -> List[str]:
+        """Update stats based on exact token counts and per-section line removals, then return out_lines."""
+        if not isinstance(stats, dict) or exact_before is None:
+            return out_lines
+        try:
+            exact_after = int(_count_tokens("\n".join(out_lines), tokenizer_name))
+            if exact_after < int(exact_before):
+                dropped = int(exact_before) - int(exact_after)
+                stats["n_truncated"] = int(stats.get("n_truncated", 0)) + 1
+                stats["tokens_before_total_truncated"] = int(stats.get("tokens_before_total_truncated", 0)) + int(exact_before)
+                stats["tokens_after_total_truncated"] = int(stats.get("tokens_after_total_truncated", 0)) + int(exact_after)
+                stats["tokens_dropped_total"] = int(stats.get("tokens_dropped_total", 0)) + int(dropped)
+                stats["tokens_dropped_max"] = max(int(stats.get("tokens_dropped_max", 0)), int(dropped))
+                # histogram
+                bins = list(stats.get("tokens_dropped_hist_bins") or [])
+                counts = list(stats.get("tokens_dropped_hist_counts") or [])
+                if bins and counts and len(bins) == len(counts):
+                    idx = 0
+                    for j, b in enumerate(bins):
+                        if dropped >= int(b):
+                            idx = j
+                    counts[idx] = int(counts[idx]) + 1
+                    stats["tokens_dropped_hist_counts"] = counts
+            # per-section removed lines / dropped sections (based on ss)
+            if orig_lens:
+                removed = stats.get("removed_lines_by_section") if isinstance(stats.get("removed_lines_by_section"), dict) else {}
+                dropped_secs = stats.get("dropped_sections_count") if isinstance(stats.get("dropped_sections_count"), dict) else {}
+                for s0 in ss:
+                    nm = str(s0.get("name", ""))
+                    new_len = int(len(s0.get("lines") or []))
+                    old_len = int(orig_lens.get(nm, new_len))
+                    if new_len < old_len:
+                        removed[nm] = int(removed.get(nm, 0)) + int(old_len - new_len)
+                    if old_len > 0 and new_len == 0:
+                        dropped_secs[nm] = int(dropped_secs.get(nm, 0)) + 1
+                stats["removed_lines_by_section"] = removed
+                stats["dropped_sections_count"] = dropped_secs
+        except Exception:
+            pass
+        return out_lines
+
+    # Fast approximate path first (avoids O(n^2) tokenization loops on very long prompts)
+    def _approx_total_tokens() -> int:
+        return _approx_token_len("\n".join(_flatten(ss)))
+
+    approx_before = _approx_total_tokens()
+    if approx_before <= mt:
+        return _flatten(ss)
+
+    # If approx says "too long", do one exact check before truncating (avoids unnecessary truncation).
+    exact_before: Optional[int] = None
+    if isinstance(stats, dict):
+        try:
+            stats["n_over_budget_estimated"] = int(stats.get("n_over_budget_estimated", 0)) + 1
+        except Exception:
+            pass
+    try:
+        exact_before = int(_count_tokens("\n".join(_flatten(ss)), tokenizer_name))
+    except Exception:
+        exact_before = None
+    if exact_before is not None and exact_before <= mt:
+        if isinstance(stats, dict):
+            try:
+                stats["n_estimated_over_but_exact_within"] = int(stats.get("n_estimated_over_but_exact_within", 0)) + 1
+            except Exception:
+                pass
+        return _flatten(ss)
+    if isinstance(stats, dict):
+        try:
+            stats["n_over_budget_exact"] = int(stats.get("n_over_budget_exact", 0)) + 1
+        except Exception:
+            pass
+
+    # 1) Drop whole history first (cheap)
     for i in order:
-        if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) <= mt:
+        if _approx_total_tokens() <= mt:
             break
         if not ss[i]["truncatable"]:
             continue
-        # Drop entire section if it is clearly optional (e.g., history)
         if ss[i]["name"] in ("history", "user_history", "optional_history"):
             ss[i]["lines"] = []
 
-    if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) <= mt:
-        return _flatten(ss)
-
-    # Step 2: progressively truncate lines within truncatable sections (from tail)
+    # 2) If still too long, drop other medium sections entirely (recent/self) before trimming texts.
+    # NOTE: persona is treated as high-priority and should not be dropped wholesale here.
     for i in order:
-        if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) <= mt:
+        if _approx_total_tokens() <= mt:
+            break
+        if not ss[i]["truncatable"]:
+            continue
+        if ss[i]["name"] in ("medium", "recent"):
+            ss[i]["lines"] = []
+
+    # 3) Trim tails of remaining truncatable sections based on approximate token count (fast list pops)
+    for i in order:
+        if _approx_total_tokens() <= mt:
             break
         if not ss[i]["truncatable"]:
             continue
         lines = ss[i]["lines"]
         if not lines:
             continue
-        # Keep section header if present (first line + maybe second), but truncate content from the end.
         keep_head = 0
         try:
-            # heuristic: if section begins with a header-like line (ends with ":"), keep first 1-2 lines
             if len(lines) >= 1 and str(lines[0]).strip().endswith(":"):
                 keep_head = 1
                 if len(lines) >= 2 and str(lines[1]).strip():
                     keep_head = 2
         except Exception:
             keep_head = 0
-        while lines and _count_tokens("\n".join(_flatten(ss)), tokenizer_name) > mt:
-            if len(lines) <= keep_head:
-                break
-            lines.pop()  # remove from tail
-        # If we removed some content, add a marker once (keep it short)
-        if len(lines) > keep_head and (lines and str(lines[-1]).strip() != "...[TRUNCATED]"):
-            # add marker only if there's room; keep it minimal
-            lines.append("...[TRUNCATED]")
-            # if marker pushes over budget, remove it
-            if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) > mt:
-                lines.pop()
+        while len(lines) > keep_head and _approx_total_tokens() > mt:
+            lines.pop()
         ss[i]["lines"] = lines
 
-    # Final: if still over budget, hard-cut from the lowest-priority truncatable section tail
-    # (This should almost never happen if high-priority sections are kept small.)
-    while _count_tokens("\n".join(_flatten(ss)), tokenizer_name) > mt:
-        # find the lowest priority section that still has removable lines
-        victim = None
-        for i in order:
-            if not ss[i]["truncatable"]:
-                continue
-            if ss[i]["lines"]:
-                victim = i
-                break
-        if victim is None:
-            # nothing to drop; give up (return as-is)
+    # 4) One exact check; if still over budget, do a small number of exact trims via binary search on the lowest-priority section
+    cur_lines = _flatten(ss)
+    if _count_tokens("\n".join(cur_lines), tokenizer_name) <= mt:
+        return _record_after(cur_lines, exact_before=exact_before)
+
+    # Find the lowest-priority truncatable section with removable lines
+    victim = None
+    for i in order:
+        if not ss[i]["truncatable"]:
+            continue
+        if ss[i]["lines"]:
+            victim = i
             break
-        ss[victim]["lines"].pop()
+    if victim is None:
+        return _flatten(ss)
 
-    return _flatten(ss)
+    lines0 = list(ss[victim]["lines"])
+    keep_head = 0
+    try:
+        if len(lines0) >= 1 and str(lines0[0]).strip().endswith(":"):
+            keep_head = 1
+            if len(lines0) >= 2 and str(lines0[1]).strip():
+                keep_head = 2
+    except Exception:
+        keep_head = 0
+
+    lo = keep_head
+    hi = len(lines0)
+    best = keep_head
+
+    def _try_keep(k: int) -> bool:
+        ss[victim]["lines"] = lines0[:k]
+        ok = _count_tokens("\n".join(_flatten(ss)), tokenizer_name) <= mt
+        return bool(ok)
+
+    # Binary search max k that fits
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _try_keep(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    ss[victim]["lines"] = lines0[:best]
+    # Optional marker
+    if best < len(lines0) and best > keep_head:
+        ss[victim]["lines"].append("...[TRUNCATED]")
+        if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) > mt:
+            ss[victim]["lines"] = lines0[:best]
+
+    return _record_after(_flatten(ss), exact_before=exact_before)
 
 
-def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
+def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
     """
     将 UserState/NeighborState 组装成 BeliefInput（作为 question）。
     目标：预测 user 在 t+1 的 stance_label（离散类别）。
@@ -888,6 +1053,15 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         pop_texts_sec = []
 
     # =========================
+    # Persona (high priority; should survive truncation when possible)
+    # =========================
+    persona_sec: List[str] = []
+    if args.persona:
+        persona_sec.append("User persona (profile):")
+        persona_sec.append(args.persona.strip())
+        persona_sec.append("")
+
+    # =========================
     # Medium-priority context
     # =========================
     medium: List[str] = []
@@ -895,10 +1069,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         medium.append(f"User posts at stage t (observed){obs_suffix}:")
         for i, txt in enumerate(args.self_texts[:20], 1):
             medium.append(f"- ({i}) {txt}")
-        medium.append("")
-    if args.persona:
-        medium.append("User persona (profile):")
-        medium.append(args.persona.strip())
         medium.append("")
 
     # =========================
@@ -923,6 +1093,7 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         sections=[
             {"name": "header", "priority": 100, "truncatable": False, "lines": header},
             {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+            {"name": "persona", "priority": 80, "truncatable": True, "lines": persona_sec},
             {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
             {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
             {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},
@@ -931,6 +1102,7 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 80) -> str:
         ],
         max_tokens=int(getattr(args, "prompt_max_tokens", 0) or 0),
         tokenizer_name=str(getattr(args, "prompt_tokenizer_name", "gpt2") or "gpt2"),
+        stats=getattr(args, "truncation_stats", None),
     )
     return "\n".join(out_lines)
 
@@ -1018,6 +1190,15 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         pop_texts_sec = []
 
     # =========================
+    # Persona (high priority; should survive truncation when possible)
+    # =========================
+    persona_sec: List[str] = []
+    if args.persona:
+        persona_sec.append("User persona (profile):")
+        persona_sec.append(args.persona.strip())
+        persona_sec.append("")
+
+    # =========================
     # Medium-priority context
     # =========================
     medium: List[str] = []
@@ -1025,10 +1206,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         medium.append("User posts at stage t (observed):")
         for i, txt in enumerate(args.self_texts[:20], 1):
             medium.append(f"- ({i}) {txt}")
-        medium.append("")
-    if args.persona:
-        medium.append("User persona (profile):")
-        medium.append(args.persona.strip())
         medium.append("")
 
     # =========================
@@ -1052,6 +1229,7 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         sections=[
             {"name": "header", "priority": 100, "truncatable": False, "lines": header},
             {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+            {"name": "persona", "priority": 80, "truncatable": True, "lines": persona_sec},
             {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
             {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
             {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},
@@ -1060,6 +1238,7 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         ],
         max_tokens=int(getattr(args, "prompt_max_tokens", 0) or 0),
         tokenizer_name=str(getattr(args, "prompt_tokenizer_name", "gpt2") or "gpt2"),
+        stats=getattr(args, "truncation_stats", None),
     )
     return "\n".join(out_lines)
 
@@ -1446,6 +1625,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
         # structured neighbor feature window
         "neighbor_k_recent_tweets": int(neighbor_k_recent_tweets),
     }
+    # Prompt truncation stats (belief dataset)
+    prompt_trunc_stats = _init_prompt_truncation_stats(
+        max_tokens=int(prompt_max_tokens),
+        tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
+    )
+    stats["prompt_truncation"] = prompt_trunc_stats
 
     z_stats = {
         "topics": list(filtered.keys()),
@@ -1472,6 +1657,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "action_id_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
         "definition": "Predict CORE user's action_type id from context; action_type in [post,retweet,reply,like,do_nothing].",
     }
+    # Prompt truncation stats (action imitation dataset)
+    a_prompt_trunc_stats = _init_prompt_truncation_stats(
+        max_tokens=int(prompt_max_tokens),
+        tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
+    )
+    a_stats["prompt_truncation"] = a_prompt_trunc_stats
     # record action imitation options
     try:
         a_stats["action_imitation_observation_mode"] = str(action_imitation_observation_mode or "legacy")
@@ -1725,8 +1916,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         cand = micro_buckets.get(t, []) if population_micro_sampling == "time" else micro_items
                         # 打乱后截断，避免同一用户集中
                         if cand:
-                            import random
-
                             random.shuffle(cand)
                             for it in cand:
                                 if max_population_tweets_total > 0 and len(pop_texts) >= max_population_tweets_total:
@@ -2130,7 +2319,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             else:
                                 # legacy: split by stage (may cause OOD-by-stage)
                                 split = "train" if t <= 9 else ("validation" if t == 10 else "test")
-                            z_split_examples[split].append(ex)
+                                z_split_examples[split].append(ex)
                             z_stats["num_examples"] += 1
                     else:
                         # population-only (current behavior)
@@ -2194,7 +2383,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             z_all_examples.append(ex)
                         else:
                             split = "train" if t <= 9 else ("validation" if t == 10 else "test")
-                        z_split_examples[split].append(ex)
+                            z_split_examples[split].append(ex)
                         z_stats["num_examples"] += 1
 
             users = list(macro.keys())
@@ -2276,7 +2465,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         # limit and filter to users existing in macro
                         if shuffle_neighbors_before_truncation and len(neighbors) > 1:
                             try:
-                                import random
                                 # deterministic per-sample shuffle so dataset build is reproducible
                                 seed = int(neighbor_shuffle_seed) ^ int(_stable_hash_to_bucket(f"{topic}:{event}:{user}:{t}", buckets=2**31-1))
                                 rnd = random.Random(seed)
@@ -2407,6 +2595,7 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         prompt_tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
                         observation_mode=str(b_obs_mode),
                         observation_t=int(obs_t),
+                        truncation_stats=prompt_trunc_stats,
                     )
 
                     ex = _build_example_from_states(bargs, target_label=target_label, target_id=target_id, target_distribution=target_counter)
@@ -2516,10 +2705,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                     target_mode="neighbor_tp1",
                                     prompt_max_tokens=int(prompt_max_tokens),
                                     prompt_tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
+                                    truncation_stats=a_prompt_trunc_stats,
                                 )
                                 q_action = build_action_imitation_input(bargs_action)
                             else:
-                                q_action = build_action_imitation_input(bargs)
+                                bargs_ai = replace(bargs, truncation_stats=a_prompt_trunc_stats)
+                                q_action = build_action_imitation_input(bargs_ai)
                             a_ex = {
                                 "question": q_action,
                                 "answer": f"\\boxed{{{aid}}}",
@@ -2581,6 +2772,35 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     if stats["num_examples"] == 0:
         raise RuntimeError("没有构造出任何样本，请检查数据路径/字段或参数。")
+
+    # finalize prompt truncation stats + print a short summary
+    try:
+        stats["prompt_truncation"] = _finalize_prompt_truncation_stats(stats.get("prompt_truncation") or {})
+        pt = stats.get("prompt_truncation") if isinstance(stats.get("prompt_truncation"), dict) else {}
+        print(
+            "[prompt-trunc][belief] "
+            f"n={int(pt.get('n_prompts',0))}, "
+            f"truncated={int(pt.get('n_truncated',0))} ({float(pt.get('truncated_ratio',0.0)):.3f}), "
+            f"tokens_dropped_total={int(pt.get('tokens_dropped_total',0))}, "
+            f"avg_drop={float(pt.get('avg_tokens_dropped_per_truncated',0.0)):.1f}, "
+            f"max_drop={int(pt.get('tokens_dropped_max',0))}"
+        )
+    except Exception:
+        pass
+    try:
+        a_stats["prompt_truncation"] = _finalize_prompt_truncation_stats(a_stats.get("prompt_truncation") or {})
+        pt = a_stats.get("prompt_truncation") if isinstance(a_stats.get("prompt_truncation"), dict) else {}
+        if int(a_stats.get("num_examples", 0)) > 0:
+            print(
+                "[prompt-trunc][action_imitation] "
+                f"n={int(pt.get('n_prompts',0))}, "
+                f"truncated={int(pt.get('n_truncated',0))} ({float(pt.get('truncated_ratio',0.0)):.3f}), "
+                f"tokens_dropped_total={int(pt.get('tokens_dropped_total',0))}, "
+                f"avg_drop={float(pt.get('avg_tokens_dropped_per_truncated',0.0)):.1f}, "
+                f"max_drop={int(pt.get('tokens_dropped_max',0))}"
+            )
+    except Exception:
+        pass
 
     _ensure_dir(output_dir)
     # save dataset

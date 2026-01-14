@@ -407,6 +407,134 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     }
 
 
+def _safe_softmax_np(x, axis=-1, eps: float = 1e-8):
+    import numpy as np
+    xx = np.array(x, dtype=np.float64)
+    xx = xx - np.max(xx, axis=axis, keepdims=True)
+    ex = np.exp(xx)
+    s = np.sum(ex, axis=axis, keepdims=True)
+    return ex / (s + eps)
+
+
+def _entropy_np(p, axis=-1, eps: float = 1e-8) -> float:
+    import numpy as np
+    pp = np.clip(np.array(p, dtype=np.float64), eps, 1.0)
+    ent = -np.sum(pp * np.log(pp), axis=axis)
+    return float(np.mean(ent))
+
+
+def _kl_np(p, q, eps: float = 1e-8) -> float:
+    import numpy as np
+    pp = np.clip(np.array(p, dtype=np.float64), eps, 1.0)
+    qq = np.clip(np.array(q, dtype=np.float64), eps, 1.0)
+    pp = pp / np.sum(pp)
+    qq = qq / np.sum(qq)
+    return float(np.sum(pp * (np.log(pp) - np.log(qq))))
+
+
+def _policy_stats_from_runner(runner: Any, batch: Any) -> Optional[Dict[str, Any]]:
+    """
+    Compute policy distribution stats from the current runner/batch at t=0:
+    - mean action distribution over agents (softmax of action_type_q_values if available)
+    - entropy of that distribution
+    """
+    try:
+        import numpy as np
+        mac = getattr(runner, "mac", None)
+        if mac is None:
+            return None
+        outs, info = mac.forward(batch, t=0, test_mode=True)  # outs: (bs,n_agents,n_avail)
+        if outs is None:
+            return None
+        if hasattr(outs, "detach"):
+            outs_np = outs.detach().float().cpu().numpy()
+        else:
+            outs_np = np.array(outs, dtype=np.float64)
+        # expect bs==1
+        if outs_np.ndim == 3 and outs_np.shape[0] >= 1:
+            logits = outs_np[0]  # (n_agents, n_actions)
+        elif outs_np.ndim == 2:
+            logits = outs_np
+        else:
+            return None
+        p_agents = _safe_softmax_np(logits, axis=-1)
+        p_mean = np.mean(p_agents, axis=0)  # (n_actions,)
+        return {
+            "p_mean": p_mean.tolist(),
+            "entropy_mean": _entropy_np(p_mean),
+        }
+    except Exception:
+        return None
+
+
+def _stage3b_compare_z_ablations(cfg: Any, ckpt: str, eval_split: str, eval_episodes: int, *, shuffle_seed: int = 0) -> Dict[str, Any]:
+    """
+    Sanity check for "z_t is really used by policy":
+    Run the SAME ckpt under three modes:
+      - z_ablation_mode=none (with z_t)
+      - z_ablation_mode=zero (z_t=0)
+      - z_ablation_mode=shuffle (z_t mismatched)
+    Report:
+      - mean action distribution p(a)
+      - entropy H(p)
+      - KL(p_with_z || p_zero), KL(p_with_z || p_shuffle)
+    """
+    import numpy as np
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+    from train import setup_experiment  # type: ignore
+
+    modes = ["none", "zero", "shuffle"]
+    out_by_mode: Dict[str, Any] = {}
+    for m in modes:
+        cfg2 = copy.deepcopy(cfg)
+        try:
+            if hasattr(cfg2, "env_args") and hasattr(cfg2.env_args, "dataset_split"):
+                cfg2.env_args.dataset_split = str(eval_split)
+        except Exception:
+            pass
+        cfg2.load_model_path = str(ckpt)
+        cfg2.z_ablation_mode = str(m)
+        cfg2.z_shuffle_seed = int(shuffle_seed)
+        runner, _mac, _learner, _logger, _device = setup_experiment(cfg2)
+
+        ps = []
+        ents = []
+        n_ok = 0
+        for _ in range(max(1, int(eval_episodes))):
+            batch = runner.run(test_mode=True)
+            st = _policy_stats_from_runner(runner, batch)
+            if not isinstance(st, dict):
+                continue
+            p = st.get("p_mean")
+            if not isinstance(p, list) or len(p) <= 0:
+                continue
+            ps.append(np.array(p, dtype=np.float64))
+            ents.append(float(st.get("entropy_mean", 0.0)))
+            n_ok += 1
+        if n_ok <= 0:
+            out_by_mode[m] = {"n": 0}
+        else:
+            p_mean = np.mean(np.stack(ps, axis=0), axis=0)
+            p_mean = p_mean / max(1e-8, float(np.sum(p_mean)))
+            out_by_mode[m] = {
+                "n": int(n_ok),
+                "p_mean": p_mean.tolist(),
+                "entropy_mean": float(np.mean(ents)),
+            }
+
+    # Compare KLs (with_z vs ablations)
+    p0 = out_by_mode.get("none", {}).get("p_mean")
+    if isinstance(p0, list) and len(p0) > 0:
+        pz = np.array(p0, dtype=np.float64)
+        if isinstance(out_by_mode.get("zero", {}).get("p_mean"), list):
+            p_zero = np.array(out_by_mode["zero"]["p_mean"], dtype=np.float64)
+            out_by_mode["kl_withz_vs_zero"] = float(_kl_np(pz, p_zero))
+        if isinstance(out_by_mode.get("shuffle", {}).get("p_mean"), list):
+            p_shuf = np.array(out_by_mode["shuffle"]["p_mean"], dtype=np.float64)
+            out_by_mode["kl_withz_vs_shuffle"] = float(_kl_np(pz, p_shuf))
+    return out_by_mode
+
+
 def _stage4_eval_online(cfg: Any, ckpt: str, eval_episodes: int) -> Dict[str, Any]:
     """
     Stage4: online env sanity + key metrics.
@@ -488,6 +616,31 @@ def _stage4_eval_online(cfg: Any, ckpt: str, eval_episodes: int) -> Dict[str, An
         "z_kl": float(z_kl),
         "z_eval_steps": int(z_steps),
     }
+
+
+def _stage4_compare_z_ablations(cfg: Any, ckpt: str, eval_episodes: int, *, shuffle_seed: int = 0) -> Dict[str, Any]:
+    """
+    Stage4 sanity check:
+    Compare early test returns under different z_ablation_mode values.
+    This diagnoses whether z_t affects action selection (policy input), while env dynamics remain the same.
+    """
+    modes = ["none", "zero", "shuffle"]
+    out: Dict[str, Any] = {}
+    for m in modes:
+        cfg2 = copy.deepcopy(cfg)
+        cfg2.load_model_path = str(ckpt)
+        cfg2.z_ablation_mode = str(m)
+        cfg2.z_shuffle_seed = int(shuffle_seed)
+        res = _stage4_eval_online(cfg2, str(ckpt), int(eval_episodes))
+        out[m] = res
+    # simple "slope" proxy: difference vs with-z
+    try:
+        rz = float(out.get("none", {}).get("test_return_mean", 0.0))
+        out["delta_return_zero_minus_withz"] = float(out.get("zero", {}).get("test_return_mean", 0.0) - rz)
+        out["delta_return_shuffle_minus_withz"] = float(out.get("shuffle", {}).get("test_return_mean", 0.0) - rz)
+    except Exception:
+        pass
+    return out
 
 def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episodes: int) -> Dict[str, float]:
     """
@@ -862,6 +1015,13 @@ def main() -> int:
     ap.add_argument("--eval_episodes", type=int, default=200)
     ap.add_argument("--min_margin", type=float, default=0.05, help="Stage1: required margin over majority baseline.")
     ap.add_argument(
+        "--compare_z",
+        action="store_true",
+        help="Sanity check: compare z_t usage by running the SAME ckpt with z_ablation_mode in {none,zero,shuffle}. "
+             "For stage3b prints action distribution entropy/KL; for stage4 prints early return deltas.",
+    )
+    ap.add_argument("--z_shuffle_seed", type=int, default=0, help="Seed for z_t shuffle ablation (diagnostic only).")
+    ap.add_argument(
         "--stage3a_fixed_stages",
         type=str,
         default="11,12",
@@ -971,6 +1131,20 @@ def main() -> int:
 
     if args.mode == "stage3b":
         _ckpt_must_have(str(args.ckpt), ["agent.th"])
+        if bool(getattr(args, "compare_z", False)):
+            outz = _stage3b_compare_z_ablations(cfg, str(args.ckpt), str(args.eval_split), int(args.eval_episodes), shuffle_seed=int(args.z_shuffle_seed))
+            print("")
+            print("=== Stage3b z_t usage sanity (same ckpt; z ablations) ===")
+            for m in ["none", "zero", "shuffle"]:
+                r = outz.get(m, {})
+                print(f"- mode={m}: n={int(r.get('n',0))} entropy_mean={float(r.get('entropy_mean',0.0)):.6f}")
+                pm = r.get("p_mean")
+                if isinstance(pm, list) and len(pm) <= 8:
+                    print(f"  p_mean={['{:.3f}'.format(float(x)) for x in pm]}")
+            if "kl_withz_vs_zero" in outz:
+                print(f"- KL(with_z || z=0): {float(outz['kl_withz_vs_zero']):.6f}")
+            if "kl_withz_vs_shuffle" in outz:
+                print(f"- KL(with_z || z=shuffle): {float(outz['kl_withz_vs_shuffle']):.6f}")
         out = _stage3b_eval_action_imitation(cfg, str(args.ckpt), str(args.eval_split), int(args.eval_episodes))
         print("")
         print("=== Stage3b(action imitation) eval ===")
@@ -1010,6 +1184,18 @@ def main() -> int:
         _ckpt_must_have(str(args.ckpt), ["agent.th"])
         if not os.path.exists(os.path.join(str(args.ckpt), "belief_encoder.th")):
             print("[WARN] Stage4 ckpt missing belief_encoder.th (z-dynamics / secondary sim may not work as intended).")
+
+        if bool(getattr(args, "compare_z", False)):
+            outz = _stage4_compare_z_ablations(cfg, str(args.ckpt), int(args.eval_episodes), shuffle_seed=int(args.z_shuffle_seed))
+            print("")
+            print("=== Stage4 z_t usage sanity (same ckpt; z ablations) ===")
+            for m in ["none", "zero", "shuffle"]:
+                r = outz.get(m, {})
+                print(f"- mode={m}: return_mean={float(r.get('test_return_mean',0.0)):.6f} std={float(r.get('test_return_std',0.0)):.6f} z_kl={float(r.get('z_kl', float('nan'))):.6f}")
+            if "delta_return_zero_minus_withz" in outz:
+                print(f"- Δreturn(z=0 - with_z): {float(outz['delta_return_zero_minus_withz']):+.6f}")
+            if "delta_return_shuffle_minus_withz" in outz:
+                print(f"- Δreturn(z=shuffle - with_z): {float(outz['delta_return_shuffle_minus_withz']):+.6f}")
 
         out = _stage4_eval_online(cfg, str(args.ckpt), int(args.eval_episodes))
         print("")
