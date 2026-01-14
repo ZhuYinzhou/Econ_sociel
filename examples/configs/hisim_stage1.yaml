@@ -29,7 +29,7 @@ use_mixer: false
 # Disable soft-label supervision (gt_action_dist from `target_distribution_prob`) to avoid fast collapse to majority class.
 belief_supervised_use_soft_labels: false
 # Micro-batch the forward pass to avoid OOM while using a larger logical batch_size.
-belief_supervised_micro_batch_size: 4
+belief_supervised_micro_batch_size: 2
 
 # ===== LRs / regularizers =====
 # NOTE: supervised optimizer uses belief_net_lr (see q_learner.py)
@@ -101,7 +101,7 @@ train:
   # Bigger buffer/batch -> smoother gradients, less "pred0 flips 0/1"
   buffer_size: 256
   # Logical batch for replay sampling (effective_count ≈ batch_size * n_agents). Forward is micro-batched above.
-  batch_size: 64
+  batch_size: 16
   update_interval: 1
   # Ensure each supervised mini-batch contains at least K label-1 samples (if available in replay).
   supervised_min_label1_per_batch: 1

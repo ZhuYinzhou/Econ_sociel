@@ -1,33 +1,48 @@
-# ECON Framework Dependencies
-# Core frameworks
-torch>=2.0.0
-numpy>=1.21.0
-datasets>=2.14.0
-transformers>=4.30.0
+# ECON Framework Dependencies (pip)
+#
+# NOTE:
+# - 你日常训练多在 conda(HiSim) 里跑；这个文件主要用于 pip 环境“快速拉起/可复现”。
+# - 这里把关键库版本范围收紧到一组更稳定的组合，避免 torch/transformers/datasets 互相不兼容。
+#
+# If you need CUDA wheels, install torch from the official index:
+#   pip install --index-url https://download.pytorch.org/whl/cu121 torch
 
-# Logging and monitoring
-loguru>=0.7.0
-wandb>=0.15.0
-tensorboard>=2.12.0
+# ---- Core ML stack ----
+torch>=2.1,<2.4
+numpy>=1.23,<3.0
 
-# Configuration and utilities
-pyyaml>=6.0
-tqdm>=4.65.0
-scikit-learn>=1.3.0
+# HuggingFace dataset IO (required by HuggingFaceDatasetEnv: load_from_disk/save_to_disk)
+datasets>=2.16,<3.0
+pyarrow>=14,<17
 
-# Environment and interaction
-gym>=0.26.2
+# Transformers + tokenizer backend
+transformers>=4.38,<5.0
+tokenizers>=0.15,<0.20
+accelerate>=0.26,<1.0
+sentencepiece>=0.1.99
 
-# API and HTTP
-requests>=2.31.0
-openai>=1.0.0
-aiohttp>=3.9.0
+# ---- Logging / monitoring ----
+loguru>=0.7,<1.0
+wandb>=0.15,<1.0
+tensorboard>=2.12,<3.0
 
-# Data processing
-pandas>=2.0.0 
+# ---- Config / utilities ----
+pyyaml>=6.0,<7.0
+tqdm>=4.65,<5.0
+scikit-learn>=1.3,<2.0
+packaging>=23.0,<25.0
 
-# Plotting (used by examples/)
-matplotlib>=3.8.0
+# ---- Env / RL ----
+gym>=0.26.2,<1.0
+
+# ---- API / HTTP ----
+requests>=2.31,<3.0
+openai>=1.0,<2.0
+aiohttp>=3.9,<4.0
+
+# ---- Data processing / plotting ----
+pandas>=2.0,<3.0
+matplotlib>=3.8,<4.0
 
 # Optional YAML parser fallback (only needed if you DON'T want PyYAML)
 # ruamel.yaml>=0.18.0
