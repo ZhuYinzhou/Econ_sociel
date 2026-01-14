@@ -277,7 +277,7 @@ class ECONLearner:
         else:
             if belief_lr <= 0:
                 self.logger.info(f"Belief optimizer skipped: belief_net_lr={belief_lr} <= 0.")
-
+        
         self.encoder_optimizer = None
         try:
             encoder_lr = float(getattr(args, "encoder_lr", getattr(args, "lr", 0.0)))
@@ -345,6 +345,20 @@ class ECONLearner:
                                     p.requires_grad = True
                             else:
                                 raise RuntimeError("train_action_imitation=True but agent.action_type_head is missing/None")
+
+                            # Optional: also train the z_t fusion parameters, BUT only when the feature is enabled.
+                            # Otherwise we might unintentionally train extra params in unrelated stages/experiments.
+                            # Without training these, z_t conditioning would be a random (frozen) projection and won't help S3b.
+                            try:
+                                if bool(getattr(args, "use_population_belief_in_action_head", False)):
+                                    if hasattr(agent, "population_belief_proj") and getattr(agent, "population_belief_proj") is not None:
+                                        for p in agent.population_belief_proj.parameters():
+                                            p.requires_grad = True
+                                    if hasattr(agent, "population_belief_gate_logit") and getattr(agent, "population_belief_gate_logit") is not None:
+                                        agent.population_belief_gate_logit.requires_grad = True
+                                    self.logger.info("Stage3b: Unfroze population_belief_proj/gate for z_t-conditioned action imitation.")
+                            except Exception:
+                                pass
 
                             # Explicitly keep belief_network + stance_head frozen (clarity)
                             if hasattr(agent, "belief_network") and getattr(agent, "belief_network") is not None:

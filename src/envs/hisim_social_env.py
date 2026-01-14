@@ -444,6 +444,8 @@ class HiSimSocialEnv(gym.Env):
         # core user profile/memory prompt controls
         self.max_user_history_lines = int(kwargs.get("max_user_history_lines", 40))
         self.max_recent_self_posts = int(kwargs.get("max_recent_self_posts", 6))
+        # B2-2: non-parametric group representation vector dim (should match belief_dim, e.g., 128)
+        self.group_representation_dim = int(kwargs.get("group_representation_dim", 128))
 
         # === HiSim-style synchronous round update (Stage4 option) ===
         # If True:
@@ -914,36 +916,229 @@ class HiSimSocialEnv(gym.Env):
                 sample = random.sample(texts, k=min(self.max_population_texts, len(texts)))
         return dist, sample
 
+    def _nonparam_group_representation_prev_stage(self, t: int) -> List[float]:
+        """
+        B2-2: Non-parametric core-group representation vector for conditioning z-transition.
+        At stage t, only uses information from PREVIOUS stage (t-1) to mimic sync-stage semantics.
+        Vector length is env_args.group_representation_dim (default 128).
+        """
+        dim = int(getattr(self, "group_representation_dim", 128))
+        dim = max(1, dim)
+        v = [0.0 for _ in range(dim)]
+        prev = int(t) - 1
+        if prev < 0:
+            # default: uniform stance + do_nothing action
+            if dim >= 3:
+                v[0] = v[1] = v[2] = 1.0 / 3.0
+            if dim >= 8:
+                v[3 + 4] = 1.0
+            return v
+
+        # stance distribution over stance-expressing actions in prev stage
+        stance_counts = [0, 0, 0]
+        stance_total = 0
+        # action distribution over all actions in prev stage
+        at_names = ["post", "retweet", "reply", "like", "do_nothing"]
+        at2i = {a: i for i, a in enumerate(at_names)}
+        action_counts = [0, 0, 0, 0, 0]
+        action_total = 0
+
+        for u in self.core_users:
+            p = self.core_posts.get((str(u), int(prev)))
+            if not isinstance(p, dict):
+                continue
+            at = str(p.get("action_type") or "do_nothing")
+            action_counts[at2i.get(at, 4)] += 1
+            action_total += 1
+            if at in ("post", "retweet", "reply"):
+                sid = p.get("stance_id")
+                try:
+                    sid_i = int(sid) if sid is not None else None
+                except Exception:
+                    sid_i = None
+                if sid_i is not None and 0 <= sid_i < 3:
+                    stance_counts[int(sid_i)] += 1
+                    stance_total += 1
+
+        if dim >= 3:
+            if stance_total > 0:
+                v[0] = float(stance_counts[0]) / float(stance_total)
+                v[1] = float(stance_counts[1]) / float(stance_total)
+                v[2] = float(stance_counts[2]) / float(stance_total)
+            else:
+                v[0] = v[1] = v[2] = 1.0 / 3.0
+
+        if dim >= 8:
+            if action_total > 0:
+                for i in range(5):
+                    v[3 + i] = float(action_counts[i]) / float(action_total)
+            else:
+                v[3 + 4] = 1.0
+
+        # activity/intensity scalars (optional)
+        if dim >= 9:
+            denom = float(max(1, len(self.core_users)))
+            v[8] = float(action_total) / denom  # in sync mode action_total==|core_users|
+        if dim >= 11:
+            expresses = float(action_counts[0] + action_counts[1] + action_counts[2])
+            v[10] = float(expresses / float(action_total)) if action_total > 0 else 0.0
+
+        return v
+
+    # === Prompt budget truncation (fast, approximate) ===
+    # Goal: ensure any truncation happens in low-priority sections (history/persona/long texts),
+    # never in critical constraints (task/output format) or critical state summaries (z/pop/neighbor summary).
+    def _approx_token_len_lines(self, lines: List[str]) -> int:
+        try:
+            # GPT-style BPE heuristic: ~4 chars/token on English; adjust for newlines.
+            s = "\n".join([str(x) for x in (lines or [])])
+            return int(max(0, (len(s) // 4) + s.count("\n") // 2))
+        except Exception:
+            return 0
+
+    def _truncate_sections_by_budget(
+        self,
+        *,
+        sections: List[Dict[str, Any]],
+        max_tokens: int,
+    ) -> List[str]:
+        """
+        sections: list of {name:str, priority:int, truncatable:bool, lines:list[str]}
+        Higher priority is protected. Truncation happens in low priority sections first.
+        Uses an approximate token length to remain fast in online env.
+        """
+        mt = int(max_tokens)
+        if mt <= 0:
+            out0: List[str] = []
+            for s in sections:
+                out0.extend([str(x) for x in (s.get("lines") or [])])
+            return out0
+
+        # copy
+        ss: List[Dict[str, Any]] = []
+        for s in sections:
+            ss.append(
+                {
+                    "name": str(s.get("name", "")),
+                    "priority": int(s.get("priority", 0)),
+                    "truncatable": bool(s.get("truncatable", True)),
+                    "lines": [str(x) for x in (s.get("lines") or [])],
+                }
+            )
+
+        def _flatten() -> List[str]:
+            out1: List[str] = []
+            for s in ss:
+                out1.extend(s.get("lines") or [])
+            return out1
+
+        cur = _flatten()
+        if self._approx_token_len_lines(cur) <= mt:
+            return cur
+
+        # truncate from lowest priority upward
+        order = sorted(range(len(ss)), key=lambda i: (ss[i]["priority"], ss[i]["name"]))
+
+        # 1) drop whole low-priority sections (history)
+        for i in order:
+            if self._approx_token_len_lines(_flatten()) <= mt:
+                break
+            if not ss[i]["truncatable"]:
+                continue
+            if ss[i]["name"] in ("history", "user_history", "optional_history"):
+                ss[i]["lines"] = []
+
+        if self._approx_token_len_lines(_flatten()) <= mt:
+            return _flatten()
+
+        # 2) drop other truncatable sections entirely (persona/recent) if still too long
+        for i in order:
+            if self._approx_token_len_lines(_flatten()) <= mt:
+                break
+            if not ss[i]["truncatable"]:
+                continue
+            if ss[i]["name"] in ("medium", "persona", "recent"):
+                ss[i]["lines"] = []
+
+        if self._approx_token_len_lines(_flatten()) <= mt:
+            return _flatten()
+
+        # 3) trim tails of long text sections (neighbor/pop texts), keep their headers if present
+        for i in order:
+            if self._approx_token_len_lines(_flatten()) <= mt:
+                break
+            if not ss[i]["truncatable"]:
+                continue
+            lines = ss[i]["lines"]
+            if not lines:
+                continue
+            # keep header-like first line if it ends with ":"
+            keep_head = 0
+            try:
+                if len(lines) >= 1 and str(lines[0]).strip().endswith(":"):
+                    keep_head = 1
+            except Exception:
+                keep_head = 0
+            while len(lines) > keep_head and self._approx_token_len_lines(_flatten()) > mt:
+                # don't remove the last blank line only; remove meaningful tail
+                lines.pop()
+            ss[i]["lines"] = lines
+
+        return _flatten()
+
     def _build_observation(self, user: str, t: int) -> str:
         persona = self.role_desc.get(user, "")
         user_history = self.user_histories.get(str(user), "")
         neighbor_counter, neighbor_texts = self._neighbor_context(user, t)
         pop_dist, pop_texts = self._population_obs(t)
 
-        lines: List[str] = []
-        lines.append("You are simulating a Twitter-like social media user.")
-        lines.append(f"Topic: {self.topic}")
-        lines.append(f"Event: {self.event}")
-        lines.append(f"Stage t: {t}")
-        lines.append(f"User: {user} (core user)")
-        lines.append("")
-        # === Profile Module ===
-        if persona:
-            lines.append("Profile Module / User persona:")
-            lines.append(str(persona).strip())
-            lines.append("")
+        header: List[str] = []
+        header.append("You are simulating a Twitter-like social media user.")
+        header.append(f"Topic: {self.topic}")
+        header.append(f"Event: {self.event}")
+        header.append(f"Stage t: {t}")
+        header.append(f"User: {user} (core user)")
+        header.append("")
+        high: List[str] = []
+        # =========================
+        # High-priority signals FIRST (must survive truncation)
+        # =========================
+        if pop_dist:
+            if self.population_z_mode == "continuous":
+                zc = float(pop_dist.get("z_scalar", 0.0))
+                high.append("Population latent z scalar (edge users, simulated):")
+                high.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
+                high.append("")
+            else:
+                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
+                high.append("Population latent z distribution (edge users, simulated):")
+                high.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
+                high.append("")
+        if neighbor_counter:
+            top = sorted(neighbor_counter.items(), key=lambda x: -x[1])[:10]
+            high.append("Neighbor stance summary at stage t (simulated):")
+            high.append(", ".join([f"{k}:{v}" for k, v in top]))
+            high.append("")
 
-        # === Memory Module ===
-        if user_history:
-            lines.append("Memory Module / User historical posts (observed):")
-            hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
-            if self.max_user_history_lines > 0:
-                hs = hs[: self.max_user_history_lines]
-            for ln in hs:
-                lines.append(str(ln))
-            lines.append("")
+        neighbor_texts_sec: List[str] = []
+        if neighbor_texts:
+            neighbor_texts_sec.append("Neighbor posts at stage t (simulated):")
+            for nb, txt in neighbor_texts:
+                neighbor_texts_sec.append(f"- [{nb}] {txt}")
+            neighbor_texts_sec.append("")
 
+        pop_texts_sec: List[str] = []
+        if pop_texts:
+            pop_texts_sec.append("Population observed texts (from micro, aligned to stage t):")
+            for txt in pop_texts:
+                pop_texts_sec.append(f"- {txt}")
+            pop_texts_sec.append("")
+
+        # =========================
+        # Medium-priority context
+        # =========================
         # recent self actions from simulation (previous stages)
+        medium: List[str] = []
         if self.max_recent_self_posts > 0:
             recent: List[Tuple[int, str, str]] = []
             for tt in range(max(0, int(t) - 6), int(t)):
@@ -955,53 +1150,59 @@ class HiSimSocialEnv(gym.Env):
                 if at:
                     recent.append((tt, at, txt))
             if recent:
-                lines.append("Memory Module / Recent self actions (simulated):")
+                medium.append("Recent self actions (simulated, previous stages):")
                 for tt, at, txt in recent[-self.max_recent_self_posts :]:
                     if txt:
-                        lines.append(f"- t={tt} {at}: {txt}")
+                        medium.append(f"- t={tt} {at}: {txt}")
                     else:
-                        lines.append(f"- t={tt} {at}")
-                lines.append("")
+                        medium.append(f"- t={tt} {at}")
+                medium.append("")
 
-        if neighbor_counter:
-            top = sorted(neighbor_counter.items(), key=lambda x: -x[1])[:10]
-            lines.append("Memory Module / Neighbor posts stance summary at stage t (simulated):")
-            lines.append(", ".join([f"{k}:{v}" for k, v in top]))
-            lines.append("")
-        if neighbor_texts:
-            lines.append("Memory Module / Neighbor posts at stage t (simulated):")
-            for nb, txt in neighbor_texts:
-                lines.append(f"- [{nb}] {txt}")
-            lines.append("")
+        if persona:
+            medium.append("Profile / persona:")
+            medium.append(str(persona).strip())
+            medium.append("")
 
-        if pop_dist:
-            if self.population_z_mode == "continuous":
-                zc = float(pop_dist.get("z_scalar", 0.0))
-                lines.append("Population latent z scalar (edge users, simulated):")
-                lines.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
-                lines.append("")
-            else:
-                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
-                lines.append("Population latent z distribution (edge users, simulated):")
-                lines.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
-                lines.append("")
-        if pop_texts:
-            lines.append("Population observed texts (from micro, aligned to stage t):")
-            for txt in pop_texts:
-                lines.append(f"- {txt}")
-            lines.append("")
+        # =========================
+        # Low-priority (should be truncated first)
+        # =========================
+        if user_history:
+            history: List[str] = []
+            history.append("Optional / low-priority: historical posts (observed; may be truncated):")
+            hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
+            if self.max_user_history_lines > 0:
+                hs = hs[: self.max_user_history_lines]
+            for ln in hs:
+                history.append(str(ln))
+            history.append("")
+        else:
+            history = []
 
-        lines.append("Task: Choose ONE action for this user at this stage.")
-        lines.append("You must output JSON only, with keys:")
-        lines.append('- "action_type": one of ["post","retweet","reply","like","do_nothing"]')
-        lines.append('- "stance_id": (optional) integer stance class id; REQUIRED when action_type in ["post","retweet","reply"]')
-        lines.append('- "post_text": (optional) tweet content; REQUIRED when action_type in ["post","retweet","reply"], empty otherwise')
-        lines.append("Valid stance_id mapping:")
+        task: List[str] = []
+        task.append("Task: Choose ONE action for this user at this stage.")
+        task.append("You must output JSON only, with keys:")
+        task.append('- "action_type": one of ["post","retweet","reply","like","do_nothing"]')
+        task.append('- "stance_id": (optional) integer stance class id; REQUIRED when action_type in ["post","retweet","reply"]')
+        task.append('- "post_text": (optional) tweet content; REQUIRED when action_type in ["post","retweet","reply"], empty otherwise')
+        task.append("Valid stance_id mapping:")
         for lab, idx in sorted(self.label2id.items(), key=lambda x: x[1]):
-            lines.append(f"- {idx}: {lab}")
-        lines.append("")
-        lines.append('Return only JSON, e.g. {"action_type":"post","stance_id": 2, "post_text": "..."}')
-        return "\n".join(lines)
+            task.append(f"- {idx}: {lab}")
+        task.append("")
+        task.append('Return only JSON, e.g. {"action_type":"post","stance_id": 2, "post_text": "..."}')
+
+        out_lines = self._truncate_sections_by_budget(
+            sections=[
+                {"name": "header", "priority": 100, "truncatable": False, "lines": header},
+                {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+                {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
+                {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
+                {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},
+                {"name": "history", "priority": 0, "truncatable": True, "lines": history},
+                {"name": "task", "priority": 100, "truncatable": False, "lines": task},
+            ],
+            max_tokens=int(getattr(self, "max_question_length", 1024)),
+        )
+        return "\n".join(out_lines)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -1035,6 +1236,8 @@ class HiSimSocialEnv(gym.Env):
                 "is_core_user": True,
                 "agent_infos": [{"user": str(u), "t": int(self.stage_t), "is_core_user": True} for u in self.core_users],
             }
+            # Non-parametric group repr for current stage (derived from previous stage; stage0 uses default)
+            self.current_info["group_representation"] = self._nonparam_group_representation_prev_stage(int(self.stage_t))
             # Provide a global belief_inputs snapshot (population_z/stage) for runner compatibility.
             self.current_info["belief_inputs"] = {
                 "t": int(self.stage_t),
@@ -1074,31 +1277,50 @@ class HiSimSocialEnv(gym.Env):
         neighbor_counter, neighbor_texts = self._neighbor_context_prev_stage(user, t)
         pop_dist, pop_texts = self._population_obs(t)
 
-        lines: List[str] = []
-        lines.append("You are simulating a Twitter-like social media user in a SYNCHRONOUS round-based simulation.")
-        lines.append("IMPORTANT: All core users act concurrently in the same stage-round.")
-        lines.append("You only observe information from the PREVIOUS stage (t-1), not from the current stage t.")
-        lines.append(f"Topic: {self.topic}")
-        lines.append(f"Event: {self.event}")
-        lines.append(f"Stage t: {t}")
-        lines.append(f"User: {user} (core user)")
-        lines.append("")
+        header: List[str] = []
+        header.append("You are simulating a Twitter-like social media user in a SYNCHRONOUS round-based simulation.")
+        header.append("IMPORTANT: All core users act concurrently in the same stage-round.")
+        header.append("You only observe information from the PREVIOUS stage (t-1), not from the current stage t.")
+        header.append(f"Topic: {self.topic}")
+        header.append(f"Event: {self.event}")
+        header.append(f"Stage t: {t}")
+        header.append(f"User: {user} (core user)")
+        header.append("")
 
-        if persona:
-            lines.append("Profile / persona:")
-            lines.append(str(persona).strip())
-            lines.append("")
+        high: List[str] = []
 
-        if user_history:
-            lines.append("Memory / historical posts (observed):")
-            hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
-            if self.max_user_history_lines > 0:
-                hs = hs[: self.max_user_history_lines]
-            for ln in hs:
-                lines.append(str(ln))
-            lines.append("")
+        # =========================
+        # High-priority signals FIRST (must survive truncation)
+        # =========================
+        if pop_dist:
+            if self.population_z_mode == "continuous":
+                zc = float(pop_dist.get("z_scalar", 0.0))
+                high.append("Population latent z scalar (edge users, simulated):")
+                high.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
+                high.append("")
+            else:
+                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
+                high.append("Population latent z distribution (edge users, simulated):")
+                high.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
+                high.append("")
+        if neighbor_counter:
+            top = sorted(neighbor_counter.items(), key=lambda x: -x[1])[:10]
+            high.append("Neighbor stance summary from PREVIOUS stage (t-1):")
+            high.append(", ".join([f"{k}:{v}" for k, v in top]))
+            high.append("")
 
+        neighbor_texts_sec: List[str] = []
+        if neighbor_texts:
+            neighbor_texts_sec.append("Neighbor posts from PREVIOUS stage (t-1):")
+            for nb, txt in neighbor_texts:
+                neighbor_texts_sec.append(f"- [{nb}] {txt}")
+            neighbor_texts_sec.append("")
+
+        # =========================
+        # Medium-priority context
+        # =========================
         # recent self actions (previous stages only)
+        medium: List[str] = []
         if self.max_recent_self_posts > 0:
             recent: List[Tuple[int, str, str]] = []
             for tt in range(max(0, int(t) - 6), int(t)):
@@ -1110,51 +1332,63 @@ class HiSimSocialEnv(gym.Env):
                 if at:
                     recent.append((tt, at, txt))
             if recent:
-                lines.append("Memory / recent self actions (simulated, previous stages):")
+                medium.append("Recent self actions (simulated, previous stages):")
                 for tt, at, txt in recent[-self.max_recent_self_posts :]:
-                    lines.append(f"- stage{tt}: {at}" + (f" | {txt}" if txt else ""))
-                lines.append("")
+                    medium.append(f"- stage{tt}: {at}" + (f" | {txt}" if txt else ""))
+                medium.append("")
 
-        if neighbor_counter:
-            top = sorted(neighbor_counter.items(), key=lambda x: -x[1])[:10]
-            lines.append("Neighbor stance summary from PREVIOUS stage (t-1):")
-            lines.append(", ".join([f"{k}:{v}" for k, v in top]))
-            lines.append("")
-        if neighbor_texts:
-            lines.append("Neighbor posts from PREVIOUS stage (t-1):")
-            for nb, txt in neighbor_texts:
-                lines.append(f"- [{nb}] {txt}")
-            lines.append("")
+        if persona:
+            medium.append("Profile / persona:")
+            medium.append(str(persona).strip())
+            medium.append("")
 
-        if pop_dist:
-            if self.population_z_mode == "continuous":
-                zc = float(pop_dist.get("z_scalar", 0.0))
-                lines.append("Population latent z scalar (edge users, simulated):")
-                lines.append(f"z_scalar: {zc:.3f}  (range [-1,1], negative=Oppose, positive=Support)")
-                lines.append("")
-            else:
-                topd = sorted(pop_dist.items(), key=lambda x: -x[1])[:10]
-                lines.append("Population latent z distribution (edge users, simulated):")
-                lines.append(", ".join([f"{k}:{v:.3f}" for k, v in topd]))
-                lines.append("")
+        # =========================
+        # Low-priority (should be truncated first)
+        # =========================
+        if user_history:
+            history: List[str] = []
+            history.append("Optional / low-priority: historical posts (observed; may be truncated):")
+            hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
+            if self.max_user_history_lines > 0:
+                hs = hs[: self.max_user_history_lines]
+            for ln in hs:
+                history.append(str(ln))
+            history.append("")
+        else:
+            history = []
 
+        pop_texts_sec: List[str] = []
         if pop_texts:
-            lines.append("Population observed texts (from micro, aligned to stage t):")
+            pop_texts_sec.append("Population observed texts (from micro, aligned to stage t):")
             for txt in pop_texts:
-                lines.append(f"- {txt}")
-            lines.append("")
+                pop_texts_sec.append(f"- {txt}")
+            pop_texts_sec.append("")
 
-        lines.append("Task: Choose ONE action for this user at this stage.")
-        lines.append("You must output JSON only, with keys:")
-        lines.append('- "action_type": one of ["post","retweet","reply","like","do_nothing"]')
-        lines.append('- "stance_id": (optional) integer stance class id; REQUIRED when action_type in ["post","retweet","reply"]')
-        lines.append('- "post_text": (optional) tweet content; REQUIRED when action_type in ["post","retweet","reply"], empty otherwise')
-        lines.append("Valid stance_id mapping:")
+        task: List[str] = []
+        task.append("Task: Choose ONE action for this user at this stage.")
+        task.append("You must output JSON only, with keys:")
+        task.append('- "action_type": one of ["post","retweet","reply","like","do_nothing"]')
+        task.append('- "stance_id": (optional) integer stance class id; REQUIRED when action_type in ["post","retweet","reply"]')
+        task.append('- "post_text": (optional) tweet content; REQUIRED when action_type in ["post","retweet","reply"], empty otherwise')
+        task.append("Valid stance_id mapping:")
         for lab, idx in sorted(self.label2id.items(), key=lambda x: x[1]):
-            lines.append(f"- {idx}: {lab}")
-        lines.append("")
-        lines.append('Return only JSON, e.g. {"action_type":"post","stance_id": 2, "post_text": "..."}')
-        return "\n".join(lines)
+            task.append(f"- {idx}: {lab}")
+        task.append("")
+        task.append('Return only JSON, e.g. {"action_type":"post","stance_id": 2, "post_text": "..."}')
+
+        out_lines = self._truncate_sections_by_budget(
+            sections=[
+                {"name": "header", "priority": 100, "truncatable": False, "lines": header},
+                {"name": "high", "priority": 90, "truncatable": False, "lines": high},
+                {"name": "neighbor_texts", "priority": 50, "truncatable": True, "lines": neighbor_texts_sec},
+                {"name": "population_texts", "priority": 50, "truncatable": True, "lines": pop_texts_sec},
+                {"name": "medium", "priority": 20, "truncatable": True, "lines": medium},
+                {"name": "history", "priority": 0, "truncatable": True, "lines": history},
+                {"name": "task", "priority": 100, "truncatable": False, "lines": task},
+            ],
+            max_tokens=int(getattr(self, "max_question_length", 1024)),
+        )
+        return "\n".join(out_lines)
 
     def _normalize_prob_vec(self, v: Any, k: int) -> List[float]:
         """Normalize a vector-like object into a valid probability vector of length k."""
@@ -1308,6 +1542,8 @@ class HiSimSocialEnv(gym.Env):
                 "neighbor_stance_counts": [0, 0, 0],
                 "population_z": self.population_z,
             }
+            # Non-parametric group repr for this stage t (based on previous stage t-1)
+            group_repr_t = self._nonparam_group_representation_prev_stage(int(t))
 
             # Normalize incoming actions into a list aligned to self.core_users
             acts: List[Any] = []
@@ -1496,6 +1732,8 @@ class HiSimSocialEnv(gym.Env):
                     "neighbor_stance_counts": [0, 0, 0],
                     "population_z": self.population_z,
                 }
+            # Non-parametric group repr for NEXT stage (based on the just-finished stage)
+            group_repr_next = self._nonparam_group_representation_prev_stage(int(self.stage_t))
 
             # z supervision: one per stage boundary (always in sync mode when t+1 exists)
             z_mask = 1.0 if ((t + 1) < self.n_stages) else 0.0
@@ -1524,6 +1762,9 @@ class HiSimSocialEnv(gym.Env):
                 "population_z": float(self.population_z) if self.population_z_mode == "continuous" else list(self.population_z),
                 "belief_inputs_pre": belief_inputs_pre,
                 "belief_inputs_post": belief_inputs_post,
+                # group repr for current/next stage (runner prefers *_next for pre-transition)
+                "group_representation": group_repr_t,
+                "group_representation_next": group_repr_next,
                 "z_pred": z_pred,
                 "z_target": z_target,
                 "z_mask": float(z_mask),

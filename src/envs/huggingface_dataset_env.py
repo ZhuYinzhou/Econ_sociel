@@ -712,6 +712,8 @@ class HuggingFaceDatasetEnv(gym.Env):
         try:
             if isinstance(self.current_sample, dict):
                 for k in (
+                    # Non-parametric group repr (B2-2): stage-level core aggregate vector for z_transition conditioning
+                    "group_representation",
                     "core_stance_id_t",
                     "core_action_type_id_t",
                     "has_user_history",

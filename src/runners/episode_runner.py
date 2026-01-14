@@ -245,7 +245,7 @@ class EpisodeRunner:
 
             # 多步 episode：循环直到 env 返回 terminated 或达到 episode_limit
             while (not terminated) and (self.t < self.episode_limit):
-                pre_transition_data = self._get_pre_transition_data(_next_obs)
+                pre_transition_data = self._get_pre_transition_data(_next_obs, env_step_info)
                 self.batch.update(pre_transition_data, ts=self.t)
 
                 # Sync-stage social env may return observation as list[str] (per-agent).
@@ -466,8 +466,12 @@ class EpisodeRunner:
             logger.exception("Exception details:")
             raise
 
-    def _get_pre_transition_data(self, current_observation_text: Any) -> Dict:
-        """Get pre-transition data (current observation). Supports str or list[str] (per-agent)."""
+    def _get_pre_transition_data(self, current_observation_text: Any, env_reset_or_step_info: Optional[Dict[str, Any]] = None) -> Dict:
+        """
+        Get pre-transition data (current observation). Supports str or list[str] (per-agent).
+        Best-effort injects global conditioning fields from env.reset()/env.step() info so they're available at t=0
+        (e.g., stage_t / z_t / belief_pre_* / group_representation).
+        """
         default_state_vshape = self.env_info.get("state_shape", (1,))
         default_avail_actions_vshape = (self.env_info.get("n_actions", 1),)
 
@@ -484,13 +488,87 @@ class EpisodeRunner:
             obs_tensor = self.mac.preprocess_observation(str(current_observation_text))
             obs_field = [obs_tensor for _ in range(self.n_agents)]
 
-        return {
+        pre_data: Dict[str, Any] = {
             "obs": obs_field,
             "state": [torch.zeros(*default_state_vshape, device=self.args.device)],
             "avail_actions": [
                 torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)
             ],
         }
+
+        # ---- Best-effort: parse reset/step info to fill global fields at pre-transition ----
+        try:
+            info0 = env_reset_or_step_info if isinstance(env_reset_or_step_info, dict) else {}
+            sample = info0.get("sample") if isinstance(info0.get("sample", None), dict) else None
+            if sample is None:
+                sample = info0 if isinstance(info0, dict) else {}
+
+            # stage index (prefer next-state belief_inputs t when available)
+            st = None
+            try:
+                bi0 = sample.get("belief_inputs", None)
+                if isinstance(bi0, dict) and ("t" in bi0):
+                    st = bi0.get("t")
+            except Exception:
+                st = None
+            if st is None:
+                try:
+                    bi1 = sample.get("belief_inputs_post", None)
+                    if isinstance(bi1, dict) and ("t" in bi1):
+                        st = bi1.get("t")
+                except Exception:
+                    st = None
+            if st is None:
+                st = sample.get("stage_t", sample.get("t", None))
+            if st is not None:
+                try:
+                    pre_data["stage_t"] = torch.tensor([int(st)], dtype=torch.int64, device=self.args.device)
+                except Exception:
+                    pass
+
+            # group_representation (global): prefer next-stage value if provided by env
+            gr = sample.get("group_representation_next", None)
+            if gr is None:
+                gr = sample.get("group_representation", None)
+            if gr is not None:
+                try:
+                    if isinstance(gr, torch.Tensor):
+                        gv = gr.detach().float().view(-1).to(self.args.device)
+                    elif isinstance(gr, (list, tuple)):
+                        gv = torch.tensor([float(x) for x in list(gr)], dtype=torch.float32, device=self.args.device)
+                    else:
+                        gv = None
+                    if isinstance(gv, torch.Tensor) and gv.numel() > 0:
+                        pre_data["group_representation"] = gv
+                except Exception:
+                    pass
+
+            # belief inputs: prefer env-provided belief_inputs; otherwise fall back to sample z_t
+            get_bt = getattr(self.env, "get_belief_tensor", None)
+            if callable(get_bt):
+                bi = sample.get("belief_inputs", None)
+                if not isinstance(bi, dict):
+                    bi = sample.get("belief_inputs_post", None)
+                if not isinstance(bi, dict):
+                    if "z_t" in sample:
+                        bi = {
+                            "population_z": sample.get("z_t"),
+                            "is_core_user": bool(sample.get("is_core_user", False)),
+                            "neighbor_stance_counts": [0, 0, 0],
+                        }
+                bt_pre = get_bt(bi, device=self.args.device) if bi is not None else None
+                if isinstance(bt_pre, dict):
+                    if "population_z" in bt_pre:
+                        pre_data["belief_pre_population_z"] = bt_pre["population_z"].to(self.args.device)
+                        pre_data["z_t"] = bt_pre["population_z"].to(self.args.device)
+                    if "neighbor_stance_counts" in bt_pre:
+                        pre_data["belief_pre_neighbor_counts"] = bt_pre["neighbor_stance_counts"].to(self.args.device)
+                    if "is_core_user" in bt_pre:
+                        pre_data["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
+        except Exception as e:
+            self.logger.debug(f"Failed to inject pre-transition conditioning fields: {e}")
+
+        return pre_data
 
     def _get_actions(self, test_mode: bool, raw_observation_text: Optional[str] = None) -> Tuple[torch.Tensor, Dict]:
         """Get actions and extra info from MAC."""

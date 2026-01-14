@@ -414,9 +414,59 @@ class LLMBasicMAC:
         
         # Build inputs for agents
         inputs, mask = self._build_inputs(ep_batch, t)
-        
-        # Forward pass through agents
-        agent_outs, hidden_states = self.agent(inputs, mask, test_mode=actual_test_mode)
+
+        # Fetch structured conditioning signals from EpisodeBatch (global, bs-level).
+        # These fields are written by EpisodeRunner for HuggingFaceDatasetEnv / social envs.
+        population_belief = None
+        stage_t = None
+        try:
+            if hasattr(ep_batch, "scheme"):
+                if "belief_pre_population_z" in ep_batch.scheme:
+                    population_belief = ep_batch["belief_pre_population_z"][:, t]  # (bs, K)
+                elif "z_t" in ep_batch.scheme:
+                    population_belief = ep_batch["z_t"][:, t]  # (bs, K)
+                if "stage_t" in ep_batch.scheme:
+                    stage_t = ep_batch["stage_t"][:, t]  # (bs,1) or (bs,)
+        except Exception as e:
+            logger.warning(f"Failed to fetch population_belief/stage_t from batch at t={t}: {e}")
+            population_belief = None
+            stage_t = None
+
+        # Optional: pass population belief z_t / stage_t into agent for conditioning
+        # (Stage3b goal: action imitation conditioned on z_t learned in Stage3a).
+        pop_flat = None
+        st_flat = None
+        try:
+            if population_belief is not None and isinstance(population_belief, torch.Tensor):
+                pb = population_belief
+                if pb.ndim == 3 and pb.shape[1] == 1:
+                    pb = pb.squeeze(1)
+                # expected pb: (batch, K)
+                if pb.ndim == 2 and pb.shape[0] == int(ep_batch.batch_size):
+                    pop_flat = pb.unsqueeze(1).expand(int(ep_batch.batch_size), int(self.n_agents), int(pb.shape[-1])).reshape(int(ep_batch.batch_size) * int(self.n_agents), int(pb.shape[-1]))
+        except Exception:
+            pop_flat = None
+        try:
+            if stage_t is not None and isinstance(stage_t, torch.Tensor):
+                st = stage_t
+                if st.ndim == 2 and st.shape[1] == 1:
+                    st = st.squeeze(1)
+                # expected st: (batch,)
+                if st.ndim == 1 and st.shape[0] == int(ep_batch.batch_size):
+                    st_flat = st.unsqueeze(1).expand(int(ep_batch.batch_size), int(self.n_agents)).reshape(int(ep_batch.batch_size) * int(self.n_agents))
+        except Exception:
+            st_flat = None
+
+        # Forward pass through agents (be robust to older agents that don't accept new kwargs)
+        try:
+            agent_outs, hidden_states = self.agent(
+                inputs, mask,
+                test_mode=actual_test_mode,
+                population_belief=pop_flat,
+                stage_t=st_flat,
+            )
+        except TypeError:
+            agent_outs, hidden_states = self.agent(inputs, mask, test_mode=actual_test_mode)
         
         # Extract data from agent outputs
         # agent_outs contains outputs for all agents in the batch
@@ -450,51 +500,51 @@ class LLMBasicMAC:
         if isinstance(action_type_q_values, torch.Tensor):
             action_type_q_values = action_type_q_values.view(batch_size, self.n_agents, -1)
         
-        # Generate group representation using BeliefEncoder
+        # Generate group representation:
+        # - Default: use BeliefEncoder(belief_states, population_belief, stage_t)
+        # - B2-2 option: use non-parametric group_representation provided by env/dataset via ep_batch (global field)
         # 对 HiSim social：显式注入 population belief（边缘用户 latent z）与 stage_t
-        population_belief = None
-        stage_t = None
-        try:
-            # 这些字段由 EpisodeRunner 写入 EpisodeBatch（global fields）
-            if hasattr(ep_batch, "scheme"):
-                if "belief_pre_population_z" in ep_batch.scheme:
-                    population_belief = ep_batch["belief_pre_population_z"][:, t]  # (bs, 3)
-                elif "z_t" in ep_batch.scheme:
-                    population_belief = ep_batch["z_t"][:, t]  # (bs, 3)
-                if "stage_t" in ep_batch.scheme:
-                    stage_t = ep_batch["stage_t"][:, t]  # (bs, 1) or (bs,)
-        except Exception as e:
-            logger.warning(f"Failed to fetch population_belief/stage_t from batch at t={t}: {e}")
-            population_belief = None
-            stage_t = None
+        # NOTE: reuse population_belief/stage_t fetched above (bs-level), NOT the per-agent expanded pop_flat/st_flat.
 
         # Stage1/2 supervised mode: optionally freeze encoder and avoid building a grad graph
         freeze_enc_sup = bool(getattr(self.args, "freeze_belief_encoder_in_supervised", False))
         is_sup = bool(getattr(self.args, "train_belief_supervised", False))
         use_no_grad = bool(train_mode and is_sup and freeze_enc_sup)
 
-        try:
-            if use_no_grad:
-                with torch.no_grad():
+        group_representation = None
+        use_nonparam_gr = bool(getattr(self.args, "use_nonparam_group_repr", False))
+        if use_nonparam_gr:
+            try:
+                if "group_representation" in ep_batch.scheme:
+                    grb = ep_batch["group_representation"][:, t]  # (bs, belief_dim)
+                    if isinstance(grb, torch.Tensor):
+                        group_representation = grb.to(self.device)
+            except Exception:
+                group_representation = None
+
+        if group_representation is None:
+            try:
+                if use_no_grad:
+                    with torch.no_grad():
+                        group_representation = self.belief_encoder(
+                            belief_states,
+                            population_belief=population_belief,
+                            stage_t=stage_t,
+                        )  # (batch, belief_dim)
+                else:
                     group_representation = self.belief_encoder(
                         belief_states,
                         population_belief=population_belief,
                         stage_t=stage_t,
                     )  # (batch, belief_dim)
-            else:
-                group_representation = self.belief_encoder(
-                    belief_states,
-                    population_belief=population_belief,
-                    stage_t=stage_t,
-                )  # (batch, belief_dim)
-        except Exception as e:
-            # 回退：不注入 population/stage（保持可运行）
-            logger.warning(f"BeliefEncoder forward with population_belief failed, fallback to vanilla: {e}")
-            if use_no_grad:
-                with torch.no_grad():
+            except Exception as e:
+                # 回退：不注入 population/stage（保持可运行）
+                logger.warning(f"BeliefEncoder forward with population_belief failed, fallback to vanilla: {e}")
+                if use_no_grad:
+                    with torch.no_grad():
+                        group_representation = self.belief_encoder(belief_states)
+                else:
                     group_representation = self.belief_encoder(belief_states)
-            else:
-                group_representation = self.belief_encoder(belief_states)
 
         # ===== Innovation hook: belief about secondary users (used for env-side simulation) =====
         secondary_z_next = None

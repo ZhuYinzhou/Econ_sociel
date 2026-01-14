@@ -278,6 +278,28 @@ class LLMTransformerAgent(nn.Module):
         # Backward-compat alias: old checkpoints used "output_network" for discrete-action logits
         # We keep an alias so state_dict keys can be loaded with strict=False.
         self.output_network = self.action_type_head
+
+        # ===== Optional: condition action logits on population belief z_t (from Stage3a) =====
+        # Motivation: for S3b we want "policy imitation conditioned on secondary-population state",
+        # not a pure action clone from text alone.
+        self.use_population_belief_in_action_head = bool(getattr(args, "use_population_belief_in_action_head", False))
+        try:
+            self.population_belief_dim = int(
+                getattr(args, "population_belief_dim", getattr(getattr(args, "env_args", None), "population_belief_dim", 3))
+            )
+        except Exception:
+            self.population_belief_dim = 3
+        self.population_belief_dim = max(1, int(self.population_belief_dim))
+        self.population_belief_proj = None
+        self.population_belief_gate_logit = None
+        if self.use_population_belief_in_action_head:
+            # project z_t -> belief_dim, then fuse via gated residual addition
+            self.population_belief_proj = nn.Sequential(
+                nn.Linear(self.population_belief_dim, self.belief_dim),
+                nn.Tanh(),
+            )
+            # gate in (0,1); initialize near 0 so existing behavior isn't destroyed
+            self.population_belief_gate_logit = nn.Parameter(torch.tensor(-2.0, device=self.device))
         
         # 初始化 LLM 包装器
         self.llm_wrapper = ImprovedLLMWrapper(
@@ -305,6 +327,9 @@ class LLMTransformerAgent(nn.Module):
         # 社交媒体任务：允许外部覆盖采样参数（温度/重复惩罚）
         temperature: Optional[Any] = None,
         repetition_penalty: Optional[Any] = None,
+        # Optional conditioning signals (aligned to bs*n_agents rows)
+        population_belief: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
         """
         前向传播，生成动作概率、置信状态和提示嵌入。
@@ -329,6 +354,26 @@ class LLMTransformerAgent(nn.Module):
         local_q_value = belief_outputs['q_value'] # Q_i^t
         temp_logit = belief_outputs['temp_logit'] # 原始温度 logit
         penalty_logit = belief_outputs['penalty_logit'] # 原始惩罚 logit
+
+        # Optional: fuse population belief z_t into belief_state before discrete heads
+        # Note: BasicMAC will pass population_belief expanded to (bs*n_agents, K).
+        if self.use_population_belief_in_action_head and (self.population_belief_proj is not None) and (population_belief is not None):
+            try:
+                z = population_belief
+                if isinstance(z, torch.Tensor):
+                    z = z.to(self.device, dtype=belief_state.dtype)
+                    if z.ndim == 1:
+                        z = z.view(-1, 1)
+                    if z.ndim == 3 and z.shape[1] == 1:
+                        z = z.squeeze(1)
+                    if z.ndim == 2 and z.shape[1] != int(self.population_belief_dim):
+                        z = z.reshape(z.shape[0], int(self.population_belief_dim))
+                    if z.ndim == 2 and belief_state.ndim == 2 and z.shape[0] == belief_state.shape[0]:
+                        z_emb = self.population_belief_proj(z)
+                        gate = torch.sigmoid(self.population_belief_gate_logit) if self.population_belief_gate_logit is not None else 1.0
+                        belief_state = belief_state + gate * z_emb
+            except Exception:
+                pass
         
         # 覆盖采样参数：temperature / repetition_penalty
         # 优先级：显式 override > test_mode 固定值 > 网络输出
