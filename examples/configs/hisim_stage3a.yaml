@@ -57,7 +57,14 @@ use_nonparam_group_repr: true
 population_update_use_group_repr: true
 
 z_transition_loss_weight: 1.0
-z_transition_loss_type: "kl"
+# Dirichlet parameterization + full-chain E[z] (no sampling):
+# - head outputs alpha (>0)
+# - rollout/control always uses mean E[z] = alpha / sum(alpha)
+# - loss: KL( Dir(alpha_target) || Dir(alpha_pred) ), where alpha_target = alpha0_target * z_target + alpha_min
+population_update_parametrization: "dirichlet"
+dirichlet_alpha_min: 0.001
+dirichlet_alpha0_target: 10.0
+z_transition_loss_type: "dirichlet_kl"
 
 env: "huggingface_dataset_env"
 env_args:
@@ -76,6 +83,9 @@ env_args:
   n_actions: 1
   emit_belief_fields: true
   population_belief_dim: 3
+  # Infer effective pseudo-count alpha0_target from z_target distribution (no need to regenerate dataset)
+  infer_dirichlet_alpha0_from_z_target: true
+  infer_dirichlet_alpha0_max_den: 2000
   verbose_step_logging: false
 
 

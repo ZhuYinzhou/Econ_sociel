@@ -1180,7 +1180,7 @@ class HiSimSocialEnv(gym.Env):
             for ln in hs:
                 history.append(str(ln))
             history.append("")
-        else:
+            else:
             history = []
 
         task: List[str] = []

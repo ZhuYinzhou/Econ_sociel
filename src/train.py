@@ -23,6 +23,16 @@ from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
 from learners import REGISTRY as le_REGISTRY
 
+# Optional distributed support (torchrun/DDP)
+try:  # pragma: no cover
+    import torch.distributed as dist  # type: ignore
+    from torch.nn.parallel import DistributedDataParallel as DDP  # type: ignore
+    _HAS_DIST = True
+except Exception:  # pragma: no cover
+    dist = None  # type: ignore
+    DDP = None  # type: ignore
+    _HAS_DIST = False
+
 # YAML loader: prefer PyYAML; fallback to ruamel.yaml if PyYAML isn't available.
 try:
     import yaml  # type: ignore
@@ -52,6 +62,12 @@ def parse_args():
     parser.add_argument('--seed', type=int, help='Random seed')
     parser.add_argument('--env', type=str, help='Environment name')
     parser.add_argument('--load_model_path', type=str, help='Optional checkpoint directory to load (expects files saved by learner.save_models)')
+
+    # Distributed training (torchrun)
+    parser.add_argument('--distributed', action='store_true', help='Enable DistributedDataParallel (use with torchrun).')
+    parser.add_argument('--ddp_backend', type=str, default='nccl', help='DDP backend (nccl/gloo).')
+    parser.add_argument('--ddp_find_unused_params', action='store_true', help='DDP find_unused_parameters=True (safer, slower).')
+    parser.add_argument('--ddp_reduce_batch_by_world_size', action='store_true', help='In DDP, divide config.train.batch_size by world_size per rank (keeps global effective batch).')
     
     # wandb related parameters
     parser.add_argument('--use_wandb', action='store_true', help='Whether to use wandb for experiment logging')
@@ -127,6 +143,16 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
 
     if getattr(args, "load_model_path", None):
         config.load_model_path = str(args.load_model_path)
+
+    # Distributed options (torchrun/DDP)
+    if getattr(args, "distributed", None) is not None:
+        config.distributed = bool(args.distributed)
+    if getattr(args, "ddp_backend", None):
+        config.ddp_backend = str(args.ddp_backend)
+    if getattr(args, "ddp_find_unused_params", None) is not None:
+        config.ddp_find_unused_params = bool(args.ddp_find_unused_params)
+    if getattr(args, "ddp_reduce_batch_by_world_size", None) is not None:
+        config.ddp_reduce_batch_by_world_size = bool(args.ddp_reduce_batch_by_world_size)
     
     # Add wandb related configuration
     if not hasattr(config, 'wandb'):
@@ -144,6 +170,14 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
 
 def setup_experiment(config: SimpleNamespace):
     """Setup experiment environment and components"""
+    # --- detect distributed env early (so we can silence TB on non-zero ranks) ---
+    rank = int(os.environ.get("RANK", "0") or "0")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    dist_enabled = bool(getattr(config, "distributed", False)) or (world_size > 1)
+    if dist_enabled and (not _HAS_DIST):
+        raise RuntimeError("distributed=True but torch.distributed is not available in this environment.")
+
     # Respect config logging settings so TensorBoard points to the expected directory.
     log_dir = "logs"
     exp_name = None
@@ -155,6 +189,9 @@ def setup_experiment(config: SimpleNamespace):
             use_tb = bool(getattr(config.logging, "use_tensorboard", use_tb))
     except Exception:
         pass
+    # In DDP: only rank0 writes TensorBoard/metrics.jsonl to avoid duplicate event streams.
+    if dist_enabled and rank != 0:
+        use_tb = False
     logger = get_logger(log_dir=log_dir, experiment_name=exp_name, use_tensorboard=use_tb)
     logger.info("Setting up experiment environment...")
     
@@ -165,9 +202,16 @@ def setup_experiment(config: SimpleNamespace):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-    # Set device
+    # Set device (DDP uses LOCAL_RANK)
     use_cuda = hasattr(config, 'system') and hasattr(config.system, 'use_cuda') and config.system.use_cuda and torch.cuda.is_available()
     device_num = config.system.device_num if hasattr(config, 'system') and hasattr(config.system, 'device_num') else 0
+    if dist_enabled:
+        device_num = int(local_rank)
+        try:
+            if hasattr(config, "system"):
+                config.system.device_num = int(device_num)
+        except Exception:
+            pass
     device = torch.device(f"cuda:{device_num}" if use_cuda else "cpu")
     
     # Add device to config object for runner access
@@ -175,6 +219,19 @@ def setup_experiment(config: SimpleNamespace):
     
     if use_cuda:
         torch.cuda.set_device(device_num)
+
+    # Initialize process group (after device is set)
+    if dist_enabled:
+        try:
+            backend = str(getattr(config, "ddp_backend", "nccl") or "nccl")
+            if dist is not None and (not dist.is_initialized()):
+                dist.init_process_group(backend=backend, init_method="env://", rank=rank, world_size=world_size)
+            # expose for later logic (saving/batch scaling)
+            config.distributed_rank = int(rank)
+            config.distributed_local_rank = int(local_rank)
+            config.distributed_world_size = int(world_size)
+        except Exception as e:
+            raise RuntimeError(f"Failed to init distributed process group: {e}")
     
     # Initialize Runner
     runner = r_REGISTRY[config.runner](args=config, logger=logger)
@@ -237,6 +294,60 @@ def setup_experiment(config: SimpleNamespace):
         except Exception as e:
             logger.warning(f"Failed to move learner to CUDA: {e}")
 
+    # Wrap trainable modules with DDP (must happen AFTER cuda() and AFTER optional load_models()).
+    # Note: BasicMAC has DDP-safe wrappers for non-forward methods (generate_answer/save_models/etc).
+    if dist_enabled and use_cuda:
+        try:
+            # In several ECON stages we intentionally train only a subset of heads/parameters
+            # (e.g., Stage1/2 stance_head only; Stage3b action_type_head (+ optional z-fusion)),
+            # so "unused parameters" in a given forward/backward is expected.
+            # DDP requires find_unused_parameters=True in that case.
+            find_unused = bool(getattr(config, "ddp_find_unused_params", False))
+            if not find_unused:
+                if bool(getattr(config, "train_belief_supervised", False)) or bool(getattr(config, "train_action_imitation", False)):
+                    find_unused = True
+                    if rank == 0:
+                        logger.info("[DDP] Auto-enabled find_unused_parameters=True for partial-head supervised training (Stage1/2/3b).")
+
+            def _has_trainable_params(m: Any) -> bool:
+                try:
+                    return any(bool(p.requires_grad) for p in m.parameters())
+                except Exception:
+                    return False
+
+            # Wrap agent (only if it has trainable params)
+            if getattr(mac, "agent", None) is not None and DDP is not None:
+                if _has_trainable_params(mac.agent):
+                    mac.agent = DDP(mac.agent, device_ids=[device_num], output_device=device_num, find_unused_parameters=find_unused)
+                else:
+                    if rank == 0:
+                        logger.info("[DDP] Skipping DDP wrap for mac.agent: no trainable params (requires_grad=False).")
+
+            # Wrap belief_encoder ONLY if it has trainable params.
+            # In Stage1/2 you freeze BeliefEncoder, so DDP should be skipped to avoid PyTorch error.
+            if getattr(mac, "belief_encoder", None) is not None and DDP is not None:
+                if _has_trainable_params(mac.belief_encoder):
+                    mac.belief_encoder = DDP(
+                        mac.belief_encoder,
+                        device_ids=[device_num],
+                        output_device=device_num,
+                        find_unused_parameters=find_unused,
+                    )
+                else:
+                    if rank == 0:
+                        logger.info("[DDP] Skipping DDP wrap for mac.belief_encoder: frozen in this stage (0 trainable params).")
+
+            # Expose rank/world_size on runner for convenience
+            try:
+                runner.distributed_rank = int(rank)
+                runner.distributed_world_size = int(world_size)
+            except Exception:
+                pass
+            if rank == 0:
+                logger.info(f"Enabled DDP: world_size={world_size}, backend={getattr(config,'ddp_backend','nccl')}, find_unused={find_unused}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to wrap modules with DDP: {e}")
+
     # Optional: resume/load checkpoint
     load_path = str(getattr(config, "load_model_path", "") or "").strip()
     if load_path:
@@ -289,6 +400,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         "belief_sup_maxprob": deque(maxlen=moving_avg_window),
         "belief_sup_logit_abs_mean": deque(maxlen=moving_avg_window),
         "belief_sup_logit_std": deque(maxlen=moving_avg_window),
+        "belief_sup_p0_mean": deque(maxlen=moving_avg_window),
+        "belief_sup_p1_mean": deque(maxlen=moving_avg_window),
+        "belief_sup_p0_gt05_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_hard_pred0_frac": deque(maxlen=moving_avg_window),
+        "belief_sup_delta01_mean": deque(maxlen=moving_avg_window),
+        "belief_sup_marginal_gap0": deque(maxlen=moving_avg_window),
+        "belief_sup_marginal_gap1": deque(maxlen=moving_avg_window),
+        "belief_sup_z_gate": deque(maxlen=moving_avg_window),
         "belief_sup_pred0_frac": deque(maxlen=moving_avg_window),
         "belief_sup_pred1_frac": deque(maxlen=moving_avg_window),
         "belief_sup_pred2_frac": deque(maxlen=moving_avg_window),
@@ -309,6 +428,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         "belief_sup_maxprob": 0,
         "belief_sup_logit_abs_mean": 0,
         "belief_sup_logit_std": 0,
+        "belief_sup_p0_mean": 0,
+        "belief_sup_p1_mean": 0,
+        "belief_sup_p0_gt05_frac": 0,
+        "belief_sup_hard_pred0_frac": 0,
+        "belief_sup_delta01_mean": 0,
+        "belief_sup_marginal_gap0": 0,
+        "belief_sup_marginal_gap1": 0,
+        "belief_sup_z_gate": 0,
         "belief_sup_pred0_frac": 0,
         "belief_sup_pred1_frac": 0,
         "belief_sup_pred2_frac": 0,
@@ -342,6 +469,11 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     episode = 0
     t_env = 0
 
+    # Distributed info (rank0 handles side effects like saving/checkpointing/eval)
+    dist_rank = int(getattr(config, "distributed_rank", 0) or 0)
+    dist_world = int(getattr(config, "distributed_world_size", 1) or 1)
+    is_rank0 = (dist_rank == 0)
+
     # ===== Stage1/2: supervised mini-batch replay (critical for stability) =====
     # The runner returns an EpisodeBatch with batch_size_run (often 1). If we train on it directly,
     # supervised learning degenerates into single-sample SGD (effective_count ~= n_agents), which is
@@ -368,6 +500,21 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     supervised_buffer_size = max(supervised_batch_size, supervised_buffer_size)
     supervised_update_interval = max(1, supervised_update_interval)
     supervised_min_label1 = max(0, supervised_min_label1)
+
+    # In DDP: reduce per-rank batch_size so global effective batch stays the same (and per-GPU memory drops).
+    # Example: global batch_size=64, world_size=4 -> per-rank=16.
+    try:
+        reduce_bs_flag = getattr(config, "ddp_reduce_batch_by_world_size", None)
+        reduce_bs = True if reduce_bs_flag is None else bool(reduce_bs_flag)
+        if dist_world > 1 and reduce_bs:
+            per_rank = max(1, int(supervised_batch_size) // int(dist_world))
+            if per_rank < int(supervised_batch_size):
+                if is_rank0:
+                    logger.info(f"[DDP] train.batch_size(global)={supervised_batch_size} -> per-rank={per_rank} (world_size={dist_world})")
+                supervised_batch_size = int(per_rank)
+                supervised_buffer_size = max(supervised_batch_size, supervised_buffer_size)
+    except Exception:
+        pass
 
     def _concat_episode_batches(batches):
         if not batches:
@@ -435,6 +582,25 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         # Train learner
         if episode_batch is not None:
             if supervised_mode:
+                # IMPORTANT (OOM fix):
+                # EpisodeRunner builds EpisodeBatch tensors on args.device (CUDA in our runs).
+                # If we keep a replay of EpisodeBatch objects on GPU, GPU memory will grow roughly
+                # linearly with replay size until OOM (and DDP duplicates this on each rank).
+                # So we store replay batches on CPU, and move only the sampled mini-batch back to CUDA.
+                try:
+                    if hasattr(episode_batch, "to"):
+                        episode_batch = episode_batch.to(torch.device("cpu"))
+                        # Optional: pin CPU memory to speed up non_blocking CPU->GPU transfer of sampled mini-batches.
+                        # This improves throughput after moving replay to CPU.
+                        try:
+                            pin_flag = getattr(config, "supervised_replay_pin_memory", None)
+                            pin_replay = True if pin_flag is None else bool(pin_flag)
+                            if pin_replay and hasattr(episode_batch, "pin_memory"):
+                                episode_batch = episode_batch.pin_memory()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # Push into supervised replay (also extract gt_action label for stratified sampling)
                 gt_label = None
                 try:
@@ -476,6 +642,12 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         sampled_batches = [b for (_lab, b) in random.sample(supervised_replay, supervised_batch_size)]
                         label1_in_batch = float("nan")
                     mb = _concat_episode_batches(sampled_batches)
+                    # Move sampled mini-batch to the intended training device (per-rank CUDA in DDP).
+                    try:
+                        if mb is not None and hasattr(mb, "to"):
+                            mb = mb.to(device)
+                    except Exception:
+                        pass
                     train_stats = learner.train(mb, t_env, episode)
                     # annotate for visibility
                     if isinstance(train_stats, dict):
@@ -536,9 +708,19 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "belief_sup_maxprob",
                         "belief_sup_logit_abs_mean",
                         "belief_sup_logit_std",
+                        "belief_sup_p0_mean",
+                        "belief_sup_p1_mean",
+                        "belief_sup_p0_gt05_frac",
+                        "belief_sup_hard_pred0_frac",
+                        "belief_sup_delta01_mean",
+                        "belief_sup_marginal_gap0",
+                        "belief_sup_marginal_gap1",
+                        "belief_sup_z_gate",
                         "belief_sup_ce_w0",
                         "belief_sup_ce_w1",
                         "belief_sup_ce_w2",
+                        "belief_sup_ce_w3",
+                        "belief_sup_ce_w4",
                         "belief_sup_pred0_frac",
                         "belief_sup_pred1_frac",
                         "belief_sup_pred2_frac",
@@ -598,9 +780,19 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "belief_sup_maxprob",
                         "belief_sup_logit_abs_mean",
                         "belief_sup_logit_std",
+                        "belief_sup_p0_mean",
+                        "belief_sup_p1_mean",
+                        "belief_sup_p0_gt05_frac",
+                        "belief_sup_hard_pred0_frac",
+                        "belief_sup_delta01_mean",
+                        "belief_sup_marginal_gap0",
+                        "belief_sup_marginal_gap1",
+                        "belief_sup_z_gate",
                         "belief_sup_ce_w0",
                         "belief_sup_ce_w1",
                         "belief_sup_ce_w2",
+                        "belief_sup_ce_w3",
+                        "belief_sup_ce_w4",
                         "belief_sup_pred0_frac",
                         "belief_sup_pred1_frac",
                         "belief_sup_pred2_frac",
@@ -678,15 +870,15 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 if hasattr(config, 'wandb') and config.wandb.use_wandb:
                     log_to_wandb(train_stats, episode, 'train/')
             
-            # Save model periodically
-            if episode % save_model_interval == 0 and episode > 0:
+            # Save model periodically (rank0 only in DDP)
+            if is_rank0 and episode % save_model_interval == 0 and episode > 0:
                 save_path = Path(config.logging.checkpoint_path) / f"episode_{episode}"
                 save_path.mkdir(parents=True, exist_ok=True)
                 learner.save_models(str(save_path))
                 logger.info(f"Model saved at episode {episode}")
             
-            # Test periodically
-            if episode % test_interval == 0 and episode > 0:
+            # Test periodically (rank0 only in DDP)
+            if is_rank0 and episode % test_interval == 0 and episode > 0:
                 test_stats = run_test(runner, logger, config)
                 logger.info(f"Test results at episode {episode}:")
                 for key, value in test_stats.items():
@@ -724,6 +916,12 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "hf_eval_skipped_unsup",
                         "hf_eval_coverage",
                         "hf_eval_skipped_ratio",
+                        # Stage3b collapse / marginal sanity (K=5 action imitation)
+                        "action_pred_entropy",
+                        "action_pred_mode_frac",
+                        "action_pred_kl_gt",
+                        "action_unsup_pred_frac",
+                        "action_unsup_gt_frac",
                         # per-class stance metrics on eval split
                         "stance_gt0_frac",
                         "stance_gt1_frac",
@@ -755,6 +953,16 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     ):
                         if k in test_stats:
                             logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
+                    # Also log per-action marginals if present (Stage3b K=5)
+                    try:
+                        for k, v in test_stats.items():
+                            if not isinstance(k, str):
+                                continue
+                            if k.startswith("action_gt") or k.startswith("action_pred") or k.startswith("action_recall") or k.startswith("action_precision"):
+                                if isinstance(v, (int, float)) and (v == v):
+                                    logger.log_stat(f"test/{k}", float(v), t_env)
+                    except Exception:
+                        pass
                     # Stage3a per-stage buckets (dynamic keys)
                     try:
                         for k, v in test_stats.items():
@@ -783,9 +991,11 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         save_path = Path(final_dir)
     else:
         save_path = Path(config.logging.checkpoint_path) / "final"
-    save_path.mkdir(parents=True, exist_ok=True)
-    learner.save_models(str(save_path))
-    logger.info("Training completed. Final model saved.")
+    # Final save (rank0 only in DDP)
+    if is_rank0:
+        save_path.mkdir(parents=True, exist_ok=True)
+        learner.save_models(str(save_path))
+        logger.info("Training completed. Final model saved.")
     
     total_time = time.time() - begin_time
     logger.info(f"Total training time: {total_time:.2f} seconds")
@@ -932,15 +1142,36 @@ def run_test(runner, logger, config: SimpleNamespace):
 
                 # forward
                 with torch.no_grad():
-                    zpred_f = be.predict_next_population_belief(zt_f, group_repr=gr_f, stage_t=st_f, return_logits=False)
-
-                    # loss
-                    loss = be.compute_population_belief_loss(
-                        zpred_f,
-                        ztar_f,
-                        zm_f,
-                        loss_type=str(getattr(config, "z_transition_loss_type", "kl") or "kl"),
-                    )
+                    lt = str(getattr(config, "z_transition_loss_type", "kl") or "kl").strip().lower()
+                    if lt.startswith("dirichlet"):
+                        if not hasattr(be, "predict_next_population_belief_alpha"):
+                            raise RuntimeError("Stage3a eval: dirichlet requested but BeliefEncoder lacks predict_next_population_belief_alpha().")
+                        if not hasattr(be, "compute_population_belief_loss_dirichlet_kl"):
+                            raise RuntimeError("Stage3a eval: dirichlet requested but BeliefEncoder lacks compute_population_belief_loss_dirichlet_kl().")
+                        alpha_pred = be.predict_next_population_belief_alpha(zt_f, group_repr=gr_f, stage_t=st_f)
+                        zpred_f = be.population_belief_mean_from_alpha(alpha_pred)
+                        # Prefer per-sample inferred alpha0_target if present in batch (EpisodeRunner passthrough)
+                        a0_tgt = None
+                        try:
+                            if "z_alpha0_target" in episode_batch.scheme:
+                                a0_tgt = episode_batch["z_alpha0_target"][:, :-1].reshape(N).to(zt_f.device)
+                        except Exception:
+                            a0_tgt = None
+                        loss = be.compute_population_belief_loss_dirichlet_kl(
+                            alpha_pred,
+                            ztar_f,
+                            zm_f,
+                            alpha0_target=(a0_tgt if a0_tgt is not None else float(getattr(config, "dirichlet_alpha0_target", 10.0))),
+                        )
+                    else:
+                        zpred_f = be.predict_next_population_belief(zt_f, group_repr=gr_f, stage_t=st_f, return_logits=False)
+                        # loss
+                        loss = be.compute_population_belief_loss(
+                            zpred_f,
+                            ztar_f,
+                            zm_f,
+                            loss_type=lt,
+                        )
 
                     # KL baseline vs model
                     kl_tgt_zt = _kl_tgt_pred(ztar_f, zt_f)
@@ -1059,6 +1290,13 @@ def run_test(runner, logger, config: SimpleNamespace):
         hf_k = int(getattr(getattr(config, "env_args", SimpleNamespace()), "n_actions", getattr(config, "n_actions", 3)))
     except Exception:
         hf_k = 3
+    # Stage3b option: binary(0/1) imitation prior.
+    # Keep model/env head as K=5 for Stage4, but report eval metrics with K=2 since we only care about labels {0,1}.
+    try:
+        if bool(getattr(config, "train_action_imitation", False)) and bool(getattr(config, "action_imitation_binary_01", False)):
+            hf_k = 2
+    except Exception:
+        pass
     hf_k = max(1, hf_k)
     hf_gt_counts = [0 for _ in range(hf_k)]
     hf_pred_counts = [0 for _ in range(hf_k)]
@@ -1172,7 +1410,9 @@ def run_test(runner, logger, config: SimpleNamespace):
                 else:
                     # HuggingFaceDatasetEnv schema: treat each step as valid.
                     # If sup_ids is set, only evaluate those labels; others are treated as latent (skipped).
-                    gt = _parse_boxed_int(info.get("ground_truth_answer", "")) or _parse_boxed_int(info.get("ground_truth", ""))
+                    gt = _parse_boxed_int(info.get("ground_truth_answer", ""))
+                    if gt is None:
+                        gt = _parse_boxed_int(info.get("ground_truth", ""))
                     if sup_ids is not None and gt is not None and int(gt) not in sup_ids:
                         hf_eval_skipped_unsup += 1
                         continue
@@ -1332,6 +1572,46 @@ def run_test(runner, logger, config: SimpleNamespace):
             out[f"action_has_gt{i}"] = float(hf_has_gt[i]) if i < len(hf_has_gt) else 0.0
             out[f"action_has_pred{i}"] = float(hf_has_pred[i]) if i < len(hf_has_pred) else 0.0
 
+        # === Stage3b sanity metrics: detect collapse on UNSUP actions (when partial supervision is enabled) ===
+        try:
+            import math
+
+            eps = 1e-8
+            # entropy of predicted marginal distribution over actions
+            p = [float(x) for x in hf_pred_frac]
+            if all((x == x) for x in p) and len(p) > 0:
+                pp = [max(eps, x) for x in p]
+                s = float(sum(pp))
+                pp = [x / s for x in pp]
+                out["action_pred_entropy"] = float(-sum(x * math.log(x + eps) for x in pp))
+                out["action_pred_mode_frac"] = float(max(pp))
+
+            # compare pred marginal to gt marginal (KL)
+            q = [float(x) for x in hf_gt_frac]
+            if all((x == x) for x in p) and all((x == x) for x in q) and len(p) == len(q) and len(p) > 0:
+                pp = [max(eps, x) for x in p]
+                qq = [max(eps, x) for x in q]
+                sp = float(sum(pp))
+                sq = float(sum(qq))
+                pp = [x / sp for x in pp]
+                qq = [x / sq for x in qq]
+                out["action_pred_kl_gt"] = float(sum(pp[i] * (math.log(pp[i] + eps) - math.log(qq[i] + eps)) for i in range(len(pp))))
+
+            # unsupervised mass (only meaningful when action_imitation_supervised_action_ids is set)
+            sup_ids_cfg = None
+            try:
+                only_ids = getattr(config, "action_imitation_supervised_action_ids", None)
+                if isinstance(only_ids, (list, tuple)) and len(only_ids) > 0:
+                    sup_ids_cfg = set(int(x) for x in only_ids)
+            except Exception:
+                sup_ids_cfg = None
+            if isinstance(sup_ids_cfg, set) and len(sup_ids_cfg) > 0:
+                unsup = [i for i in range(hf_k) if i not in sup_ids_cfg]
+                out["action_unsup_pred_frac"] = float(sum(float(hf_pred_frac[i]) for i in unsup if i < len(hf_pred_frac)))
+                out["action_unsup_gt_frac"] = float(sum(float(hf_gt_frac[i]) for i in unsup if i < len(hf_gt_frac)))
+        except Exception:
+            pass
+
     return out
 
 def setup_wandb(config: SimpleNamespace, logger):
@@ -1391,6 +1671,13 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
+        # Clean up distributed process group (if any)
+        try:
+            if _HAS_DIST and dist is not None and dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+        except Exception:
+            pass
         # Clean up wandb
         if wandb is not None and wandb.run is not None:
             wandb.finish()

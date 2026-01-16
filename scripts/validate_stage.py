@@ -235,8 +235,12 @@ def _stage1_eval_confusion(cfg: Any, ckpt: str, eval_split: str, eval_episodes: 
         for info in infos:
             if not isinstance(info, dict):
                 continue
-            gt = _boxed_int(info.get("ground_truth_answer", "")) or _boxed_int(info.get("ground_truth", ""))
-            pr = _boxed_int(info.get("llm_answer", "")) or _boxed_int(info.get("answer", ""))
+            gt = _boxed_int(info.get("ground_truth_answer", ""))
+            if gt is None:
+                gt = _boxed_int(info.get("ground_truth", ""))
+            pr = _boxed_int(info.get("llm_answer", ""))
+            if pr is None:
+                pr = _boxed_int(info.get("answer", ""))
             if gt is None or pr is None:
                 continue
             if gt < 0 or gt >= k or pr < 0 or pr >= k:
@@ -320,11 +324,19 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     """
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
     from train import setup_experiment  # type: ignore
+    import numpy as np
 
     cfg2 = copy.deepcopy(cfg)
     try:
         if hasattr(cfg2, "env_args") and hasattr(cfg2.env_args, "dataset_split"):
             cfg2.env_args.dataset_split = str(eval_split)
+    except Exception:
+        pass
+    # Make evaluation deterministic/stable: disable random sampling over the HF dataset split.
+    # This avoids noisy preference_BCE estimates due to different sampled subsets across runs.
+    try:
+        if hasattr(cfg2, "env_args") and hasattr(cfg2.env_args, "use_random_sampling"):
+            cfg2.env_args.use_random_sampling = False
     except Exception:
         pass
     cfg2.load_model_path = str(ckpt)
@@ -344,6 +356,17 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         k = int(getattr(getattr(cfg2, "env_args", None), "n_actions", getattr(cfg2, "n_actions", 5)))
     except Exception:
         k = 5
+    # Stage3b option: binary(0/1) imitation prior.
+    try:
+        if bool(getattr(cfg2, "train_action_imitation", False)) and bool(getattr(cfg2, "action_imitation_binary_01", False)):
+            k = 2
+    except Exception:
+        pass
+    # Stage3b option: preference scorer (retweet vs post)
+    try:
+        s3b_preference_scorer = bool(getattr(cfg2, "s3b_preference_scorer", False))
+    except Exception:
+        s3b_preference_scorer = False
     k = max(1, k)
 
     # confusion for masked rows only (size k x k)
@@ -351,6 +374,21 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     total = 0
     correct = 0
     skipped_unsup = 0
+    # full marginal stats over ALL labels (including unsupervised ones)
+    gt_counts_all = [0 for _ in range(k)]
+    pred_counts_all = [0 for _ in range(k)]
+    invalid_pred = 0
+    # preference scorer metrics
+    pref_p1_targets = []
+    pref_p1_preds = []
+    # debug counters for preference scorer
+    dbg_pref = bool(getattr(cfg2, "debug_preference", False))
+    dbg_pref_total_infos = 0
+    dbg_pref_has_dist = 0
+    dbg_pref_denom_pos = 0
+    dbg_pref_has_bias = 0
+    dbg_pref_added = 0
+    dbg_pref_examples = []
 
     n_ep = max(1, int(eval_episodes))
     for _ in range(n_ep):
@@ -361,10 +399,91 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         for info in infos:
             if not isinstance(info, dict):
                 continue
-            gt = _boxed_int(info.get("ground_truth_answer", "")) or _boxed_int(info.get("ground_truth", ""))
-            pr = _boxed_int(info.get("llm_answer", "")) or _boxed_int(info.get("answer", ""))
+            if dbg_pref and s3b_preference_scorer:
+                dbg_pref_total_infos += 1
+            gt = _boxed_int(info.get("ground_truth_answer", ""))
+            if gt is None:
+                gt = _boxed_int(info.get("ground_truth", ""))
+            pr = _boxed_int(info.get("llm_answer", ""))
+            if pr is None:
+                pr = _boxed_int(info.get("answer", ""))
             if gt is None:
                 continue
+            # preference scorer: use target_distribution_prob if present
+            try:
+                if s3b_preference_scorer and isinstance(info, dict):
+                    dist = info.get("target_distribution_prob")
+                    if isinstance(dist, dict) and ("0" in dist or "1" in dist):
+                        if dbg_pref:
+                            dbg_pref_has_dist += 1
+                        p0 = float(dist.get("0", 0.0) or 0.0)
+                        p1 = float(dist.get("1", 0.0) or 0.0)
+                        denom = p0 + p1
+                        if denom > 0:
+                            if dbg_pref:
+                                dbg_pref_denom_pos += 1
+                            p1_t = p1 / denom
+                            # predicted p1 from bias logit (if provided)
+                            bl = info.get("pref_bias_logit", None)
+                            if bl is not None:
+                                if dbg_pref:
+                                    dbg_pref_has_bias += 1
+                                p1_pred = 1.0 / (1.0 + np.exp(-float(bl)))
+                                pref_p1_targets.append(p1_t)
+                                pref_p1_preds.append(float(p1_pred))
+                                if dbg_pref:
+                                    dbg_pref_added += 1
+                            else:
+                                if dbg_pref and len(dbg_pref_examples) < 5:
+                                    dbg_pref_examples.append(
+                                        {
+                                            "why": "missing_pref_bias_logit",
+                                            "gt": int(gt) if gt is not None else None,
+                                            "pr": int(pr) if pr is not None else None,
+                                            "target_distribution_prob": dist,
+                                            "has_pref_p0": ("pref_p0" in info),
+                                            "has_pref_p1": ("pref_p1" in info),
+                                            "keys": sorted(list(info.keys()))[:40],
+                                        }
+                                    )
+                        else:
+                            if dbg_pref and len(dbg_pref_examples) < 5:
+                                dbg_pref_examples.append(
+                                    {
+                                        "why": "p0_p1_denom_zero",
+                                        "gt": int(gt) if gt is not None else None,
+                                        "pr": int(pr) if pr is not None else None,
+                                        "target_distribution_prob": dist,
+                                        "keys": sorted(list(info.keys()))[:40],
+                                    }
+                                )
+                    else:
+                        if dbg_pref and len(dbg_pref_examples) < 5:
+                            dbg_pref_examples.append(
+                                {
+                                    "why": "missing_or_unexpected_target_distribution_prob",
+                                    "gt": int(gt) if gt is not None else None,
+                                    "pr": int(pr) if pr is not None else None,
+                                    "target_distribution_prob_type": str(type(dist)),
+                                    "target_distribution_prob": dist,
+                                    "keys": sorted(list(info.keys()))[:40],
+                                }
+                            )
+            except Exception:
+                pass
+            # full marginal counts (for collapse detection)
+            try:
+                if 0 <= int(gt) < k:
+                    gt_counts_all[int(gt)] += 1
+            except Exception:
+                pass
+            try:
+                if pr is not None and 0 <= int(pr) < k:
+                    pred_counts_all[int(pr)] += 1
+                elif pr is not None:
+                    invalid_pred += 1
+            except Exception:
+                pass
             if isinstance(sup_ids, set) and len(sup_ids) > 0 and int(gt) not in sup_ids:
                 skipped_unsup += 1
                 continue
@@ -393,6 +512,62 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     coverage = float(total) / denom if denom > 0 else 0.0
     skipped_ratio = float(skipped_unsup) / denom if denom > 0 else 0.0
 
+    # === Sanity metrics for collapse / marginals ===
+    # We compute marginal distributions over the whole eval split (including unsupervised labels).
+    try:
+        import numpy as np
+
+        gt = np.array(gt_counts_all, dtype=np.float64)
+        pr = np.array(pred_counts_all, dtype=np.float64)
+        gt_frac = (gt / max(1.0, float(gt.sum()))).tolist()
+        pr_frac = (pr / max(1.0, float(pr.sum()))).tolist()
+        ent_pred = _entropy_np(pr_frac)
+        ent_gt = _entropy_np(gt_frac)
+        kl_pred_gt = _kl_np(pr_frac, gt_frac)
+        mode_frac = float(np.max(pr / max(1.0, float(pr.sum())))) if float(pr.sum()) > 0 else 0.0
+
+        # In binary-01 mode (k=2), "unsup" fractions are not meaningful.
+        unsup_pred_frac = float("nan")
+        unsup_gt_frac = float("nan")
+        if k > 2:
+            unsup_ids = None
+            if isinstance(sup_ids, set) and len(sup_ids) > 0:
+                unsup_ids = [i for i in range(k) if i not in sup_ids]
+            unsup_pred_frac = float(sum(pr_frac[i] for i in (unsup_ids or []))) if unsup_ids else float("nan")
+            unsup_gt_frac = float(sum(gt_frac[i] for i in (unsup_ids or []))) if unsup_ids else float("nan")
+    except Exception:
+        gt_frac = None
+        pr_frac = None
+        ent_pred = float("nan")
+        ent_gt = float("nan")
+        kl_pred_gt = float("nan")
+        mode_frac = float("nan")
+        unsup_pred_frac = float("nan")
+        unsup_gt_frac = float("nan")
+
+    # preference scorer diagnostics (retweet vs post)
+    pref_bce = float("nan")
+    pref_bce_baseline = float("nan")
+    pref_corr = float("nan")
+    pref_margin = float("nan")
+    try:
+        if len(pref_p1_targets) > 0:
+            import numpy as np
+            t = np.array(pref_p1_targets, dtype=np.float64)
+            p = np.array(pref_p1_preds, dtype=np.float64)
+            eps = 1e-8
+            p = np.clip(p, eps, 1.0 - eps)
+            pref_bce = float(np.mean(-(t * np.log(p) + (1.0 - t) * np.log(1.0 - p))))
+            # baseline: constant mean(p1)
+            m = float(np.mean(t))
+            m = float(min(1.0 - eps, max(eps, m)))
+            pref_bce_baseline = float(np.mean(-(t * np.log(m) + (1.0 - t) * np.log(1.0 - m))))
+            pref_margin = float(pref_bce_baseline - pref_bce)
+            if t.size >= 2 and np.std(t) > 0 and np.std(p) > 0:
+                pref_corr = float(np.corrcoef(t, p)[0, 1])
+    except Exception:
+        pass
+
     return {
         "eval_acc_masked": float(acc),
         "majority_baseline_masked": float(maj),
@@ -404,6 +579,32 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         "confusion": conf,
         "k": int(k),
         "sup_ids": sorted(list(sup_ids)) if isinstance(sup_ids, set) else None,
+        # collapse/marginal sanity
+        "pred_counts_all": pred_counts_all,
+        "gt_counts_all": gt_counts_all,
+        "invalid_pred": int(invalid_pred),
+        "pred_frac_all": pr_frac,
+        "gt_frac_all": gt_frac,
+        "pred_entropy": float(ent_pred),
+        "gt_entropy": float(ent_gt),
+        "pred_kl_gt": float(kl_pred_gt),
+        "pred_mode_frac": float(mode_frac),
+        "unsup_pred_frac": float(unsup_pred_frac),
+        "unsup_gt_frac": float(unsup_gt_frac),
+        "s3b_preference_scorer": bool(s3b_preference_scorer),
+        "pref_n": int(len(pref_p1_targets)),
+        "pref_bce": float(pref_bce),
+        "pref_bce_baseline": float(pref_bce_baseline),
+        "pref_bce_margin": float(pref_margin),
+        "pref_corr": float(pref_corr),
+        # debug: why pref_n is 0
+        "debug_preference": bool(dbg_pref),
+        "debug_pref_total_infos": int(dbg_pref_total_infos),
+        "debug_pref_has_dist": int(dbg_pref_has_dist),
+        "debug_pref_denom_pos": int(dbg_pref_denom_pos),
+        "debug_pref_has_bias": int(dbg_pref_has_bias),
+        "debug_pref_added": int(dbg_pref_added),
+        "debug_pref_examples": dbg_pref_examples,
     }
 
 
@@ -432,7 +633,7 @@ def _kl_np(p, q, eps: float = 1e-8) -> float:
     return float(np.sum(pp * (np.log(pp) - np.log(qq))))
 
 
-def _policy_stats_from_runner(runner: Any, batch: Any) -> Optional[Dict[str, Any]]:
+def _policy_stats_from_runner(runner: Any, batch: Any, *, k_override: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Compute policy distribution stats from the current runner/batch at t=0:
     - mean action distribution over agents (softmax of action_type_q_values if available)
@@ -457,6 +658,11 @@ def _policy_stats_from_runner(runner: Any, batch: Any) -> Optional[Dict[str, Any
             logits = outs_np
         else:
             return None
+        try:
+            if isinstance(k_override, int) and k_override > 0 and logits.shape[-1] >= int(k_override):
+                logits = logits[:, : int(k_override)]
+        except Exception:
+            pass
         p_agents = _safe_softmax_np(logits, axis=-1)
         p_mean = np.mean(p_agents, axis=0)  # (n_actions,)
         return {
@@ -485,6 +691,13 @@ def _stage3b_compare_z_ablations(cfg: Any, ckpt: str, eval_split: str, eval_epis
 
     modes = ["none", "zero", "shuffle"]
     out_by_mode: Dict[str, Any] = {}
+    # binary(0/1) prior: compare action distribution only over first 2 classes
+    k_override = None
+    try:
+        if bool(getattr(cfg, "train_action_imitation", False)) and bool(getattr(cfg, "action_imitation_binary_01", False)):
+            k_override = 2
+    except Exception:
+        k_override = None
     for m in modes:
         cfg2 = copy.deepcopy(cfg)
         try:
@@ -502,7 +715,7 @@ def _stage3b_compare_z_ablations(cfg: Any, ckpt: str, eval_split: str, eval_epis
         n_ok = 0
         for _ in range(max(1, int(eval_episodes))):
             batch = runner.run(test_mode=True)
-            st = _policy_stats_from_runner(runner, batch)
+            st = _policy_stats_from_runner(runner, batch, k_override=k_override)
             if not isinstance(st, dict):
                 continue
             p = st.get("p_mean")
@@ -693,6 +906,10 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     sum_kl_nogr = 0.0
     sum_kl_randstage = 0.0
     sum_kl_shiftstage = 0.0
+    sum_alpha0 = 0.0
+    sum_alpha0_tgt = 0.0
+    sum_dir_ent = 0.0
+    sum_dir_varsum = 0.0
     # fixed-stage probes help diagnose "stage embeddings for late stages are untrained/misaligned"
     fixed_stage_ids = list(getattr(cfg2, "stage3a_fixed_stages", [11, 12]) or [11, 12])
     fixed_stage_ids = [int(x) for x in fixed_stage_ids if str(x).strip() != ""]
@@ -703,6 +920,7 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     stage_sum_dz_tgt: Dict[int, float] = {}
 
     n_ep = max(1, int(eval_episodes))
+    lt = str(getattr(cfg2, "z_transition_loss_type", "kl") or "kl").strip().lower()
     for _ in range(n_ep):
         batch = runner.run(test_mode=True)
         if batch is None:
@@ -729,14 +947,55 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
         denom = float(zm.sum().item())
         if denom <= 0:
             continue
+        # optional per-sample alpha0_target inferred by env/dataset
+        a0_tgt = None
+        try:
+            if "z_alpha0_target" in batch.scheme:
+                a0_tgt = batch["z_alpha0_target"][:, :-1].reshape(N).to(device)
+                a0_tgt = a0_tgt.to(dtype=torch.float32)
+        except Exception:
+            a0_tgt = None
         grf = gr.reshape(N, -1) if gr is not None else None
         stf = stage_t.reshape(N, -1) if stage_t is not None else None
 
         with torch.no_grad():
-            zpred = be.predict_next_population_belief(zt, group_repr=grf, stage_t=stf, return_logits=False)
-            loss = be.compute_population_belief_loss(
-                zpred, ztar, zm, loss_type=str(getattr(cfg2, "z_transition_loss_type", "kl") or "kl")
-            )
+            if lt.startswith("dirichlet"):
+                if not hasattr(be, "predict_next_population_belief_alpha"):
+                    raise RuntimeError("validate_stage stage3a: dirichlet requested but BeliefEncoder lacks predict_next_population_belief_alpha().")
+                if not hasattr(be, "compute_population_belief_loss_dirichlet_kl"):
+                    raise RuntimeError("validate_stage stage3a: dirichlet requested but BeliefEncoder lacks compute_population_belief_loss_dirichlet_kl().")
+                alpha_pred = be.predict_next_population_belief_alpha(zt, group_repr=grf, stage_t=stf)
+                zpred = be.population_belief_mean_from_alpha(alpha_pred)
+                loss = be.compute_population_belief_loss_dirichlet_kl(
+                    alpha_pred,
+                    ztar,
+                    zm,
+                    alpha0_target=(a0_tgt if a0_tgt is not None else float(getattr(cfg2, "dirichlet_alpha0_target", 10.0))),
+                )
+                try:
+                    a0 = alpha_pred.sum(dim=-1)
+                    sum_alpha0 += float((a0 * zm).sum().item())
+                    if a0_tgt is not None:
+                        sum_alpha0_tgt += float((a0_tgt.reshape(-1) * zm).sum().item())
+                    # Dirichlet uncertainty stats
+                    try:
+                        k_dir = int(alpha_pred.shape[-1])
+                        ap = torch.clamp(alpha_pred, min=float(getattr(be, "dirichlet_alpha_min", 1e-6)))
+                        ap0 = torch.clamp(ap.sum(dim=-1), min=1e-6)
+                        logB = torch.sum(torch.lgamma(ap), dim=-1) - torch.lgamma(ap0)
+                        ent = logB + (ap0 - float(k_dir)) * torch.digamma(ap0) - torch.sum((ap - 1.0) * torch.digamma(ap), dim=-1)
+                        sum_dir_ent += float((ent * zm).sum().item())
+                        ap0u = ap0.unsqueeze(-1)
+                        var = (ap * (ap0u - ap)) / (ap0u * ap0u * (ap0u + 1.0))
+                        var_sum = var.sum(dim=-1)
+                        sum_dir_varsum += float((var_sum * zm).sum().item())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            else:
+                zpred = be.predict_next_population_belief(zt, group_repr=grf, stage_t=stf, return_logits=False)
+                loss = be.compute_population_belief_loss(zpred, ztar, zm, loss_type=lt)
             kl_zt = _kl_tgt_pred(ztar, zt)
             kl_zp = _kl_tgt_pred(ztar, zpred)
 
@@ -839,6 +1098,14 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     out["eval_kl_target_zpred_nogr"] = float(sum_kl_nogr / sum_mask) if sum_kl_nogr > 0 else 0.0
     out["eval_kl_target_zpred_randstage"] = float(sum_kl_randstage / sum_mask) if sum_kl_randstage > 0 else 0.0
     out["eval_kl_target_zpred_shiftstage"] = float(sum_kl_shiftstage / sum_mask) if sum_kl_shiftstage > 0 else 0.0
+    if lt.startswith("dirichlet") and sum_alpha0 > 0:
+        out["eval_z_pred_alpha0_mean"] = float(sum_alpha0 / sum_mask)
+        if sum_alpha0_tgt > 0:
+            out["eval_z_target_alpha0_mean"] = float(sum_alpha0_tgt / sum_mask)
+        if sum_dir_ent > 0:
+            out["eval_z_pred_dirichlet_entropy"] = float(sum_dir_ent / sum_mask)
+        if sum_dir_varsum > 0:
+            out["eval_z_pred_dirichlet_varsum"] = float(sum_dir_varsum / sum_mask)
     for sid in fixed_stage_ids:
         s = int(sid)
         v = float(fixed_stage_sums.get(s, 0.0))
@@ -1015,6 +1282,22 @@ def main() -> int:
     ap.add_argument("--eval_episodes", type=int, default=200)
     ap.add_argument("--min_margin", type=float, default=0.05, help="Stage1: required margin over majority baseline.")
     ap.add_argument(
+        "--pref_min_margin",
+        type=float,
+        default=0.005,
+        help="Stage3b(preference scorer): required margin in (baseline_BCE - model_BCE). Default is small because BCE improvements are subtle.",
+    )
+    ap.add_argument(
+        "--stage3b_eval_sampling",
+        action="store_true",
+        help="Stage3b: evaluate with sampling (do not force argmax); useful to inspect sampling behavior.",
+    )
+    ap.add_argument(
+        "--debug_preference",
+        action="store_true",
+        help="Stage3b: preference scorer debug. Print why preference_eval_n could be zero (missing dist/bias logit).",
+    )
+    ap.add_argument(
         "--compare_z",
         action="store_true",
         help="Sanity check: compare z_t usage by running the SAME ckpt with z_ablation_mode in {none,zero,shuffle}. "
@@ -1034,6 +1317,11 @@ def main() -> int:
     from train import load_config  # type: ignore
 
     cfg = load_config(str(args.config))
+    # pass debug flags through cfg (used by stage3b eval)
+    try:
+        cfg.debug_preference = bool(getattr(args, "debug_preference", False))
+    except Exception:
+        pass
     # Stage3a diagnostic probe stages (passed via cfg for simplicity)
     try:
         fixed = [int(x) for x in str(args.stage3a_fixed_stages).split(",") if str(x).strip() != ""]
@@ -1130,6 +1418,18 @@ def main() -> int:
         return 0 if ok else 2
 
     if args.mode == "stage3b":
+        # For validation, default to deterministic boxed action selection to avoid sampling noise.
+        # You can opt-in to sampling via --stage3b_eval_sampling.
+        try:
+            if bool(getattr(args, "stage3b_eval_sampling", False)):
+                # keep config as-is (sampling)
+                pass
+            else:
+                cfg.s3b_boxed_action_selection = "argmax"
+                cfg.s3b_boxed_action_temperature = 1.0
+                cfg.s3b_boxed_action_epsilon = 0.0
+        except Exception:
+            pass
         _ckpt_must_have(str(args.ckpt), ["agent.th"])
         if bool(getattr(args, "compare_z", False)):
             outz = _stage3b_compare_z_ablations(cfg, str(args.ckpt), str(args.eval_split), int(args.eval_episodes), shuffle_seed=int(args.z_shuffle_seed))
@@ -1149,15 +1449,60 @@ def main() -> int:
         print("")
         print("=== Stage3b(action imitation) eval ===")
         print(f"- eval_split: {args.eval_split}")
+        if bool(getattr(args, "stage3b_eval_sampling", False)):
+            print("- boxed_action_selection: sampling (from config)")
+        else:
+            print("- boxed_action_selection: argmax (forced for stable eval)")
+        print("- boxed_action_selection: argmax (forced for stable eval)")
         if out.get("sup_ids") is not None:
             print(f"- masked_supervised_ids: {out.get('sup_ids')}")
         print(f"- eval_acc_masked: {out['eval_acc_masked']:.4f}")
         print(f"- majority_baseline_masked: {out['majority_baseline_masked']:.4f}")
         print(f"- margin: {out['margin']:+.4f}")
+        if bool(out.get("s3b_preference_scorer", False)):
+            print(f"- preference_eval_n: {int(out.get('pref_n', 0))}")
+            print(f"- preference_bce: {float(out.get('pref_bce', float('nan'))):.6f}")
+            print(f"- preference_bce_baseline: {float(out.get('pref_bce_baseline', float('nan'))):.6f}")
+            print(f"- preference_bce_margin(baseline - model): {float(out.get('pref_bce_margin', float('nan'))):+.6f}")
+            print(f"- preference_corr: {float(out.get('pref_corr', float('nan'))):.4f}")
+            if bool(out.get("debug_preference", False)):
+                print(f"- [debug] total_env_infos: {int(out.get('debug_pref_total_infos', 0))}")
+                print(f"- [debug] has_target_dist_dict: {int(out.get('debug_pref_has_dist', 0))}")
+                print(f"- [debug] p0+p1>0: {int(out.get('debug_pref_denom_pos', 0))}")
+                print(f"- [debug] has_pref_bias_logit: {int(out.get('debug_pref_has_bias', 0))}")
+                print(f"- [debug] pref_pairs_added: {int(out.get('debug_pref_added', 0))}")
+                exs = out.get("debug_pref_examples", None)
+                if isinstance(exs, list) and len(exs) > 0:
+                    print(f"- [debug] examples(first {min(5, len(exs))}):")
+                    for ex in exs[:5]:
+                        try:
+                            why = ex.get('why')
+                            keys = ex.get('keys')
+                            print(f"  - why={why} keys={keys}")
+                            if 'target_distribution_prob' in ex:
+                                print(f"    target_distribution_prob={ex.get('target_distribution_prob')}")
+                            if 'target_distribution_prob_type' in ex:
+                                print(f"    target_distribution_prob_type={ex.get('target_distribution_prob_type')}")
+                        except Exception:
+                            pass
         print(f"- n_masked: {out['n_masked']}")
         print(f"- n_skipped_unsup: {out['n_skipped_unsup']}")
         print(f"- coverage: {out['coverage']:.4f}")
         print(f"- skipped_ratio: {out['skipped_ratio']:.4f}")
+        # Collapse sanity (marginal distribution over ALL labels, including unsupervised)
+        try:
+            if out.get("pred_entropy") == out.get("pred_entropy"):
+                print(f"- pred_entropy(all labels): {float(out.get('pred_entropy',0.0)):.6f}")
+            if out.get("pred_mode_frac") == out.get("pred_mode_frac"):
+                print(f"- pred_mode_frac(all labels): {float(out.get('pred_mode_frac',0.0)):.6f}")
+            if out.get("pred_kl_gt") == out.get("pred_kl_gt"):
+                print(f"- KL(pred_marginal || gt_marginal): {float(out.get('pred_kl_gt',0.0)):.6f}")
+            if out.get("unsup_pred_frac") == out.get("unsup_pred_frac"):
+                print(f"- unsup_pred_frac(sum over unsup labels): {float(out.get('unsup_pred_frac',0.0)):.6f}")
+            if out.get("unsup_gt_frac") == out.get("unsup_gt_frac"):
+                print(f"- unsup_gt_frac(sum over unsup labels): {float(out.get('unsup_gt_frac',0.0)):.6f}")
+        except Exception:
+            pass
         print("")
         print("Confusion matrix (rows=GT, cols=Pred) over MASKED rows:")
         conf = out["confusion"]
@@ -1167,15 +1512,39 @@ def main() -> int:
             print("  " + " ".join([f"{int(x):6d}" for x in row[: min(k, 5)]]))
 
         ok = True
-        # Minimal gate: masked acc should beat masked majority + margin, and coverage should not be 0.
-        if float(out["n_masked"]) <= 0:
-            ok = False
-            print("\n[FAIL] Stage3b: masked eval has zero labeled samples. Check supervised ids / dataset.")
-        elif float(out["eval_acc_masked"]) < (float(out["majority_baseline_masked"]) + float(args.min_margin)):
-            ok = False
-            print("\n[FAIL] Stage3b: eval_acc_masked < majority_baseline_masked + margin.")
+        # Gate depends on whether S3b is a classifier or preference scorer.
+        if bool(out.get("s3b_preference_scorer", False)):
+            if float(out.get("pref_n", 0)) <= 0:
+                ok = False
+                print("\n[FAIL] Stage3b: preference eval has zero valid samples (missing target_distribution_prob?).")
+            else:
+                # prefer lower BCE than baseline by a margin
+                try:
+                    bce = float(out.get("pref_bce", float("nan")))
+                    bce_base = float(out.get("pref_bce_baseline", float("nan")))
+                    if not (bce == bce and bce_base == bce_base):
+                        ok = False
+                        print("\n[FAIL] Stage3b: preference BCE is NaN.")
+                    elif bce > (bce_base - float(getattr(args, "pref_min_margin", args.min_margin))):
+                        ok = False
+                        need = float(getattr(args, "pref_min_margin", args.min_margin))
+                        print(f"\n[FAIL] Stage3b: preference BCE not better than baseline by margin={need:.6f}.")
+                    else:
+                        need = float(getattr(args, "pref_min_margin", args.min_margin))
+                        print(f"\n[PASS] Stage3b: preference BCE beats baseline by margin={need:.6f}.")
+                except Exception:
+                    ok = False
+                    print("\n[FAIL] Stage3b: preference BCE evaluation error.")
         else:
-            print("\n[PASS] Stage3b: masked accuracy 达到 majority baseline + margin。")
+            # Minimal gate: masked acc should beat masked majority + margin, and coverage should not be 0.
+            if float(out["n_masked"]) <= 0:
+                ok = False
+                print("\n[FAIL] Stage3b: masked eval has zero labeled samples. Check supervised ids / dataset.")
+            elif float(out["eval_acc_masked"]) < (float(out["majority_baseline_masked"]) + float(args.min_margin)):
+                ok = False
+                print("\n[FAIL] Stage3b: eval_acc_masked < majority_baseline_masked + margin.")
+            else:
+                print("\n[PASS] Stage3b: masked accuracy 达到 majority baseline + margin。")
         return 0 if ok else 4
 
     if args.mode == "stage4":
@@ -1251,6 +1620,11 @@ def main() -> int:
         "eval_z_pred_maxprob",
         "eval_z_pred_minus_z_t_l2",
         "eval_z_target_minus_z_t_l2",
+        # Dirichlet-specific (may be absent if loss_type is not dirichlet_* or ckpt doesn't support it)
+        "eval_z_target_alpha0_mean",
+        "eval_z_pred_alpha0_mean",
+        "eval_z_pred_dirichlet_entropy",
+        "eval_z_pred_dirichlet_varsum",
         "eval_kl_target_zpred_nostage",
         "eval_kl_target_zpred_randstage",
         "eval_kl_target_zpred_shiftstage",

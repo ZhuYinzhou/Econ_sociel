@@ -104,6 +104,9 @@ class LLMBasicMAC:
             population_update_hidden_dim=getattr(args, "population_update_hidden_dim", 128),
             population_update_use_group_repr=getattr(args, "population_update_use_group_repr", True),
             population_update_use_stage=getattr(args, "population_update_use_stage", False),
+            # --- z dynamics parametrization ---
+            population_update_parametrization=getattr(args, "population_update_parametrization", "categorical"),
+            dirichlet_alpha_min=getattr(args, "dirichlet_alpha_min", 1e-3),
             population_update_use_extra_cond=getattr(args, "population_update_use_extra_cond", False),
             population_update_extra_cond_dim=getattr(args, "population_update_extra_cond_dim", 0),
             population_update_residual_mixing=getattr(args, "population_update_residual_mixing", True),
@@ -128,6 +131,21 @@ class LLMBasicMAC:
         
         # Initialize attention masks
         self.setup_attention_masks()
+
+    # ---- DDP helpers ----
+    # When using DistributedDataParallel, `self.agent` / `self.belief_encoder` may be wrapped,
+    # and non-forward methods (e.g., generate_answer / save_models / predict_next_population_b_tri) live on `.module`.
+    # These helpers make the rest of the code DDP-safe.
+    def _unwrap(self, m: Any) -> Any:
+        return getattr(m, "module", m)
+
+    @property
+    def agent_module(self) -> Any:
+        return self._unwrap(getattr(self, "agent", None))
+
+    @property
+    def belief_encoder_module(self) -> Any:
+        return self._unwrap(getattr(self, "belief_encoder", None))
         
     def preprocess_observation(self, observation_text: str, max_length: Optional[int] = None) -> torch.Tensor:
         """
@@ -346,19 +364,19 @@ class LLMBasicMAC:
                 if is_social:
                     # Be robust to agents that don't accept forced_* kwargs
                     try:
-                        response = self.agent.generate_answer(
+                        response = self.agent_module.generate_answer(
                             question=raw_observation_text,
                             strategy=strategy,
                             forced_action_type=forced_at,
                             forced_stance_id=forced_sid,
                         )
                     except TypeError:
-                        response = self.agent.generate_answer(
+                        response = self.agent_module.generate_answer(
                             question=raw_observation_text,
                             strategy=strategy,
                         )
                 else:
-                    response = self.agent.generate_answer(
+                    response = self.agent_module.generate_answer(
                         question=raw_observation_text,
                         strategy=strategy,
                     )
@@ -550,8 +568,9 @@ class LLMBasicMAC:
         secondary_z_next = None
         secondary_action_probs = None
         try:
-            if population_belief is not None and hasattr(self.belief_encoder, "predict_next_population_belief"):
-                secondary_z_next = self.belief_encoder.predict_next_population_belief(
+            be = self.belief_encoder_module
+            if population_belief is not None and be is not None and hasattr(be, "predict_next_population_belief"):
+                secondary_z_next = be.predict_next_population_belief(
                     population_belief,
                     group_repr=group_representation,
                     stage_t=stage_t,
@@ -562,8 +581,9 @@ class LLMBasicMAC:
             secondary_z_next = None
 
         try:
-            if population_belief is not None and getattr(self.belief_encoder, "secondary_action_head", None) is not None:
-                secondary_action_probs = self.belief_encoder.predict_secondary_action_probs(
+            be = self.belief_encoder_module
+            if population_belief is not None and be is not None and getattr(be, "secondary_action_head", None) is not None:
+                secondary_action_probs = be.predict_secondary_action_probs(
                     z_t=population_belief,
                     group_repr=group_representation,
                     stage_t=stage_t,
@@ -878,13 +898,15 @@ Final Answer (max 50 tokens):"""
         """
         sd: Dict[str, Any] = {}
         try:
-            if getattr(self, "agent", None) is not None and hasattr(self.agent, "state_dict"):
-                sd["agent"] = self.agent.state_dict()
+            am = self.agent_module
+            if am is not None and hasattr(am, "state_dict"):
+                sd["agent"] = am.state_dict()
         except Exception as e:
             logger.warning(f"Failed to get agent state_dict: {e}")
         try:
-            if getattr(self, "belief_encoder", None) is not None and hasattr(self.belief_encoder, "state_dict"):
-                sd["belief_encoder"] = self.belief_encoder.state_dict()
+            bm = self.belief_encoder_module
+            if bm is not None and hasattr(bm, "state_dict"):
+                sd["belief_encoder"] = bm.state_dict()
         except Exception as e:
             logger.warning(f"Failed to get belief_encoder state_dict: {e}")
         return sd
@@ -893,42 +915,46 @@ Final Answer (max 50 tokens):"""
         """Load state produced by state_dict()."""
         if not isinstance(state_dict, dict):
             raise TypeError(f"LLMBasicMAC.load_state_dict expects dict, got: {type(state_dict)}")
-        if "agent" in state_dict and getattr(self, "agent", None) is not None and hasattr(self.agent, "load_state_dict"):
+        if "agent" in state_dict and self.agent_module is not None and hasattr(self.agent_module, "load_state_dict"):
             try:
-                self.agent.load_state_dict(state_dict["agent"], strict=strict)
+                self.agent_module.load_state_dict(state_dict["agent"], strict=strict)
             except TypeError:
                 # some modules don't support strict kw
-                self.agent.load_state_dict(state_dict["agent"])
-        if "belief_encoder" in state_dict and getattr(self, "belief_encoder", None) is not None and hasattr(self.belief_encoder, "load_state_dict"):
+                self.agent_module.load_state_dict(state_dict["agent"])
+        if "belief_encoder" in state_dict and self.belief_encoder_module is not None and hasattr(self.belief_encoder_module, "load_state_dict"):
             try:
-                self.belief_encoder.load_state_dict(state_dict["belief_encoder"], strict=strict)
+                self.belief_encoder_module.load_state_dict(state_dict["belief_encoder"], strict=strict)
             except TypeError:
-                self.belief_encoder.load_state_dict(state_dict["belief_encoder"])
+                self.belief_encoder_module.load_state_dict(state_dict["belief_encoder"])
         return self
 
     def save_models(self, path: str):
         """Save all model components."""
-        self.agent.save_models(path)
+        # If agent is DDP-wrapped, save underlying module weights.
+        self.agent_module.save_models(path)
         # Save BeliefEncoder (critical for HiSim: includes population_update_head for z_transition)
         try:
-            if getattr(self, "belief_encoder", None) is not None:
-                torch.save(self.belief_encoder.state_dict(), f"{path}/belief_encoder.th")
+            bm = self.belief_encoder_module
+            if bm is not None:
+                torch.save(bm.state_dict(), f"{path}/belief_encoder.th")
         except Exception as e:
             logger.warning(f"Failed to save belief_encoder: {e}")
         # Note: coordinator / commitment_embedder are stateless wrappers around external APIs.
 
     def load_models(self, path: str):
         """Load all model components."""
-        self.agent.load_models(path)
+        # If agent is DDP-wrapped, load into underlying module.
+        self.agent_module.load_models(path)
         # Load BeliefEncoder if present
         try:
             import os
 
             p = f"{path}/belief_encoder.th"
-            if getattr(self, "belief_encoder", None) is not None and os.path.exists(p):
+            bm = self.belief_encoder_module
+            if bm is not None and os.path.exists(p):
                 sd = torch.load(p, map_location=lambda storage, loc: storage)
                 try:
-                    self.belief_encoder.load_state_dict(sd, strict=True)
+                    bm.load_state_dict(sd, strict=True)
                 except Exception as e_strict:
                     logger.warning(f"Strict load for belief_encoder failed ({e_strict}); retrying strict=False")
                     # NOTE:
@@ -936,7 +962,7 @@ Final Answer (max 50 tokens):"""
                     # - Stage3a enables population_update_use_stage => adds stage_embed and changes population_update_head input dim
                     # We therefore do a "shape-filtered" partial load: keep only keys that exist and match shapes.
                     try:
-                        cur = self.belief_encoder.state_dict()
+                        cur = bm.state_dict()
                         filtered = {}
                         skipped_mismatch = 0
                         skipped_missing = 0
@@ -952,7 +978,7 @@ Final Answer (max 50 tokens):"""
                                 skipped_mismatch += 1
                                 continue
                             filtered[k] = v
-                        missing, unexpected = self.belief_encoder.load_state_dict(filtered, strict=False)
+                        missing, unexpected = bm.load_state_dict(filtered, strict=False)
                         logger.warning(
                             "BeliefEncoder partial-load (shape-filtered) applied: "
                             f"kept={len(filtered)}/{len(sd)}, skipped_missing={skipped_missing}, skipped_mismatch={skipped_mismatch}. "
@@ -960,7 +986,7 @@ Final Answer (max 50 tokens):"""
                         )
                     except Exception as e_partial:
                         logger.warning(f"BeliefEncoder partial-load failed ({e_partial}); retrying strict=False without filtering.")
-                        self.belief_encoder.load_state_dict(sd, strict=False)
+                        bm.load_state_dict(sd, strict=False)
         except Exception as e:
             logger.warning(f"Failed to load belief_encoder: {e}")
         # Additional loading logic for other components if needed

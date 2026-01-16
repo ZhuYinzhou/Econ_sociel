@@ -77,6 +77,19 @@ env_args:
   mask_missing_gt: true
   min_edge_labels_for_z_target: 200
 
+# === S3b prior bias injection (optional) ===
+# Treat S3b as a "preference scorer" and inject its bias into RL logits.
+# bias = g_s3b(state); logits[RETWEET]+=alpha*bias, logits[POST]-=alpha*bias
+s3b_bias_enabled: true
+s3b_bias_mode: "diff01"
+s3b_bias_alpha: 1.0
+s3b_bias_alpha_trainable: true
+# Constrain alpha to be non-negative and optionally bounded (alpha = exp(beta))
+s3b_bias_alpha_max: 5.0
+# Gate bias injection by stance-head confidence (only inject when stance is confident)
+s3b_bias_gate_by_stance: true
+s3b_bias_stance_min_conf: 0.6
+
 # Curriculum: gradually increase number of stages once training is stable
 curriculum:
   enabled: true

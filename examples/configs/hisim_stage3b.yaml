@@ -13,7 +13,7 @@ load_model_path: ""
 
 t_max: 50000
 test_interval: 2000
-test_nepisode: 2000
+test_nepisode: 1000
 eval_dataset_split: "test"
 
 n_agents: 3
@@ -35,17 +35,44 @@ llm_model_name: "gpt2"
 train_belief_supervised: true
 supervised_metric_prefix: "action_sup"
 use_mixer: false
-belief_supervised_use_soft_labels: false
-belief_supervised_micro_batch_size: 4
+belief_supervised_use_soft_labels: true
+# Soft-label stability: mix soft distribution with hard label (1.0 = pure soft, 0.0 = pure hard)
+# Use a conservative mix to avoid instability observed before.
+belief_supervised_soft_label_mix: 0.4
+# Fallback when gt_action_dist is missing/empty: apply label smoothing on hard label
+# (kept small to avoid destabilizing training)
+belief_supervised_label_smoothing: 0.08
+belief_supervised_micro_batch_size: 128
+# Avoid argmax-based training metrics (pred*_frac/precision/recall) which can flip-flop near the decision boundary.
+# Loss remains standard CE; we only change what we log to TensorBoard.
+belief_supervised_metrics_use_argmax: false
+# Optional: class weights for imbalanced action imitation (K=5).
+# Example: if supervised subset {0,1} has gt0_frac≈0.12, gt1_frac≈0.88, set w0≈0.88/0.12≈7.3.
+# (Other classes are masked out by supervised_action_ids in S3b, but we keep K=5 for consistency.)
+# NOTE: 为了先稳定训练，避免决策边界在 0/1 两侧来回翻转（test/action_recall0 反复掉到 0），
+# 这里用更温和的 w0；后续如果 recall0 长期偏低再逐步上调。
+belief_supervised_class_weights: [2.2, 1.0, 1.0, 1.0, 1.0]
 
 # Freeze belief modules; train only action_type_head (implemented in q_learner via train_action_imitation)
 freeze_belief_encoder_in_supervised: true
 train_action_imitation: true
+# Stage3b objective: only learn a binary prior over action ids {0,1}.
+# The model head remains 5-way for Stage4; S3b loss/metrics only use logits[:2].
+action_imitation_binary_01: true
+# Treat S3b as a preference scorer (retweet vs post) rather than a hard classifier.
+s3b_preference_scorer: true
 
 # Make S3b action imitation conditioned on secondary-population latent state z_t (learned in S3a / provided by dataset).
 # This requires the dataset samples to contain `z_t` (list[3]) so HuggingFaceDatasetEnv can emit belief_inputs_pre.
 use_population_belief_in_action_head: true
 population_belief_dim: 3
+# Keep z_t as input but reduce shortcut reliance (train-time only).
+# - drop_prob: randomly zero-out some z rows
+# - shuffle_prob: randomly permute z rows in batch (break correlation)
+# NOTE: 初期 z-regularization 过强会导致信息不足，模型更容易退化成“全猜 1/全猜 0”的先验解。
+# 先用温和值稳住分布，稳定后再逐步加回去。
+s3b_z_drop_prob: 0.1
+s3b_z_shuffle_prob: 0.0
 
 # Stage3b adjustment:
 # Only supervise a subset of action ids (post/retweet) during offline imitation.
@@ -53,9 +80,21 @@ population_belief_dim: 3
 # but the policy head still outputs 5-way logits and Stage4 RL keeps the full action space.
 action_imitation_supervised_action_ids: [0, 1]
 
+# Optional (S3b): avoid hard argmax for boxed action id when driving HuggingFaceDatasetEnv.
+# This can reduce "threshold collapse" where p0_mean looks OK but argmax always predicts class-1.
+# - selection: "argmax" (default) or "sample"
+# - temperature: softmax temperature for sampling (higher => more random)
+# - epsilon: mix-in uniform noise (epsilon-greedy over {0,1}) to avoid absolute zero predictions
+s3b_boxed_action_selection: "sample"
+# sampling temperature for the binary(0/1) boxed-id decision
+s3b_boxed_action_temperature: 1.0
+# mix in a bit of uniform exploration over {0,1} to avoid long runs of pred0_count==0
+s3b_boxed_action_epsilon: 0.05
+
 # ===== LRs / regularizers =====
 lr: 0.0003
-belief_net_lr: 0.0003
+# NOTE: 降低 supervised head 的 lr，减少“突然翻边/坍缩”
+belief_net_lr: 0.0001
 encoder_lr: 0.0
 mixer_lr: 0.0
 weight_decay: 0.0
@@ -91,10 +130,25 @@ env_args:
   dataset_streaming: false
   use_random_sampling: true
   verbose_step_logging: false
+  # Infer soft action distribution from question text when dataset lacks target_distribution_prob
+  infer_target_distribution_from_question: true
+  infer_target_distribution_log_limit: 3
   # core only (safety)
   filter_is_core_user: "core"
   # action imitation A=5
   n_actions: 5
+  # === Fix for class-0 collapse in S3b (train split only) ===
+  # The env already supports oversampling by parsing \\boxed{<id>} in `answer`.
+  # This increases the chance that label-0 samples appear in each update, which is more effective than only tuning CE weights.
+  oversample_enabled: true
+  oversample_only_train: true
+  oversample_label_id: 0
+  # Target ratio within the supervised subset {0,1} (avoids over-correcting due to labels 2/3/4).
+  oversample_condition_label_ids: [0, 1]
+  # Start close to the original conditional ratio (~0.12), but higher to ensure enough positives per update.
+  # If recall0 is still 0, increase gradually (e.g., 0.25 -> 0.30), rather than jumping to 0.5.
+  oversample_target_ratio: 0.20
+  oversample_seed: 42
 
 # No reward / RL signals
 reward:
@@ -103,8 +157,9 @@ reward:
   cc_weight: 0.0
 
 train:
-  buffer_size: 256
-  batch_size: 64
+  # NOTE: 更大的 buffer 可以降低每次更新的方差，减少周期性坍缩/反弹
+  buffer_size: 512
+  batch_size: 128
   update_interval: 1
   optimizer: "adam"
   learning_rate: 0.001

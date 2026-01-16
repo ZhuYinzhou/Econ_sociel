@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Any
@@ -279,6 +280,33 @@ class LLMTransformerAgent(nn.Module):
         # We keep an alias so state_dict keys can be loaded with strict=False.
         self.output_network = self.action_type_head
 
+        # ===== Optional: S3b prior head for S4 bias injection =====
+        # We keep a frozen copy of action_type_head to serve as a "preference scorer" prior.
+        self.s3b_bias_enabled = bool(getattr(args, "s3b_bias_enabled", False))
+        self.s3b_bias_mode = str(getattr(args, "s3b_bias_mode", "diff01") or "diff01").strip().lower()
+        self.s3b_bias_alpha = float(getattr(args, "s3b_bias_alpha", 1.0))
+        self.s3b_bias_alpha_trainable = bool(getattr(args, "s3b_bias_alpha_trainable", False))
+        self.s3b_bias_alpha_max = float(getattr(args, "s3b_bias_alpha_max", 0.0) or 0.0)
+        self.s3b_bias_gate_by_stance = bool(getattr(args, "s3b_bias_gate_by_stance", False))
+        self.s3b_bias_stance_min_conf = float(getattr(args, "s3b_bias_stance_min_conf", 0.5) or 0.5)
+        self.s3b_prior_head = None
+        if self.s3b_bias_enabled:
+            self.s3b_prior_head = nn.Linear(self.belief_dim, self.action_type_n_actions)
+            # Freeze prior head by default; we only use it as a fixed bias source.
+            for p in self.s3b_prior_head.parameters():
+                p.requires_grad = False
+            if self.s3b_bias_alpha_trainable:
+                # Parameterize alpha = exp(beta) to guarantee alpha >= 0
+                alpha0 = float(max(self.s3b_bias_alpha, 1e-6))
+                self.s3b_bias_alpha_param = nn.Parameter(torch.tensor(float(np.log(alpha0))))
+            else:
+                self.s3b_bias_alpha_param = None
+        # cached stats for logging
+        self.last_s3b_bias_alpha = float("nan")
+        self.last_s3b_bias_logit_mean = float("nan")
+        self.last_s3b_bias_logit_std = float("nan")
+        self.last_s3b_bias_applied_frac = float("nan")
+
         # ===== Optional: condition action logits on population belief z_t (from Stage3a) =====
         # Motivation: for S3b we want "policy imitation conditioned on secondary-population state",
         # not a pure action clone from text alone.
@@ -369,6 +397,27 @@ class LLMTransformerAgent(nn.Module):
                     if z.ndim == 2 and z.shape[1] != int(self.population_belief_dim):
                         z = z.reshape(z.shape[0], int(self.population_belief_dim))
                     if z.ndim == 2 and belief_state.ndim == 2 and z.shape[0] == belief_state.shape[0]:
+                        # === Anti-shortcut regularization (S3b) ===
+                        # Keep z_t as an input feature, but prevent the policy from relying on it as a shortcut.
+                        # During TRAINING only, we randomly:
+                        # - drop z rows to 0 (input dropout)
+                        # - or shuffle z rows within the batch (break correlation)
+                        # This forces the head to also use non-z features, while still allowing z to help when present.
+                        try:
+                            if bool(self.training) and (not bool(test_mode)):
+                                p_drop = float(getattr(self.args, "s3b_z_drop_prob", 0.0))
+                                p_shuffle = float(getattr(self.args, "s3b_z_shuffle_prob", 0.0))
+                                p_drop = max(0.0, min(1.0, p_drop))
+                                p_shuffle = max(0.0, min(1.0, p_shuffle))
+                                if p_shuffle > 0 and torch.rand((), device=z.device).item() < p_shuffle:
+                                    perm = torch.randperm(z.shape[0], device=z.device)
+                                    z = z[perm]
+                                if p_drop > 0:
+                                    mask = (torch.rand((z.shape[0], 1), device=z.device) < p_drop)
+                                    z = torch.where(mask, torch.zeros_like(z), z)
+                        except Exception:
+                            pass
+
                         z_emb = self.population_belief_proj(z)
                         gate = torch.sigmoid(self.population_belief_gate_logit) if self.population_belief_gate_logit is not None else 1.0
                         belief_state = belief_state + gate * z_emb
@@ -435,6 +484,54 @@ class LLMTransformerAgent(nn.Module):
         # - action_type_q_values: shape (bs, 5)
         stance_action_q_values = self.stance_head(belief_state)
         action_type_q_values = self.action_type_head(belief_state)
+
+        # Optional: inject S3b prior bias into action_type logits (S4 only).
+        try:
+            if self.s3b_bias_enabled and (not bool(getattr(self.args, "train_action_imitation", False))):
+                if isinstance(self.s3b_prior_head, nn.Module):
+                    with torch.no_grad():
+                        prior_logits = self.s3b_prior_head(belief_state)
+                    # Default bias: retweet(1) vs post(0)
+                    if prior_logits.shape[-1] >= 2:
+                        bias = (prior_logits[:, 1] - prior_logits[:, 0]).view(-1)
+                        # Optional gate: only inject when stance head is confident enough
+                        apply_mask = torch.ones_like(bias, dtype=torch.float32)
+                        if self.s3b_bias_gate_by_stance and isinstance(stance_action_q_values, torch.Tensor):
+                            try:
+                                sp = torch.softmax(stance_action_q_values, dim=-1)
+                                maxp = sp.max(dim=-1)[0].view(-1)
+                                apply_mask = (maxp >= float(self.s3b_bias_stance_min_conf)).float()
+                            except Exception:
+                                apply_mask = torch.ones_like(bias, dtype=torch.float32)
+                        # alpha >= 0 via exp(beta)
+                        if self.s3b_bias_alpha_trainable and isinstance(self.s3b_bias_alpha_param, torch.Tensor):
+                            alpha_val = torch.exp(self.s3b_bias_alpha_param)
+                        else:
+                            alpha_val = torch.tensor(float(max(self.s3b_bias_alpha, 0.0)), device=bias.device)
+                        # optional upper bound for stability
+                        if float(self.s3b_bias_alpha_max) > 0:
+                            alpha_val = torch.clamp(alpha_val, max=float(self.s3b_bias_alpha_max))
+                        # Apply bias: retweet += alpha*bias, post -= alpha*bias (masked)
+                        action_type_q_values = action_type_q_values.clone()
+                        adj = alpha_val * bias * apply_mask
+                        action_type_q_values[:, 1] = action_type_q_values[:, 1] + adj
+                        action_type_q_values[:, 0] = action_type_q_values[:, 0] - adj
+                        # cache stats for logging
+                        try:
+                            self.last_s3b_bias_alpha = float(alpha_val.detach().item())
+                            if bool(apply_mask.any().item()):
+                                m = apply_mask > 0.5
+                                bsel = bias[m]
+                                self.last_s3b_bias_logit_mean = float(bsel.mean().item())
+                                self.last_s3b_bias_logit_std = float(bsel.std(unbiased=False).item())
+                            else:
+                                self.last_s3b_bias_logit_mean = float("nan")
+                                self.last_s3b_bias_logit_std = float("nan")
+                            self.last_s3b_bias_applied_frac = float(apply_mask.mean().item())
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         
         outputs = {
             # Backward-compat key: keep "action_q_values" pointing to action_type head by default.
@@ -672,6 +769,12 @@ Return JSON only:"""
             except Exception:
                 # ultra-safe fallback
                 self.load_state_dict(sd, strict=False)
+            # Initialize S3b prior head from action_type_head after loading.
+            try:
+                if self.s3b_bias_enabled and isinstance(self.s3b_prior_head, nn.Module):
+                    self.s3b_prior_head.load_state_dict(self.action_type_head.state_dict(), strict=True)
+            except Exception:
+                pass
             return
         # 兼容旧 checkpoint 命名
         bn = f"{path}/belief_network.th"
@@ -688,6 +791,13 @@ Return JSON only:"""
                     self.action_type_head.load_state_dict(torch.load(on, map_location=self.device), strict=False)
                 except Exception:
                     pass
+
+        # Initialize S3b prior head from action_type_head after loading.
+        try:
+            if self.s3b_bias_enabled and isinstance(self.s3b_prior_head, nn.Module):
+                self.s3b_prior_head.load_state_dict(self.action_type_head.state_dict(), strict=True)
+        except Exception:
+            pass
     
     def cuda(self):
         """

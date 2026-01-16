@@ -307,16 +307,68 @@ class EpisodeRunner:
                     try:
                         # discrete_actions is typically shape (bs, n_agents) or (n_agents,)
                         a = discrete_actions
-                        if isinstance(a, torch.Tensor):
-                            # take batch 0 if exists
-                            if a.ndim >= 2:
-                                a0 = a[0]
+                        # Stage3b binary(0/1) prior:
+                        # Even though the agent head is 5-way for Stage4, S3b objective/metrics are binary over {0,1}.
+                        # If we pass a 5-way argmax id (e.g., 2/3/4) into HF env, then binary eval (K=2) will treat
+                        # predictions as out-of-range and you will see action_pred0_count/action_pred1_count both == 0.
+                        # Fix: in binary mode, derive the env action id from the first two logits argmax.
+                        s3b_binary_01 = False
+                        try:
+                            if bool(getattr(self.args, "train_action_imitation", False)):
+                                s3b_binary_01 = bool(getattr(self.args, "action_imitation_binary_01", False))
+                        except Exception:
+                            s3b_binary_01 = False
+
+                        if s3b_binary_01:
+                            q = mac_extra_info.get("action_type_q_values")
+                            if isinstance(q, torch.Tensor):
+                                # q: (bs, n_agents, 5) or (n_agents, 5)
+                                if q.ndim >= 3:
+                                    q0 = q[0, 0, :2]
+                                elif q.ndim == 2:
+                                    q0 = q[0, :2]
+                                else:
+                                    q0 = None
+                                if isinstance(q0, torch.Tensor) and q0.numel() == 2:
+                                    # Optional: avoid hard argmax collapse for binary(0/1) imitation.
+                                    # Default remains argmax for backward-compatibility.
+                                    sel = str(getattr(self.args, "s3b_boxed_action_selection", "argmax") or "argmax").strip().lower()
+                                    if sel in ("sample", "sampling", "softmax_sample", "categorical"):
+                                        try:
+                                            temp = float(getattr(self.args, "s3b_boxed_action_temperature", 1.0) or 1.0)
+                                        except Exception:
+                                            temp = 1.0
+                                        temp = float(max(1e-6, temp))
+                                        try:
+                                            eps = float(getattr(self.args, "s3b_boxed_action_epsilon", 0.0) or 0.0)
+                                        except Exception:
+                                            eps = 0.0
+                                        eps = float(max(0.0, min(1.0, eps)))
+                                        logits = (q0.float() / temp).view(1, 2)
+                                        p = torch.softmax(logits, dim=-1).view(-1)
+                                        if eps > 0:
+                                            p = (1.0 - eps) * p + eps * torch.full_like(p, 0.5)
+                                        # multinomial expects probs sum>0
+                                        p = torch.clamp(p, min=1e-12)
+                                        p = p / p.sum()
+                                        aid = int(torch.multinomial(p, num_samples=1).item())
+                                    else:
+                                        aid = int(q0.argmax(dim=-1).item())
+                                else:
+                                    aid = 0
                             else:
-                                a0 = a
-                            # take agent 0 as the env action (you can change to majority vote later)
-                            aid = int(a0[0].item()) if a0.numel() > 0 else 0
+                                aid = 0
                         else:
-                            aid = int(a)
+                            if isinstance(a, torch.Tensor):
+                                # take batch 0 if exists
+                                if a.ndim >= 2:
+                                    a0 = a[0]
+                                else:
+                                    a0 = a
+                                # take agent 0 as the env action (you can change to majority vote later)
+                                aid = int(a0[0].item()) if a0.numel() > 0 else 0
+                            else:
+                                aid = int(a)
                     except Exception:
                         aid = 0
                     action_for_env_step = f"\\boxed{{{aid}}}"
@@ -343,6 +395,26 @@ class EpisodeRunner:
                 _next_obs, reward_total_float, terminated, _truncated, env_step_info = self.env.step(
                     action_for_env_step, extra_info=step_extra_info
                 )
+                # Attach preference-scorer signals for Stage3b eval (retweet vs post bias)
+                try:
+                    if isinstance(env_step_info, dict):
+                        q = mac_extra_info.get("action_type_q_values")
+                        q0 = None
+                        if isinstance(q, torch.Tensor):
+                            if q.ndim >= 3:
+                                q0 = q[0, 0, :2]
+                            elif q.ndim == 2:
+                                q0 = q[0, :2]
+                        if isinstance(q0, torch.Tensor) and q0.numel() == 2:
+                            bias_logit = float((q0[1] - q0[0]).item())
+                            p = torch.softmax(q0.float(), dim=-1)
+                            p0 = float(p[0].item())
+                            p1 = float(p[1].item())
+                            env_step_info["pref_bias_logit"] = bias_logit
+                            env_step_info["pref_p0"] = p0
+                            env_step_info["pref_p1"] = p1
+                except Exception:
+                    pass
                 # cache for evaluation
                 if isinstance(env_step_info, dict):
                     self.last_env_infos.append(env_step_info)
@@ -791,6 +863,13 @@ class EpisodeRunner:
                 if isinstance(z_target, list):
                     post_data_dict["z_target"] = torch.tensor(z_target, dtype=torch.float32, device=self.args.device)
                 post_data_dict["z_mask"] = torch.tensor([float(z_mask)], dtype=torch.float32, device=self.args.device)
+                # Optional: Dirichlet alpha0_target (effective pseudo-counts) inferred by HF env
+                try:
+                    a0 = env_info.get("z_alpha0_target", None)
+                    if a0 is not None:
+                        post_data_dict["z_alpha0_target"] = torch.tensor([float(a0)], dtype=torch.float32, device=self.args.device)
+                except Exception:
+                    pass
         except Exception as e:
             self.logger.warning(f"Failed to add z supervision fields to batch: {e}")
 
@@ -901,7 +980,10 @@ class EpisodeRunner:
                 processed_group_representation = None 
             
             if processed_group_representation is not None:
-                 post_data_dict["group_representation"] = processed_group_representation
+                 # IMPORTANT:
+                 # Avoid "overlapping memory" assignment in EpisodeBatch.update when the source tensor
+                 # aliases the destination buffer (e.g., MAC returns a view/reference to batch storage).
+                 post_data_dict["group_representation"] = processed_group_representation.detach().clone()
         
         if belief_states is not None:
             expected_belief_dim = getattr(self.args, 'belief_dim', 64) # Get belief_dim from args, with a fallback
@@ -999,6 +1081,8 @@ class EpisodeRunner:
             "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_mask": {"vshape": (1,), "dtype": torch.float32},
+            # Dirichlet alpha0_target (optional; scalar)
+            "z_alpha0_target": {"vshape": (1,), "dtype": torch.float32},
 
             # === belief inputs (explicit, tensorized; global) ===
             # stage index

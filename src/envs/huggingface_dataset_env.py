@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import random
+from fractions import Fraction
+import math
 
 class HuggingFaceDatasetEnv(gym.Env):
     metadata = {'render_modes': ['human'], 'render_fps': 4}
@@ -64,6 +66,19 @@ class HuggingFaceDatasetEnv(gym.Env):
         self.oversample_only_train = bool(kwargs.get("oversample_only_train", True))
         self.oversample_label_id = int(kwargs.get("oversample_label_id", 1))
         self.oversample_target_ratio = float(kwargs.get("oversample_target_ratio", 0.05))  # e.g., 0.05~0.10
+        # Optional: compute oversample ratio *within a conditional subset of labels*.
+        # Motivation (Stage3b): we often supervise only a subset of action ids (e.g., {0,1}),
+        # but the dataset may contain additional labels (2/3/4). Oversampling by global marginal
+        # can over-correct and induce collapse. If set, we target:
+        #   ratio = count(oversample_label_id) / count(labels in oversample_condition_label_ids)
+        # by duplicating oversample_label_id samples.
+        _cond = kwargs.get("oversample_condition_label_ids", None)
+        self.oversample_condition_label_ids = None
+        try:
+            if isinstance(_cond, (list, tuple)) and len(_cond) > 0:
+                self.oversample_condition_label_ids = [int(x) for x in _cond]
+        except Exception:
+            self.oversample_condition_label_ids = None
         self.oversample_seed = int(kwargs.get("oversample_seed", 42))
         # Safety cap to avoid exploding dataset size (multiplier for the minority class)
         self.oversample_max_multiplier = int(kwargs.get("oversample_max_multiplier", 30))
@@ -86,6 +101,19 @@ class HuggingFaceDatasetEnv(gym.Env):
         # - K=1: scalar z in [-1,1]
         self.population_belief_dim = int(kwargs.get("population_belief_dim", 3))
         self.population_belief_dim = max(1, self.population_belief_dim)
+        # Optional: infer soft action-type distribution from question text when dataset lacks it.
+        self.infer_target_distribution_from_question = bool(
+            kwargs.get("infer_target_distribution_from_question", True)
+        )
+        self.infer_target_distribution_log_limit = int(
+            kwargs.get("infer_target_distribution_log_limit", 3)
+        )
+        self._parsed_target_dist_count = 0
+        # For Dirichlet z-transition supervision: infer an effective pseudo-count alpha0 from z_target distribution.
+        # This enables alpha0_target to scale with stage-wise available labeled edge users, without regenerating datasets.
+        self.infer_dirichlet_alpha0_from_z_target = bool(kwargs.get("infer_dirichlet_alpha0_from_z_target", True))
+        self.infer_dirichlet_alpha0_max_den = int(kwargs.get("infer_dirichlet_alpha0_max_den", 2000))
+        self.infer_dirichlet_alpha0_max_den = max(10, self.infer_dirichlet_alpha0_max_den)
 
         try:
             # Support both:
@@ -209,16 +237,36 @@ class HuggingFaceDatasetEnv(gym.Env):
                             elif len(idx_by_label.get(lid, [])) <= 0:
                                 logger.warning(f"[HFEnv] No samples for label_id={lid}; skipping oversampling.")
                             else:
-                                cur = float(counts[lid]) / float(total) if total > 0 else 0.0
+                                # If condition labels are provided, compute ratio within that subset (e.g., {0,1}).
+                                cond_ids = None
+                                try:
+                                    if isinstance(self.oversample_condition_label_ids, list) and len(self.oversample_condition_label_ids) > 0:
+                                        cond_ids = [i for i in self.oversample_condition_label_ids if 0 <= int(i) < na]
+                                except Exception:
+                                    cond_ids = None
+                                if cond_ids is not None and len(cond_ids) > 0:
+                                    cond_total = int(sum(len(idx_by_label.get(int(i), [])) for i in cond_ids))
+                                    if cond_total <= 0:
+                                        logger.warning(f"[HFEnv] oversample_condition_label_ids={cond_ids} has zero samples; falling back to global ratio.")
+                                        cond_ids = None
+                                        cond_total = total
+                                else:
+                                    cond_total = total
+
+                                cur = float(counts[lid]) / float(cond_total) if cond_total > 0 else 0.0
                                 tgt = float(self.oversample_target_ratio)
                                 if tgt <= 0.0 or cur >= tgt:
                                     logger.info(
-                                        f"[HFEnv] Oversampling skipped (current_ratio={cur:.4f} >= target_ratio={tgt:.4f}). "
+                                        f"[HFEnv] Oversampling skipped "
+                                        f"(current_ratio={cur:.4f} >= target_ratio={tgt:.4f}, "
+                                        f"basis={'cond' if cond_ids is not None else 'global'}). "
                                         f"counts={counts}, missing_boxed={missing}"
                                     )
                                 else:
-                                    # x >= (tgt*total - count_lid) / (1 - tgt)
-                                    need = int(np.ceil((tgt * float(total) - float(counts[lid])) / max(1e-8, (1.0 - tgt))))
+                                    # Add x duplicates of label=lid.
+                                    # If conditional basis: (c0+x)/(c+x) >= tgt  where c0=count_lid, c=cond_total.
+                                    # Else:             (c0+x)/(total+x) >= tgt.
+                                    need = int(np.ceil((tgt * float(cond_total) - float(counts[lid])) / max(1e-8, (1.0 - tgt))))
                                     # Cap by max_multiplier
                                     max_extra = int(self.oversample_max_multiplier * counts[lid] - counts[lid])
                                     if max_extra < 0:
@@ -241,10 +289,17 @@ class HuggingFaceDatasetEnv(gym.Env):
                                         new_counts = counts[:]
                                         new_counts[lid] = new_counts[lid] + extra
                                         new_total = int(sum(new_counts))
-                                        new_ratio = float(new_counts[lid]) / float(new_total) if new_total > 0 else 0.0
+                                        if cond_ids is not None and len(cond_ids) > 0:
+                                            new_cond_total = int(cond_total + extra)
+                                            new_ratio = float(new_counts[lid]) / float(new_cond_total) if new_cond_total > 0 else 0.0
+                                        else:
+                                            new_ratio = float(new_counts[lid]) / float(new_total) if new_total > 0 else 0.0
                                         logger.info(
                                             f"[HFEnv] Oversampled label_id={lid} on split='{self.dataset_split}': "
                                             f"target_ratio={tgt:.3f}, current_ratio={cur:.3f} -> new_ratio={new_ratio:.3f}; "
+                                            f"basis={'cond' if cond_ids is not None else 'global'}"
+                                            + (f" cond_ids={cond_ids}" if cond_ids is not None else "")
+                                            + "; "
                                             f"added={extra}, size={before_n}->{after_n}, counts={counts}->{new_counts}, missing_boxed={missing}"
                                         )
                 except Exception as e:
@@ -463,11 +518,13 @@ class HuggingFaceDatasetEnv(gym.Env):
             logger.info(f"Starting dataset-level Episode {self.episode_count}: will process {self.num_samples} samples")
         else:
             # 原有逻辑：每个问题一个episode
-            if not self.is_streaming and (self.dataset_iterator is None or self.current_data_idx >= self.num_samples -1):
-                # Re-initialize iterator for non-streaming dataset if exhausted or first time
+            # NOTE: for non-streaming + sequential sampling, we should NOT reset current_data_idx on every reset.
+            # Previously we checked (self.dataset_iterator is None), but for non-streaming datasets we keep dataset_list
+            # and dataset_iterator stays None forever, causing current_data_idx to be reset to -1 each episode and
+            # repeatedly sampling the first item. Only reset when we truly reach the end of the split.
+            if (not self.is_streaming) and (self.current_data_idx >= self.num_samples - 1):
                 if not self.use_random_sampling:
-                    # 只有在顺序采样时才重置索引
-                    self.current_data_idx = -1 # Will be incremented by _get_next_sample
+                    self.current_data_idx = -1  # Will be incremented by _get_next_sample
 
         self.current_sample = self._get_next_sample()
         
@@ -564,6 +621,101 @@ class HuggingFaceDatasetEnv(gym.Env):
             "neighbor_stance_counts": torch.tensor(nb, dtype=torch.float32, device=device),
             "is_core_user": torch.tensor([1 if is_core else 0], dtype=torch.int64, device=device),
         }
+
+    @staticmethod
+    def _lcm(a: int, b: int) -> int:
+        try:
+            return abs(a * b) // math.gcd(a, b) if a and b else max(a, b)
+        except Exception:
+            return max(a, b, 1)
+
+    def _parse_action_type_distribution(self, text: Any) -> Optional[Dict[str, float]]:
+        """
+        Parse user action-type distribution from question text.
+        Expected snippet (example):
+          "User action-type distribution at stage t (observed, aggregated):"
+          "post:1, retweet:10, reply:1, like:0, do_nothing:0"
+        Returns a dict with string keys "0".."4" for {post, retweet, reply, like, do_nothing}.
+        """
+        if not isinstance(text, str) or not text:
+            return None
+        lower = text.lower()
+        key = "user action-type distribution"
+        idx = lower.find(key)
+        if idx < 0:
+            return None
+        sub = text[idx:]
+        # cut off at neighbor distribution to avoid mixing
+        nidx = sub.lower().find("neighbor action-type distribution")
+        if nidx >= 0:
+            sub = sub[:nidx]
+        # take a small window to avoid parsing other sections
+        sub = sub[:400]
+        # normalize potential variants of do_nothing
+        sub = sub.replace("do nothing", "do_nothing")
+        pattern = r"(post|retweet|reply|like|do_nothing)\s*:\s*([0-9]+)"
+        matches = re.findall(pattern, sub, flags=re.IGNORECASE)
+        if not matches:
+            return None
+        counts = {}
+        for name, cnt in matches:
+            try:
+                counts[name.lower()] = int(cnt)
+            except Exception:
+                continue
+        names = ["post", "retweet", "reply", "like", "do_nothing"]
+        total = sum(int(counts.get(n, 0)) for n in names)
+        if total <= 0:
+            return None
+        dist = {str(i): float(counts.get(name, 0)) / float(total) for i, name in enumerate(names)}
+        return dist
+
+    def _infer_total_count_from_dist(self, dist: List[float], *, max_den: int = 2000) -> int:
+        """
+        Given a probability-like vector dist (len=K, sum≈1), infer an integer total N such that dist≈counts/N.
+        We do this via rational approximation with limited denominator (fast, robust enough for your datasets).
+        """
+        try:
+            xs = [float(x) for x in list(dist)]
+        except Exception:
+            return 0
+        if not xs:
+            return 0
+        # normalize to sum=1
+        s = float(sum(max(0.0, x) for x in xs))
+        if s <= 0:
+            return 0
+        xs = [max(0.0, x) / s for x in xs]
+        dens: List[int] = []
+        fracs: List[Fraction] = []
+        for x in xs:
+            if x <= 0.0:
+                fr = Fraction(0, 1)
+            else:
+                fr = Fraction(x).limit_denominator(int(max_den))
+            fracs.append(fr)
+            dens.append(int(fr.denominator) if fr.denominator else 1)
+        # common denominator
+        d = 1
+        for dd in dens:
+            d = self._lcm(int(d), int(dd))
+            if d > int(max_den):
+                # cap to avoid huge lcm blowups; fall back to max_den
+                d = int(max_den)
+                break
+        # counts on common denom
+        counts = []
+        for fr in fracs:
+            try:
+                c = int(fr.numerator) * int(d // int(fr.denominator))
+            except Exception:
+                c = int(round(float(fr) * float(d)))
+            counts.append(max(0, int(c)))
+        n = int(sum(counts))
+        # if approximation collapsed, fall back to denom
+        if n <= 0:
+            n = int(d)
+        return max(1, int(n))
 
     def step(self, action: Any, extra_info: Optional[Dict[str, Any]] = None) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
         """
@@ -728,6 +880,27 @@ class HuggingFaceDatasetEnv(gym.Env):
                         info[k] = self.current_sample.get(k)
         except Exception:
             pass
+        # Fallback: infer target_distribution_prob from question text if missing.
+        if (
+            self.infer_target_distribution_from_question
+            and isinstance(info, dict)
+            and "target_distribution_prob" not in info
+        ):
+            text = None
+            try:
+                if isinstance(self.current_sample, dict):
+                    text = self.current_sample.get(self.question_field) or self.current_sample.get("question_preview")
+            except Exception:
+                text = None
+            if not text:
+                text = self.current_question
+            dist = self._parse_action_type_distribution(text)
+            if isinstance(dist, dict) and len(dist) > 0:
+                info["target_distribution_prob"] = dist
+                # Avoid log spam; log only the first few parses
+                if self._parsed_target_dist_count < self.infer_target_distribution_log_limit:
+                    self._parsed_target_dist_count += 1
+                    logger.info(f"[HFEnv] inferred target_distribution_prob from question text: {dist}")
 
         # Optional: emit belief/z supervision fields for offline transition training
         if self.emit_belief_fields and isinstance(self.current_sample, dict):
@@ -761,6 +934,13 @@ class HuggingFaceDatasetEnv(gym.Env):
             else:
                 if isinstance(z_target, (list, tuple)) and len(z_target) >= pop_dim:
                     info["z_target"] = [float(x) for x in list(z_target)[:pop_dim]]
+                    # Dirichlet alpha0_target inference (pseudo-counts) from z_target distribution
+                    try:
+                        if bool(self.infer_dirichlet_alpha0_from_z_target):
+                            n_eff = self._infer_total_count_from_dist(info["z_target"], max_den=int(self.infer_dirichlet_alpha0_max_den))
+                            info["z_alpha0_target"] = float(n_eff)
+                    except Exception:
+                        pass
             if z_mask is not None:
                 try:
                     info["z_mask"] = float(z_mask)

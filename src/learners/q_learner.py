@@ -442,6 +442,8 @@ class ECONLearner:
 
             total_loss = torch.tensor(0.0, device=self.device)
             total_correct = 0.0
+            # Probability-based "soft accuracy" (no argmax): mean p(y_true) over effective rows.
+            total_correct_prob = 0.0
             total_count = 0.0
             # Stage3b masked-supervision diagnostics:
             # - possible_count: how many (masked) agent-rows existed (by env mask), regardless of label filtering
@@ -461,6 +463,18 @@ class ECONLearner:
             dbg_logit_abs_sum = 0.0
             dbg_logit_std_sum = 0.0
             dbg_logit_count = 0
+            # Probability-based diagnostics (more stable than argmax fractions)
+            dbg_p0_sum = 0.0
+            dbg_p0_count = 0
+            dbg_p1_sum = 0.0
+            dbg_p1_count = 0
+            # Threshold / hard-pred proxies (helps explain "mean(p0) ok but argmax always 1")
+            dbg_p0_gt05_sum = 0.0
+            dbg_p0_gt05_count = 0
+            dbg_hard_pred0_sum = 0.0
+            dbg_hard_pred0_count = 0
+            dbg_delta01_sum = 0.0
+            dbg_delta01_count = 0
             # debug: predicted/gt class distribution (helps detect majority-class collapse / argmax tie-to-0)
             pred_counts = None  # type: ignore
             gt_counts = None  # type: ignore
@@ -468,6 +482,30 @@ class ECONLearner:
             correct_counts = None  # type: ignore
             # Zero grads once; we will backward through micro-batches and step once.
             self.belief_supervised_optimizer.zero_grad()
+
+            # Stage3b option: "binary(0/1) action prior" training.
+            # Keep the agent head as A=5 for Stage4 compatibility, but during S3b supervised CE/metrics,
+            # only use logits[:, :2] and labels in {0,1}. This leaves actions {2,3,4} to Stage4 RL.
+            s3b_binary_01 = False
+            try:
+                if bool(getattr(self.args, "train_action_imitation", False)):
+                    s3b_binary_01 = bool(getattr(self.args, "action_imitation_binary_01", False))
+            except Exception:
+                s3b_binary_01 = False
+            # Stage3b option: preference scorer (train only a scalar bias between retweet/post)
+            try:
+                s3b_preference_scorer = bool(getattr(self.args, "s3b_preference_scorer", False))
+            except Exception:
+                s3b_preference_scorer = False
+
+            # Optional: avoid argmax-based metrics (pred*_frac, recall/precision, hard acc) to reduce flip-flop noise.
+            # In this mode we still train with CE normally; we only change what we LOG.
+            # Default True keeps previous behavior for S1/S2.
+            use_argmax_metrics = True
+            try:
+                use_argmax_metrics = bool(getattr(self.args, "belief_supervised_metrics_use_argmax", True))
+            except Exception:
+                use_argmax_metrics = True
 
             for t in range(batch.max_seq_length - 1):
                 bs_total = int(batch.batch_size)
@@ -530,8 +568,22 @@ class ECONLearner:
                         y = y.view(bs)
                     y = torch.clamp(y.long(), min=0, max=max(0, int(nc) - 1))
 
-                    y_exp = y.unsqueeze(1).expand(bs, na).reshape(-1)
                     logits_flat = agent_logits.reshape(bs * na, nc)
+                    # Effective CE classes / weights for this supervised step
+                    nc_eff = int(nc)
+                    ce_weight_eff = ce_weight
+                    if bool(s3b_binary_01):
+                        nc_eff = 2
+                        logits_flat = logits_flat[:, :2]
+                        y = torch.clamp(y, min=0, max=1)
+                        try:
+                            if isinstance(ce_weight, torch.Tensor) and ce_weight.numel() >= 2:
+                                ce_weight_eff = ce_weight[:2]
+                            else:
+                                ce_weight_eff = None
+                        except Exception:
+                            ce_weight_eff = None
+                    y_exp = y.unsqueeze(1).expand(bs, na).reshape(-1)
 
                     # Debug: entropy / confidence (no grad)
                     try:
@@ -561,6 +613,11 @@ class ECONLearner:
                         w = w * sup_w
 
                     use_soft = bool(getattr(self.args, "belief_supervised_use_soft_labels", False)) and ("gt_action_dist" in batch.scheme)
+                    # Optional fallback: label smoothing when gt_action_dist is missing/empty
+                    try:
+                        label_smoothing = float(getattr(self.args, "belief_supervised_label_smoothing", 0.0) or 0.0)
+                    except Exception:
+                        label_smoothing = 0.0
                     if use_soft:
                         # Soft CE sum (normalized by total_w for exactness)
                         try:
@@ -573,9 +630,24 @@ class ECONLearner:
                                 else:
                                     pad = torch.zeros(bs, nc - psl.shape[-1], device=self.device, dtype=psl.dtype)
                                     psl = torch.cat([psl, pad], dim=-1)
+                            # For binary-01 mode, only keep classes {0,1}
+                            if bool(s3b_binary_01):
+                                psl = psl[:, :2]
+                                if psl.shape[-1] != 2:
+                                    pad = torch.zeros(bs, 2 - psl.shape[-1], device=self.device, dtype=psl.dtype)
+                                    psl = torch.cat([psl, pad], dim=-1)
                             psl = torch.clamp(psl.float(), min=0.0)
                             ps = psl.sum(dim=-1, keepdim=True)
                             valid = (ps.squeeze(-1) > 0)
+                            # Fallback: if no valid soft labels and label_smoothing>0, build smoothed one-hot
+                            if (not bool(valid.any().item())) and label_smoothing > 0.0:
+                                k = int(psl.shape[-1])
+                                k = max(2, k)
+                                y2 = y.clamp(min=0, max=k - 1).view(-1)
+                                psl = torch.full((bs, k), fill_value=label_smoothing / float(k - 1), device=self.device, dtype=torch.float32)
+                                psl.scatter_(1, y2.view(-1, 1), 1.0 - label_smoothing)
+                                ps = psl.sum(dim=-1, keepdim=True)
+                                valid = torch.ones_like(ps.squeeze(-1), dtype=torch.bool)
                             if bool(valid.any().item()):
                                 soft_available_steps += 1
                                 try:
@@ -584,18 +656,48 @@ class ECONLearner:
                                         soft_p_count += 1
                                 except Exception:
                                     pass
-                                psl = torch.where(ps > 0, psl / ps, torch.full_like(psl, 1.0 / float(nc)))
-                                p_exp = psl.unsqueeze(1).expand(bs, na, nc).reshape(bs * na, nc)
-                                logp = F.log_softmax(logits_flat, dim=-1)
-                                s_ce = -(p_exp * logp).sum(dim=-1)
-                                if torch.isfinite(s_ce).all():
-                                    loss_sum = (s_ce * w).sum()
-                                    (loss_sum / total_w).backward()
-                                    loss_t_val += float((loss_sum.detach() / total_w).item())
-                                    soft_used_steps += 1
-                                    loss_used = True
+                                # Normalize to a proper distribution
+                                psl = torch.where(ps > 0, psl / ps, torch.full_like(psl, 1.0 / float(psl.shape[-1])))
+                                # Optional: mix hard label to stabilize training (prevents runaway noise)
+                                try:
+                                    mix = float(getattr(self.args, "belief_supervised_soft_label_mix", 1.0))
+                                except Exception:
+                                    mix = 1.0
+                                mix = float(max(0.0, min(1.0, mix)))
+                                if mix < 1.0:
+                                    # one-hot hard label for y
+                                    y_oh = torch.zeros_like(psl)
+                                    y_oh.scatter_(1, y.view(-1, 1).clamp(min=0, max=psl.shape[-1]-1), 1.0)
+                                    psl = mix * psl + (1.0 - mix) * y_oh
+                                if bool(s3b_binary_01) and bool(s3b_preference_scorer):
+                                    # Preference scorer: predict retweet tendency as a single bias logit.
+                                    bias_logit = logits_flat[:, 1] - logits_flat[:, 0]
+                                    p1_target = psl[:, 1].clamp(0.0, 1.0)
+                                    p1_exp = p1_target.unsqueeze(1).expand(bs, na).reshape(-1)
+                                    bce = F.binary_cross_entropy_with_logits(bias_logit, p1_exp, reduction="none")
+                                    if torch.isfinite(bce).all():
+                                        loss_sum = (bce * w).sum()
+                                        (loss_sum / total_w).backward()
+                                        loss_t_val += float((loss_sum.detach() / total_w).item())
+                                        soft_used_steps += 1
+                                        loss_used = True
+                                    else:
+                                        loss_used = False
                                 else:
-                                    loss_used = False
+                                    p_exp = psl.unsqueeze(1).expand(bs, na, psl.shape[-1]).reshape(bs * na, psl.shape[-1])
+                                    logp = F.log_softmax(logits_flat, dim=-1)
+                                    # If binary-01, logits_flat already sliced to 2 dims
+                                    if bool(s3b_binary_01) and logp.shape[-1] != p_exp.shape[-1]:
+                                        logp = logp[:, : p_exp.shape[-1]]
+                                    s_ce = -(p_exp * logp).sum(dim=-1)
+                                    if torch.isfinite(s_ce).all():
+                                        loss_sum = (s_ce * w).sum()
+                                        (loss_sum / total_w).backward()
+                                        loss_t_val += float((loss_sum.detach() / total_w).item())
+                                        soft_used_steps += 1
+                                        loss_used = True
+                                    else:
+                                        loss_used = False
                             else:
                                 loss_used = False
                         except Exception:
@@ -604,7 +706,13 @@ class ECONLearner:
                         loss_used = False
 
                     if not loss_used:
-                        ce = F.cross_entropy(logits_flat, y_exp, reduction="none", weight=ce_weight)
+                        if bool(s3b_binary_01) and bool(s3b_preference_scorer):
+                            # Preference scorer: use hard label as target for sigmoid(bias_logit).
+                            bias_logit = logits_flat[:, 1] - logits_flat[:, 0]
+                            y_bin = y_exp.float().clamp(0.0, 1.0)
+                            ce = F.binary_cross_entropy_with_logits(bias_logit, y_bin, reduction="none")
+                        else:
+                            ce = F.cross_entropy(logits_flat, y_exp, reduction="none", weight=ce_weight_eff)
                         if not torch.isfinite(ce).all():
                             self.logger.warning(f"belief_supervised: non-finite CE at t={t}; skipping slice {s0}:{s1}.")
                             continue
@@ -612,29 +720,62 @@ class ECONLearner:
                         (loss_sum / total_w).backward()
                         loss_t_val += float((loss_sum.detach() / total_w).item())
 
-                    # accuracy + class counts (masked)
-                    pred = logits_flat.argmax(dim=-1)
-                    total_correct += float(((pred == y_exp).float() * w).sum().item())
+                    # metrics + class counts (masked)
                     total_count += float(w.sum().item())
                     supervised_count += float(w.sum().item())
                     try:
                         with torch.no_grad():
-                            if pred_counts is None:
-                                pred_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
-                            if gt_counts is None:
-                                gt_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
-                            if correct_counts is None:
-                                correct_counts = torch.zeros(nc, device=self.device, dtype=torch.float32)
                             m = (w > 0.5)
+                            # Probability-based metrics (stable): p(y_true) and p(class0/1)
+                            try:
+                                if bool(m.any().item()):
+                                    p_all = F.softmax(logits_flat, dim=-1)
+                                    # soft accuracy = mean p(y_true)
+                                    idx = torch.arange(p_all.shape[0], device=self.device)
+                                    p_true = p_all[idx, y_exp]
+                                    total_correct_prob += float((p_true * w).sum().item())
+                            except Exception:
+                                pass
+
+                            # Argmax metrics (noisy near boundary): only if enabled
+                            if use_argmax_metrics:
+                                pred = logits_flat.argmax(dim=-1)
+                                total_correct += float(((pred == y_exp).float() * w).sum().item())
+                            if pred_counts is None:
+                                pred_counts = torch.zeros(nc_eff, device=self.device, dtype=torch.float32)
+                            if gt_counts is None:
+                                gt_counts = torch.zeros(nc_eff, device=self.device, dtype=torch.float32)
+                            if correct_counts is None:
+                                correct_counts = torch.zeros(nc_eff, device=self.device, dtype=torch.float32)
                             if bool(m.any().item()):
-                                pc = torch.bincount(pred[m], minlength=nc).float()
-                                gc = torch.bincount(y_exp[m], minlength=nc).float()
-                                pred_counts[: pc.numel()] += pc
+                                # Prob-based metrics on EFFECTIVE supervised rows (masked) (for TB smoothing)
+                                try:
+                                    logits_m = logits_flat[m]
+                                    if isinstance(logits_m, torch.Tensor) and logits_m.ndim == 2 and logits_m.shape[-1] >= 2:
+                                        pm = F.softmax(logits_m, dim=-1)
+                                        dbg_p0_sum += float(pm[:, 0].mean().item())
+                                        dbg_p0_count += 1
+                                        dbg_p1_sum += float(pm[:, 1].mean().item())
+                                        dbg_p1_count += 1
+                                        # how often p0 crosses 0.5 (approximate hard decision rate for class-0)
+                                        dbg_p0_gt05_sum += float((pm[:, 0] > 0.5).float().mean().item())
+                                        dbg_p0_gt05_count += 1
+                                        # hard-pred proxy (binary): fraction where logit0 > logit1
+                                        dbg_hard_pred0_sum += float((logits_m[:, 0] > logits_m[:, 1]).float().mean().item())
+                                        dbg_hard_pred0_count += 1
+                                        dbg_delta01_sum += float((logits_m[:, 0] - logits_m[:, 1]).mean().item())
+                                        dbg_delta01_count += 1
+                                except Exception:
+                                    pass
+                                gc = torch.bincount(y_exp[m], minlength=nc_eff).float()
                                 gt_counts[: gc.numel()] += gc
-                                corr = (pred == y_exp) & m
-                                if bool(corr.any().item()):
-                                    cc = torch.bincount(y_exp[corr], minlength=nc).float()
-                                    correct_counts[: cc.numel()] += cc
+                                if use_argmax_metrics:
+                                    pc = torch.bincount(pred[m], minlength=nc_eff).float()
+                                    pred_counts[: pc.numel()] += pc
+                                    corr = (pred == y_exp) & m
+                                    if bool(corr.any().item()):
+                                        cc = torch.bincount(y_exp[corr], minlength=nc_eff).float()
+                                        correct_counts[: cc.numel()] += cc
                     except Exception:
                         pass
 
@@ -707,29 +848,65 @@ class ECONLearner:
                 grad_norm = 0.0
             self.belief_supervised_optimizer.step()
 
-            acc = (total_correct / max(1.0, total_count)) if total_count > 0 else 0.0
+            # Prefer stable prob-based acc when argmax metrics are disabled.
+            if use_argmax_metrics:
+                acc = (total_correct / max(1.0, total_count)) if total_count > 0 else 0.0
+            else:
+                acc = (total_correct_prob / max(1.0, total_count)) if total_count > 0 else 0.0
             # finalize debug distributions
-            pred_frac = [float("nan")] * int(nc)
-            gt_frac = [float("nan")] * int(nc)
-            # per-class precision/recall (masked)
-            recall = [float("nan")] * int(nc)
-            precision = [float("nan")] * int(nc)
-            # raw counts for debugging (masked)
-            pred_cnt = [0.0] * int(nc)
-            gt_cnt = [0.0] * int(nc)
-            correct_cnt = [0.0] * int(nc)
-            has_gt = [0.0] * int(nc)
+            # Note: in Stage3b binary-01 mode, pred_counts/gt_counts are size 2 even if agent head is 5-way.
             try:
-                if isinstance(pred_counts, torch.Tensor) and pred_counts.sum().item() > 0:
-                    pf = (pred_counts / pred_counts.sum()).detach().cpu().tolist()
-                    pred_frac = [float(x) for x in pf]
+                nc_stats = int(pred_counts.numel()) if isinstance(pred_counts, torch.Tensor) else int(nc)
+            except Exception:
+                nc_stats = int(nc)
+            pred_frac = [float("nan")] * int(nc_stats)
+            gt_frac = [float("nan")] * int(nc_stats)
+            # per-class precision/recall (masked)
+            recall = [float("nan")] * int(nc_stats)
+            precision = [float("nan")] * int(nc_stats)
+            # raw counts for debugging (masked)
+            pred_cnt = [0.0] * int(nc_stats)
+            gt_cnt = [0.0] * int(nc_stats)
+            correct_cnt = [0.0] * int(nc_stats)
+            has_gt = [0.0] * int(nc_stats)
+            try:
+                if use_argmax_metrics:
+                    if isinstance(pred_counts, torch.Tensor) and pred_counts.sum().item() > 0:
+                        pf = (pred_counts / pred_counts.sum()).detach().cpu().tolist()
+                        pred_frac = [float(x) for x in pf]
+                else:
+                    # Use probability mean as predicted marginal (stable)
+                    try:
+                        if dbg_p0_count > 0 and dbg_p1_count > 0:
+                            p0 = float(dbg_p0_sum / max(1, dbg_p0_count))
+                            p1 = float(dbg_p1_sum / max(1, dbg_p1_count))
+                            pred_frac = [p0, p1] + ([float("nan")] * max(0, int(nc_stats) - 2))
+                    except Exception:
+                        pass
                 if isinstance(gt_counts, torch.Tensor) and gt_counts.sum().item() > 0:
                     gf = (gt_counts / gt_counts.sum()).detach().cpu().tolist()
                     gt_frac = [float(x) for x in gf]
-                if isinstance(correct_counts, torch.Tensor):
+                # When argmax metrics are disabled, fill *_count using gt_counts and probability-based pred_frac.
+                # This avoids confusing "counts==0 but frac!=0" situations.
+                if (not use_argmax_metrics) and isinstance(gt_counts, torch.Tensor):
+                    try:
+                        eff_total = float(gt_counts.sum().item())
+                        for i in range(int(nc_stats)):
+                            if i < int(gt_counts.numel()):
+                                gti = float(gt_counts[i].item())
+                                gt_cnt[i] = gti
+                                has_gt[i] = 1.0 if gti > 0 else 0.0
+                            # pred_cnt is an estimate from mean probabilities (not an argmax count)
+                            if i < len(pred_frac):
+                                pi = float(pred_frac[i])
+                                if pi == pi and eff_total > 0:
+                                    pred_cnt[i] = float(pi * eff_total)
+                    except Exception:
+                        pass
+                if use_argmax_metrics and isinstance(correct_counts, torch.Tensor):
                     # recall_c = correct_c / gt_c
                     if isinstance(gt_counts, torch.Tensor):
-                        for i in range(int(nc)):
+                        for i in range(int(nc_stats)):
                             gti = float(gt_counts[i].item())
                             ci = float(correct_counts[i].item())
                             gt_cnt[i] = gti
@@ -738,7 +915,7 @@ class ECONLearner:
                             recall[i] = (ci / gti) if gti > 0 else 0.0
                     # precision_c = correct_c / pred_c
                     if isinstance(pred_counts, torch.Tensor):
-                        for i in range(int(nc)):
+                        for i in range(int(nc_stats)):
                             pi = float(pred_counts[i].item())
                             ci = float(correct_counts[i].item())
                             pred_cnt[i] = pi
@@ -748,6 +925,28 @@ class ECONLearner:
                             precision[i] = (ci / pi) if pi > 0 else 0.0
             except Exception:
                 pass
+            # Marginal gap diagnostics (pred marginal - gt marginal). Useful to see distribution mismatch in TB.
+            gap0 = float("nan")
+            gap1 = float("nan")
+            try:
+                if len(pred_frac) > 0 and len(gt_frac) > 0:
+                    if (pred_frac[0] == pred_frac[0]) and (gt_frac[0] == gt_frac[0]):
+                        gap0 = float(pred_frac[0] - gt_frac[0])
+                if len(pred_frac) > 1 and len(gt_frac) > 1:
+                    if (pred_frac[1] == pred_frac[1]) and (gt_frac[1] == gt_frac[1]):
+                        gap1 = float(pred_frac[1] - gt_frac[1])
+            except Exception:
+                gap0 = float("nan")
+                gap1 = float("nan")
+            # Monitor z_t shortcut usage (gate value in (0,1)). Only meaningful when z-fusion is enabled.
+            z_gate = float("nan")
+            try:
+                agent = getattr(self.mac, "agent", None)
+                g = getattr(agent, "population_belief_gate_logit", None) if agent is not None else None
+                if isinstance(g, torch.Tensor):
+                    z_gate = float(torch.sigmoid(g.detach()).float().item())
+            except Exception:
+                z_gate = float("nan")
             return {
                 "status": "belief_supervised",
                 "loss_total": float(total_loss.item()),
@@ -771,6 +970,12 @@ class ECONLearner:
                 "belief_sup_maxprob": float(dbg_maxprob_sum / max(1, dbg_maxprob_count)) if dbg_maxprob_count > 0 else float("nan"),
                 "belief_sup_logit_abs_mean": float(dbg_logit_abs_sum / max(1, dbg_logit_count)) if dbg_logit_count > 0 else float("nan"),
                 "belief_sup_logit_std": float(dbg_logit_std_sum / max(1, dbg_logit_count)) if dbg_logit_count > 0 else float("nan"),
+                # prob-based (stable) for binary(0/1) and general CE:
+                "belief_sup_p0_mean": float(dbg_p0_sum / max(1, dbg_p0_count)) if dbg_p0_count > 0 else float("nan"),
+                "belief_sup_p1_mean": float(dbg_p1_sum / max(1, dbg_p1_count)) if dbg_p1_count > 0 else float("nan"),
+                "belief_sup_p0_gt05_frac": float(dbg_p0_gt05_sum / max(1, dbg_p0_gt05_count)) if dbg_p0_gt05_count > 0 else float("nan"),
+                "belief_sup_hard_pred0_frac": float(dbg_hard_pred0_sum / max(1, dbg_hard_pred0_count)) if dbg_hard_pred0_count > 0 else float("nan"),
+                "belief_sup_delta01_mean": float(dbg_delta01_sum / max(1, dbg_delta01_count)) if dbg_delta01_count > 0 else float("nan"),
                 # soft-label diagnostics: verify Scheme-B is actually used
                 "belief_sup_soft_available_frac": float(soft_available_steps / float(steps)) if steps > 0 else 0.0,
                 "belief_sup_soft_used_frac": float(soft_used_steps / float(steps)) if steps > 0 else 0.0,
@@ -782,6 +987,9 @@ class ECONLearner:
                 "belief_sup_gt0_frac": float(gt_frac[0]) if len(gt_frac) > 0 else float("nan"),
                 "belief_sup_gt1_frac": float(gt_frac[1]) if len(gt_frac) > 1 else float("nan"),
                 "belief_sup_gt2_frac": float(gt_frac[2]) if len(gt_frac) > 2 else float("nan"),
+                "belief_sup_marginal_gap0": float(gap0),
+                "belief_sup_marginal_gap1": float(gap1),
+                "belief_sup_z_gate": float(z_gate),
                 # per-class recall/precision (for stance K=3)
                 "belief_sup_recall0": float(recall[0]) if len(recall) > 0 else float("nan"),
                 "belief_sup_recall1": float(recall[1]) if len(recall) > 1 else float("nan"),
@@ -806,6 +1014,9 @@ class ECONLearner:
                 "belief_sup_ce_w0": float(ce_weight_list[0]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 0 else float("nan"),
                 "belief_sup_ce_w1": float(ce_weight_list[1]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 1 else float("nan"),
                 "belief_sup_ce_w2": float(ce_weight_list[2]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 2 else float("nan"),
+                # For Stage3b action imitation (K=5), also expose w3/w4 when configured
+                "belief_sup_ce_w3": float(ce_weight_list[3]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 3 else float("nan"),
+                "belief_sup_ce_w4": float(ce_weight_list[4]) if isinstance(ce_weight_list, list) and len(ce_weight_list) > 4 else float("nan"),
             }
 
         # ==============================
@@ -902,18 +1113,79 @@ class ECONLearner:
                     st_flat = stage_t_seq.reshape(bs * seq_len, -1) if stage_t_seq is not None else None
 
                     # Compute z_pred explicitly so we can log ||z_pred - z_t|| / ||z_target - z_t||
-                    z_pred_flat = self.belief_encoder.predict_next_population_belief(
-                        z_t_flat,
-                        group_repr=gr_flat,
-                        stage_t=st_flat,
-                        return_logits=False,
-                    )
-                    z_tr_loss = self.belief_encoder.compute_population_belief_loss(
-                        z_pred_flat,
-                        z_target_flat,
-                        z_mask_flat,
-                        loss_type=getattr(self.args, "z_transition_loss_type", "kl"),
-                    )
+                    lt = str(getattr(self.args, "z_transition_loss_type", "kl") or "kl").strip().lower()
+                    if lt.startswith("dirichlet"):
+                        # Dirichlet parameterization: head predicts alpha (>0), rollout/control uses mean E[z]
+                        if not hasattr(self.belief_encoder, "predict_next_population_belief_alpha"):
+                            raise RuntimeError("Dirichlet z_transition requested but BeliefEncoder lacks predict_next_population_belief_alpha().")
+                        if not hasattr(self.belief_encoder, "compute_population_belief_loss_dirichlet_kl"):
+                            raise RuntimeError("Dirichlet z_transition requested but BeliefEncoder lacks compute_population_belief_loss_dirichlet_kl().")
+                        alpha_pred = self.belief_encoder.predict_next_population_belief_alpha(
+                            z_t_flat,
+                            group_repr=gr_flat,
+                            stage_t=st_flat,
+                        )
+                        # for diagnostics + downstream, use mean
+                        z_pred_flat = self.belief_encoder.population_belief_mean_from_alpha(alpha_pred)
+                        # alpha0_target: prefer per-sample inferred pseudo-counts from dataset/env if available
+                        alpha0_tgt_flat = None
+                        try:
+                            if "z_alpha0_target" in batch.scheme:
+                                a0_seq = batch["z_alpha0_target"][:, :-1].to(self.device)  # (bs, seq, 1)
+                                alpha0_tgt_flat = a0_seq.reshape(bs * seq_len)
+                        except Exception:
+                            alpha0_tgt_flat = None
+                        if alpha0_tgt_flat is None:
+                            alpha0_tgt_flat = float(getattr(self.args, "dirichlet_alpha0_target", 10.0))
+                        z_tr_loss = self.belief_encoder.compute_population_belief_loss_dirichlet_kl(
+                            alpha_pred,
+                            z_target_flat,
+                            z_mask_flat,
+                            alpha0_target=alpha0_tgt_flat,
+                        )
+                        # alpha stats (optional)
+                        try:
+                            zm = z_mask_flat.to(alpha_pred.device, dtype=alpha_pred.dtype).clamp(min=0.0, max=1.0)
+                            denom = torch.clamp(zm.sum(), min=1.0)
+                            a0 = alpha_pred.sum(dim=-1)
+                            train_stats_alpha0 = (a0 * zm).sum() / denom
+                            # Dirichlet entropy (uncertainty) + variance mass
+                            try:
+                                k_dir = int(alpha_pred.shape[-1])
+                                ap = torch.clamp(alpha_pred, min=float(getattr(self.belief_encoder, "dirichlet_alpha_min", 1e-6)))
+                                ap0 = torch.clamp(ap.sum(dim=-1), min=1e-6)
+                                # entropy: log B(a) + (a0-K)psi(a0) - sum((ai-1)psi(ai))
+                                logB = torch.sum(torch.lgamma(ap), dim=-1) - torch.lgamma(ap0)
+                                ent = logB + (ap0 - float(k_dir)) * torch.digamma(ap0) - torch.sum((ap - 1.0) * torch.digamma(ap), dim=-1)
+                                train_stats_dir_entropy = (ent * zm).sum() / denom
+                                # total variance mass: sum_i Var[p_i]
+                                ap0u = ap0.unsqueeze(-1)
+                                var = (ap * (ap0u - ap)) / (ap0u * ap0u * (ap0u + 1.0))
+                                var_sum = var.sum(dim=-1)
+                                train_stats_dir_varsum = (var_sum * zm).sum() / denom
+                            except Exception:
+                                train_stats_dir_entropy = None
+                                train_stats_dir_varsum = None
+                        except Exception:
+                            train_stats_alpha0 = None
+                            train_stats_dir_entropy = None
+                            train_stats_dir_varsum = None
+                    else:
+                        z_pred_flat = self.belief_encoder.predict_next_population_belief(
+                            z_t_flat,
+                            group_repr=gr_flat,
+                            stage_t=st_flat,
+                            return_logits=False,
+                        )
+                        z_tr_loss = self.belief_encoder.compute_population_belief_loss(
+                            z_pred_flat,
+                            z_target_flat,
+                            z_mask_flat,
+                            loss_type=lt,
+                        )
+                        train_stats_alpha0 = None
+                        train_stats_dir_entropy = None
+                        train_stats_dir_varsum = None
                     encoder_loss = encoder_loss + self.z_transition_loss_weight * z_tr_loss
 
                     # === Diagnostics for TensorBoard ===
@@ -1010,6 +1282,12 @@ class ECONLearner:
                 train_stats["loss_z_transition"] = float(z_tr_loss.item())
                 # diagnostics (optional)
                 try:
+                    if "train_stats_alpha0" in locals() and train_stats_alpha0 is not None:
+                        train_stats["z_pred_alpha0_mean"] = float(train_stats_alpha0.item())
+                    if "train_stats_dir_entropy" in locals() and train_stats_dir_entropy is not None:
+                        train_stats["z_pred_dirichlet_entropy"] = float(train_stats_dir_entropy.item())
+                    if "train_stats_dir_varsum" in locals() and train_stats_dir_varsum is not None:
+                        train_stats["z_pred_dirichlet_varsum"] = float(train_stats_dir_varsum.item())
                     if z_pred_minus_z_t_l2 is not None:
                         train_stats["z_pred_minus_z_t_l2"] = float(z_pred_minus_z_t_l2.item())
                     if z_target_minus_z_t_l2 is not None:
@@ -1320,14 +1598,36 @@ class ECONLearner:
                 gr_flat = gr_seq.reshape(bs * seq_len, -1)
                 st_flat = stage_t_seq.reshape(bs * seq_len, -1) if stage_t_seq is not None else None
 
-                z_tr_loss = self.belief_encoder.compute_loss(
-                    z_t_flat,
-                    z_target_flat,
-                    z_mask_flat,
-                    group_repr=gr_flat,
-                    stage_t=st_flat,
-                    loss_type=getattr(self.args, "z_transition_loss_type", "kl"),
-                )
+                lt = str(getattr(self.args, "z_transition_loss_type", "kl") or "kl").strip().lower()
+                if lt.startswith("dirichlet"):
+                    if not hasattr(self.belief_encoder, "predict_next_population_belief_alpha"):
+                        raise RuntimeError("Dirichlet z_transition requested but BeliefEncoder lacks predict_next_population_belief_alpha().")
+                    if not hasattr(self.belief_encoder, "compute_population_belief_loss_dirichlet_kl"):
+                        raise RuntimeError("Dirichlet z_transition requested but BeliefEncoder lacks compute_population_belief_loss_dirichlet_kl().")
+                    alpha_pred = self.belief_encoder.predict_next_population_belief_alpha(
+                        z_t_flat,
+                        group_repr=gr_flat,
+                        stage_t=st_flat,
+                    )
+                    z_tr_loss = self.belief_encoder.compute_population_belief_loss_dirichlet_kl(
+                        alpha_pred,
+                        z_target_flat,
+                        z_mask_flat,
+                        alpha0_target=(
+                            (batch["z_alpha0_target"][:, :-1].to(self.device).reshape(bs * seq_len))
+                            if ("z_alpha0_target" in batch.scheme)
+                            else float(getattr(self.args, "dirichlet_alpha0_target", 10.0))
+                        ),
+                    )
+                else:
+                    z_tr_loss = self.belief_encoder.compute_loss(
+                        z_t_flat,
+                        z_target_flat,
+                        z_mask_flat,
+                        group_repr=gr_flat,
+                        stage_t=st_flat,
+                        loss_type=lt,
+                    )
                 encoder_loss = encoder_loss + self.z_transition_loss_weight * z_tr_loss
         except Exception as e:
             self.logger.warning(f"z_transition_loss skipped due to error: {e}")
@@ -1379,6 +1679,24 @@ class ECONLearner:
             "q_total_stage2_mean": local_q_values_stage2.mean().item(),
             "reward_mean": rewards_flat.mean().item(),
         }
+        # S3b bias injection diagnostics (S4)
+        try:
+            agent = getattr(self.mac, "agent", None)
+            if agent is not None:
+                a = getattr(agent, "last_s3b_bias_alpha", None)
+                bm = getattr(agent, "last_s3b_bias_logit_mean", None)
+                bs = getattr(agent, "last_s3b_bias_logit_std", None)
+                af = getattr(agent, "last_s3b_bias_applied_frac", None)
+                if a is not None:
+                    train_stats["s3b_bias_alpha"] = float(a)
+                if bm is not None:
+                    train_stats["s3b_bias_logit_mean"] = float(bm)
+                if bs is not None:
+                    train_stats["s3b_bias_logit_std"] = float(bs)
+                if af is not None:
+                    train_stats["s3b_bias_applied_frac"] = float(af)
+        except Exception:
+            pass
         if self.z_head is not None:
             train_stats["loss_z"] = z_loss.item()
         if self.z_transition_loss_weight and self.z_transition_loss_weight > 0:

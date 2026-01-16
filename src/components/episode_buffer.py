@@ -13,6 +13,45 @@ class EpisodeBatch:
         
         self.data = {}
         self._setup_data()
+
+    def to(self, device) -> "EpisodeBatch":
+        """
+        Move all stored tensors to a target device (in-place) and update self.device.
+
+        This is critical for Stage1/2 supervised replay:
+        - store replay batches on CPU to avoid unbounded GPU memory growth
+        - move only the sampled mini-batch to CUDA for training
+        """
+        try:
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+        except Exception:
+            dev = device
+        # If already on target, no-op
+        try:
+            if str(self.device) == str(dev):
+                return self
+        except Exception:
+            pass
+        self.device = dev
+        for k, v in list(self.data.items()):
+            if isinstance(v, torch.Tensor):
+                # Detach to avoid keeping any accidental graphs; these are data tensors.
+                self.data[k] = v.detach().to(dev, non_blocking=True)
+        return self
+
+    def pin_memory(self) -> "EpisodeBatch":
+        """
+        Pin CPU tensors to speed up CPU->GPU transfers with non_blocking=True.
+        Safe no-op if tensors are not on CPU.
+        """
+        for k, v in list(self.data.items()):
+            if isinstance(v, torch.Tensor):
+                try:
+                    if v.device.type == "cpu":
+                        self.data[k] = v.pin_memory()
+                except Exception:
+                    pass
+        return self
         
     def _setup_data(self):
         """Initialize data storage structures."""

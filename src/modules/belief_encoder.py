@@ -29,6 +29,9 @@ class BeliefEncoder(nn.Module):
         population_update_hidden_dim: int = 128,
         population_update_use_group_repr: bool = True,
         population_update_use_stage: bool = False,
+        # --- population belief (categorical vs dirichlet) ---
+        population_update_parametrization: str = "categorical",
+        dirichlet_alpha_min: float = 1e-3,
         # --- optional structured conditioning vector for z-transition ---
         population_update_use_extra_cond: bool = False,
         population_update_extra_cond_dim: int = 0,
@@ -76,6 +79,14 @@ class BeliefEncoder(nn.Module):
         self.population_update_hidden_dim = int(population_update_hidden_dim)
         self.population_update_use_group_repr = bool(population_update_use_group_repr)
         self.population_update_use_stage = bool(population_update_use_stage)
+        self.population_update_parametrization = str(population_update_parametrization or "categorical").strip().lower()
+        if self.population_update_parametrization in ("dirichlet", "dir", "dirichlet_alpha", "alpha"):
+            self.population_update_parametrization = "dirichlet"
+        else:
+            self.population_update_parametrization = "categorical"
+        self.dirichlet_alpha_min = float(dirichlet_alpha_min) if dirichlet_alpha_min is not None else 1e-3
+        if self.dirichlet_alpha_min <= 0:
+            self.dirichlet_alpha_min = 1e-6
         self.population_update_use_extra_cond = bool(population_update_use_extra_cond)
         self.population_update_extra_cond_dim = int(population_update_extra_cond_dim)
         self.population_update_residual_mixing = bool(population_update_residual_mixing)
@@ -365,30 +376,184 @@ class BeliefEncoder(nn.Module):
         if int(self.population_belief_dim) == 1:
             # tanh squashes to [-1,1]
             z_hat = torch.tanh(logits)
-        else:
-            z_hat = F.softmax(logits, dim=-1)
-
-        # residual mixing (convex combination keeps simplex)
-        if self.population_update_residual_mixing:
-            if int(self.population_belief_dim) == 1:
-                # scalar convex mixing, clamp to [-1,1]
+            # residual mixing (scalar)
+            if self.population_update_residual_mixing:
                 z_in = torch.clamp(z_t, min=-1.0, max=1.0)
-            else:
+                mix = None
+                if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                    mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+                else:
+                    mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=z_hat.device))
+                mix = mix.to(z_hat.device, dtype=z_hat.dtype).view(1, 1)
+                z_hat = mix * z_hat + (1.0 - mix) * z_in
+            return torch.clamp(z_hat, min=-1.0, max=1.0)
+
+        # === categorical / dirichlet mode: K>1 on simplex ===
+        if self.population_update_parametrization == "dirichlet":
+            alpha = self._dirichlet_alpha_from_logits(logits)  # (bs,K) positive
+            mean = self.population_belief_mean_from_alpha(alpha)  # (bs,K)
+            if self.population_update_residual_mixing:
                 z_in = torch.clamp(z_t, min=0.0)
                 z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+                mix = None
+                if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                    mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+                else:
+                    mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=mean.device))
+                mix = mix.to(mean.device, dtype=mean.dtype).view(1, 1)
+                mean = mix * mean + (1.0 - mix) * z_in
+                mean = mean / torch.clamp(mean.sum(dim=-1, keepdim=True), min=1e-8)
+            return mean
+
+        # categorical logits -> softmax probs (legacy)
+        z_hat = F.softmax(logits, dim=-1)
+        if self.population_update_residual_mixing:
+            z_in = torch.clamp(z_t, min=0.0)
+            z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+            mix = None
             if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
                 mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
             else:
                 mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=z_hat.device))
-            # broadcast scalar -> [bs,1]
             mix = mix.to(z_hat.device, dtype=z_hat.dtype).view(1, 1)
             z_out = mix * z_hat + (1.0 - mix) * z_in
-            if int(self.population_belief_dim) == 1:
-                return torch.clamp(z_out, min=-1.0, max=1.0)
-            # safety renorm (categorical simplex)
             return z_out / torch.clamp(z_out.sum(dim=-1, keepdim=True), min=1e-8)
-
         return z_hat
+
+    def _dirichlet_alpha_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Convert unconstrained head output logits -> Dirichlet alpha (>0).
+        We use softplus for stable positivity, plus a small floor.
+        """
+        # softplus(logits) is strictly positive; alpha_min avoids extremely tiny concentrations
+        alpha = F.softplus(logits) + float(self.dirichlet_alpha_min)
+        return alpha
+
+    @staticmethod
+    def population_belief_mean_from_alpha(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """E[z] for Dirichlet(alpha): alpha / sum(alpha)."""
+        a = torch.clamp(alpha, min=0.0)
+        return a / torch.clamp(a.sum(dim=-1, keepdim=True), min=eps)
+
+    def predict_next_population_belief_alpha(
+        self,
+        z_t: torch.Tensor,
+        *,
+        group_repr: Optional[torch.Tensor] = None,
+        stage_t: Optional[torch.Tensor] = None,
+        extra_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Return Dirichlet alpha for z(t+1).
+        - Only valid when population_belief_dim>1 and population_update_parametrization=="dirichlet".
+        - If residual mixing is enabled, we mix in mean-space but keep alpha0 (=sum alpha) from the head.
+        """
+        if int(self.population_belief_dim) == 1:
+            raise RuntimeError("predict_next_population_belief_alpha is not defined for scalar z (population_belief_dim==1).")
+        if self.population_update_parametrization != "dirichlet":
+            raise RuntimeError("predict_next_population_belief_alpha requires population_update_parametrization='dirichlet'.")
+        # reuse input assembly from predict_next_population_belief (but we need logits)
+        logits = self.predict_next_population_belief(
+            z_t,
+            group_repr=group_repr,
+            stage_t=stage_t,
+            extra_cond=extra_cond,
+            return_logits=True,
+        )
+        alpha = self._dirichlet_alpha_from_logits(logits)
+        if self.population_update_residual_mixing:
+            mean = self.population_belief_mean_from_alpha(alpha)
+            z_in = z_t
+            if z_in.ndim == 1:
+                z_in = z_in.unsqueeze(0)
+            z_in = torch.clamp(z_in, min=0.0)
+            z_in = z_in / torch.clamp(z_in.sum(dim=-1, keepdim=True), min=1e-8)
+            mix = None
+            if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
+                mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
+            else:
+                mix = getattr(self, "population_update_mix_const", torch.tensor(self.population_update_mixing_init, device=mean.device))
+            mix = mix.to(mean.device, dtype=mean.dtype).view(1, 1)
+            mean = mix * mean + (1.0 - mix) * z_in
+            mean = mean / torch.clamp(mean.sum(dim=-1, keepdim=True), min=1e-8)
+            alpha0 = torch.clamp(alpha.sum(dim=-1, keepdim=True), min=float(self.dirichlet_alpha_min) * float(self.population_belief_dim))
+            alpha = torch.clamp(mean * alpha0, min=float(self.dirichlet_alpha_min))
+        return alpha
+
+    def compute_population_belief_loss_dirichlet_kl(
+        self,
+        alpha_pred: torch.Tensor,   # [bs, K] (alpha > 0)
+        z_target: torch.Tensor,     # [bs, K] (target mean on simplex)
+        z_mask: torch.Tensor,       # [bs] or [bs,1]
+        *,
+        alpha0_target: Any = 10.0,
+    ) -> torch.Tensor:
+        """
+        Dirichlet KL supervision with mask:
+          loss = KL( Dir(alpha_target) || Dir(alpha_pred) )
+
+        We only have z_target as a distribution (mean). We construct a target Dirichlet by:
+          alpha_target = alpha0_target * z_target + alpha_min
+        """
+        eps = 1e-8
+        if alpha_pred.ndim == 1:
+            alpha_pred = alpha_pred.unsqueeze(0)
+        if z_target.ndim == 1:
+            z_target = z_target.unsqueeze(0)
+        if alpha_pred.ndim != 2 or z_target.ndim != 2:
+            raise ValueError(f"alpha_pred/z_target 期望 [bs,K]，实际 alpha_pred={tuple(alpha_pred.shape)} z_target={tuple(z_target.shape)}")
+        if alpha_pred.size(-1) != z_target.size(-1):
+            raise ValueError(f"K 不一致: alpha_pred K={alpha_pred.size(-1)} vs z_target K={z_target.size(-1)}")
+        if int(alpha_pred.size(-1)) == 1:
+            raise RuntimeError("Dirichlet KL is not defined for K=1 scalar mode.")
+
+        # normalize target to simplex
+        zt = torch.clamp(z_target, min=0.0)
+        zt = zt / torch.clamp(zt.sum(dim=-1, keepdim=True), min=eps)
+
+        a_min = float(self.dirichlet_alpha_min)
+        # alpha0_target can be:
+        # - float: shared scalar for the whole batch
+        # - Tensor: per-sample alpha0 with shape [bs] or [bs,1]
+        a0_t = alpha0_target
+        if isinstance(a0_t, torch.Tensor):
+            a0v = a0_t
+            if a0v.ndim == 2 and a0v.shape[-1] == 1:
+                a0v = a0v.squeeze(-1)
+            if a0v.ndim != 1:
+                a0v = a0v.reshape(-1)
+            a0v = a0v.to(device=zt.device, dtype=zt.dtype)
+            # safety clamp: avoid tiny/negative/NaN
+            a0v = torch.nan_to_num(a0v, nan=0.0, posinf=0.0, neginf=0.0)
+            a0v = torch.clamp(a0v, min=1.0)
+            alpha_tgt = (a0v.unsqueeze(-1) * zt) + a_min
+        else:
+            try:
+                a0 = float(a0_t) if a0_t is not None else 10.0
+            except Exception:
+                a0 = 10.0
+            if a0 <= 0:
+                a0 = 10.0
+            alpha_tgt = (a0 * zt) + a_min
+
+        ap = torch.clamp(alpha_pred, min=a_min)
+        at = torch.clamp(alpha_tgt, min=a_min)
+
+        # KL(Dir(at) || Dir(ap))
+        at0 = at.sum(dim=-1)
+        ap0 = ap.sum(dim=-1)
+        t1 = torch.lgamma(at0) - torch.sum(torch.lgamma(at), dim=-1)
+        t2 = torch.lgamma(ap0) - torch.sum(torch.lgamma(ap), dim=-1)
+        dig_at = torch.digamma(at)
+        dig_at0 = torch.digamma(at0).unsqueeze(-1)
+        t3 = torch.sum((at - ap) * (dig_at - dig_at0), dim=-1)
+        kl = (t1 - t2 + t3)
+
+        if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
+            z_mask = z_mask.squeeze(-1)
+        m = z_mask.to(ap.device, dtype=ap.dtype).clamp(min=0.0, max=1.0)
+        kl = kl * m
+        return kl.sum() / (m.sum() + eps)
 
     def predict_secondary_action_probs(
         self,

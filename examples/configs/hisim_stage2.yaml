@@ -11,6 +11,9 @@ learner: "q_learner"
 #   but env_args.n_actions=3 is the actual stance label space.
 # - If you want to load Stage1 weights, pass --load_model_path <stage1_ckpt_dir> to src/train.py
 
+# DDP safety: Stage1/2 only uses stance_head for loss; other heads are unused -> needs find_unused_parameters.
+ddp_find_unused_params: true
+
 t_max: 50000
 test_interval: 2000
 test_nepisode: 2000
@@ -36,11 +39,12 @@ train_belief_supervised: true
 freeze_belief_encoder_in_supervised: true
 use_mixer: false
 belief_supervised_use_soft_labels: false
-belief_supervised_micro_batch_size: 4
+# With max_question_length=1024, attention memory is heavy; keep micro-batch=1 to reduce peak CUDA memory.
+belief_supervised_micro_batch_size: 64
 
 # ===== LRs / regularizers =====
 lr: 0.0003
-belief_net_lr: 0.0003
+belief_net_lr: 0.0001
 encoder_lr: 0.0
 mixer_lr: 0.0
 weight_decay: 0.0
@@ -95,6 +99,7 @@ reward:
 
 train:
   buffer_size: 256
+  # Global batch size (will be divided by world_size under DDP by default).
   batch_size: 64
   update_interval: 1
   supervised_min_label1_per_batch: 1
