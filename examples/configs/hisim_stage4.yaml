@@ -2,6 +2,41 @@ runner: "episode_runner"
 mac: "basic_mac"
 learner: "q_learner"
 
+# DDP safety: Stage4 may freeze/skip parts of the model (e.g., belief_network/encoder),
+# so some parameters can be unused in a given iteration.
+ddp_find_unused_params: true
+
+# ===== Stage4 optimizer knobs (IMPORTANT) =====
+# In this codebase, RL optimizers use:
+# - belief optimizer lr: belief_net_lr (fallback to lr)
+# - encoder optimizer lr: encoder_lr (fallback to lr)
+# - mixer optimizer lr: mixer_lr (fallback to lr)
+# `train.learning_rate` is NOT used to build these optimizers.
+#
+# Your intended Stage4 design:
+# - Freeze encoder + belief_network (representation)
+# - Train policy heads (action_type_head + optional stance_head) + optional s3b_bias_alpha
+# So: set belief_net_lr > 0, keep encoder_lr=0, and disable mixer by default.
+use_mixer: false
+lr: 0.0003
+belief_net_lr: 0.0001
+encoder_lr: 0.0
+mixer_lr: 0.0
+weight_decay: 0.0
+lambda_sd: 0.0
+lambda_m: 0.0
+
+# ===== Stage4 exploration (IMPORTANT to avoid collapse) =====
+# BasicMAC default action_selector is "multinomial".
+# We enable softmax sampling (instead of greedy argmax) plus epsilon-random exploration.
+action_selector: "multinomial"
+multinomial_sample_mode: "softmax"
+action_temperature: 1.0
+epsilon_start: 0.2
+epsilon_finish: 0.05
+epsilon_anneal_time: 20000
+test_greedy: true
+
 # Stage4 (online): multi-agent RL for core users with policy→LLM decoupling and z-based reward.
 # This config is intentionally "safer" than hisim_social.yaml:
 # - Use categorical z (K=3 distribution) to match your Stage3a dist model
@@ -9,9 +44,9 @@ learner: "q_learner"
 # - Freeze representation modules to avoid noisy reward destabilizing beliefs
 # - Short curriculum (5-10 stages first) is controlled by curriculum block
 
-t_max: 5000
+t_max: 500000
 test_interval: 2000
-test_nepisode: 2
+test_nepisode: 200
 
 # In sync-stage mode, we treat EACH core user as an "agent slot" with shared weights.
 # HiSim default core_users=300 for metoo; keep these consistent.
@@ -23,6 +58,23 @@ batch_size_run: 1
 n_actions: 5
 max_seq_length: 1024
 
+# Mixer/commitment-related dims (used by LLMQMixer even if you don't call external LLM APIs)
+# prompt_embedding_dim is fixed at 2 inside mixer, so num_heads must divide 2 -> {1,2}
+prompt_attention_heads: 2
+commitment_embedding_dim: 1024
+
+# Transformer agent architecture (required by LLMTransformerAgent)
+# Keep consistent with Stage1/2/3a/3b so checkpoints are compatible.
+arch:
+  entity_dim: 256
+  attention_heads: 4
+  transformer_blocks: 2
+  key_dim: 64
+  mlp_hidden_size: 256
+  feedforward_size: 1024
+  dropout_rate: 0.1
+  layer_norm_epsilon: 0.00001
+
 env_action_source: "sync_stage_policy"
 enable_llm_rollout: false
 llm_model_name: "gpt2"
@@ -33,6 +85,11 @@ commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
 llm_response_format_json: true
 use_nonparam_group_repr: true
 population_update_use_group_repr: true
+# Match Stage3a BeliefEncoder conditioning so `belief_encoder.th` loads without shape mismatch.
+population_update_use_stage: true
+# Match Stage3a Dirichlet parametrization (rollout/control uses E[z]; no sampling).
+population_update_parametrization: "dirichlet"
+dirichlet_alpha_min: 0.001
 
 env: "hisim_social_env"
 env_args:
@@ -66,6 +123,8 @@ env_args:
   secondary_sim_use_micro_texts: true
   # Disable hand-written ABM updater (we still aggregate counts, but z update uses secondary_z_next)
   population_belief_mode: "categorical3"
+  # Structured alignment (EpisodeRunner): when this is "noop", we override env z-update by passing
+  # `secondary_z_next` computed from policy's POST-stage aggregate group_repr_next.
   population_z_updater: "noop"
 
   # Stage4 reward: start simple with z-only reward
@@ -85,10 +144,10 @@ s3b_bias_mode: "diff01"
 s3b_bias_alpha: 1.0
 s3b_bias_alpha_trainable: true
 # Constrain alpha to be non-negative and optionally bounded (alpha = exp(beta))
-s3b_bias_alpha_max: 5.0
+s3b_bias_alpha_max: 3.0
 # Gate bias injection by stance-head confidence (only inject when stance is confident)
 s3b_bias_gate_by_stance: true
-s3b_bias_stance_min_conf: 0.6
+s3b_bias_stance_min_conf: 0.9
 
 # Curriculum: gradually increase number of stages once training is stable
 curriculum:

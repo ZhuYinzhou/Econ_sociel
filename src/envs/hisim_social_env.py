@@ -1171,8 +1171,8 @@ class HiSimSocialEnv(gym.Env):
         # =========================
         # Low-priority (should be truncated first)
         # =========================
+        history: List[str] = []
         if user_history:
-            history: List[str] = []
             history.append("Optional / low-priority: historical posts (observed; may be truncated):")
             hs = [ln.strip() for ln in str(user_history).splitlines() if ln.strip()]
             if self.max_user_history_lines > 0:
@@ -1180,8 +1180,6 @@ class HiSimSocialEnv(gym.Env):
             for ln in hs:
                 history.append(str(ln))
             history.append("")
-            else:
-            history = []
 
         task: List[str] = []
         task.append("Task: Choose ONE action for this user at this stage.")

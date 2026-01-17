@@ -18,8 +18,14 @@ class Logger:
     with support for various data types and formats.
     """
     
-    def __init__(self, console_logger: logging.Logger, directory: str, 
-                 experiment_name: str, use_tensorboard: bool = True):
+    def __init__(
+        self,
+        console_logger: logging.Logger,
+        directory: str,
+        experiment_name: str,
+        use_tensorboard: bool = True,
+        write_metrics_file: bool = True,
+    ):
         """
         Initialize the logger.
         
@@ -32,6 +38,8 @@ class Logger:
         self.console_logger = console_logger
         self.experiment_name = experiment_name
         self.use_tensorboard = use_tensorboard
+        # In DDP we usually want ONLY rank0 to write metrics.jsonl to avoid duplicates.
+        self.write_metrics_file = bool(write_metrics_file)
         
         # Setup log directory
         self.log_dir = Path(directory) / experiment_name
@@ -129,16 +137,17 @@ class Logger:
         if self.use_tensorboard:
             self.tb_writer.add_scalar(key, value, t)
             
-        # Log to metrics file
-        with open(self.metric_log_path, 'a') as f:
-            log_entry = {
-                'time': datetime.now().isoformat(),
-                'step': t,
-                'metric': key,
-                'value': value,
-                'window_size': window
-            }
-            f.write(json.dumps(log_entry) + '\n')
+        # Log to metrics file (optional; disable on non-rank0 in DDP)
+        if self.write_metrics_file:
+            with open(self.metric_log_path, 'a') as f:
+                log_entry = {
+                    'time': datetime.now().isoformat(),
+                    'step': t,
+                    'metric': key,
+                    'value': value,
+                    'window_size': window
+                }
+                f.write(json.dumps(log_entry) + '\n')
 
     def print_recent_stats(self) -> None:
         """Print recent statistics to console."""
@@ -285,8 +294,12 @@ class Logger:
             self.tb_writer.close()
 
 
-def get_logger(log_dir: str = "logs", experiment_name: str = None,
-              use_tensorboard: bool = True) -> Logger:
+def get_logger(
+    log_dir: str = "logs",
+    experiment_name: str = None,
+    use_tensorboard: bool = True,
+    write_metrics_file: bool = True,
+) -> Logger:
     """
     Get a configured logger instance.
     
@@ -310,5 +323,6 @@ def get_logger(log_dir: str = "logs", experiment_name: str = None,
         console_logger=console_logger,
         directory=log_dir,
         experiment_name=experiment_name,
-        use_tensorboard=use_tensorboard
+        use_tensorboard=use_tensorboard,
+        write_metrics_file=write_metrics_file,
     )

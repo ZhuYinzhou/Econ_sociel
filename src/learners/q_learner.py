@@ -91,6 +91,23 @@ class ECONLearner:
         # Initialize networks and optimizers
         self._initialize_networks_and_optimizers(args)
 
+    def _unwrap_module(self, m: Any) -> Any:
+        """Unwrap DDP-wrapped modules for attribute access (e.g., .module)."""
+        return getattr(m, "module", m)
+
+    def _get_agent_module(self) -> Any:
+        """
+        Get underlying agent module (handles DDP wrapping and BasicMAC helpers).
+        This is required for accessing custom attributes like last_s3b_bias_alpha / s3b_bias_alpha_param.
+        """
+        try:
+            am = getattr(self.mac, "agent_module", None)
+            if am is not None:
+                return am
+        except Exception:
+            pass
+        return self._unwrap_module(getattr(self.mac, "agent", None))
+
     def _initialize_networks_and_optimizers(self, args: Any):
         # Initialize Mixer (CentralizedMixingNetwork)
         if getattr(args, "use_mixer", True):
@@ -162,7 +179,7 @@ class ECONLearner:
 
                 # Also freeze agent to avoid wasting memory on gradients (encoder-only stage doesn't need it)
                 try:
-                    agent = getattr(self.mac, "agent", None)
+                    agent = self._get_agent_module()
                     if agent is not None and hasattr(agent, "parameters"):
                         for p in agent.parameters():
                             p.requires_grad = False
@@ -214,7 +231,7 @@ class ECONLearner:
 
         # Stage4 RL recommended freezing knobs for agent parts (backward-compatible defaults)
         if (not self.train_belief_supervised) and (not self.train_encoder_only):
-            agent = getattr(self.mac, "agent", None)
+            agent = self._get_agent_module()
             try:
                 if bool(getattr(args, "freeze_belief_network_in_rl", False)) and agent is not None and hasattr(agent, "belief_network") and agent.belief_network is not None:
                     for p in agent.belief_network.parameters():
@@ -242,7 +259,7 @@ class ECONLearner:
         try:
             train_heads_rl = bool(getattr(args, "train_policy_heads_in_rl", True))
             if train_heads_rl and (not self.train_belief_supervised) and (not self.train_encoder_only):
-                agent = getattr(self.mac, "agent", None)
+                agent = self._get_agent_module()
                 if agent is not None:
                     # action_type_head is the 5-way action policy (post/retweet/reply/like/do_nothing)
                     if hasattr(agent, "action_type_head") and getattr(agent, "action_type_head") is not None:
@@ -251,6 +268,14 @@ class ECONLearner:
                     if bool(getattr(args, "train_stance_head_in_rl", True)):
                         if hasattr(agent, "stance_head") and getattr(agent, "stance_head") is not None:
                             self.belief_net_params.extend(list(agent.stance_head.parameters()))
+                    # Optional: trainable S3b prior strength alpha (beta-parametrized; alpha=exp(beta))
+                    # This parameter lives on the agent, not inside action_type_head, so we must include it explicitly.
+                    try:
+                        p = getattr(agent, "s3b_bias_alpha_param", None)
+                        if isinstance(p, torch.nn.Parameter) and bool(getattr(p, "requires_grad", False)):
+                            self.belief_net_params.append(p)
+                    except Exception:
+                        pass
         except Exception as e:
             self.logger.warning(f"Failed to include policy head params for RL training: {e}")
 
@@ -1318,9 +1343,23 @@ class ECONLearner:
         # ==============================
         # Full RL/mixer mode (default)
         # ==============================
-        if self.mixer is None:
-            self.logger.warning("Mixer is None, training will be skipped.")
-            return {"status": "skipped_mixer_none"}
+        # NOTE:
+        # In our HiSim social-media setup, we may deliberately disable the mixer
+        # (e.g., use_mixer: false) to avoid Coordinator-LLM dependencies and heavy memory.
+        # The original code used to *skip training entirely* when mixer is None, which makes
+        # Stage4 silently "run but never learn" (only runner-level reward/return gets logged).
+        #
+        # Fallback: VDN-style sum mixing (no mixer loss, no coordinator commitment loss).
+        # This keeps RL training functional without requiring LLMQMixer.
+        use_mixer = (self.mixer is not None) and (self.target_mixer is not None)
+        if not use_mixer:
+            # Warn only once to avoid log spam.
+            if not bool(getattr(self, "_warned_no_mixer_fallback", False)):
+                self.logger.warning(
+                    "Mixer is None; falling back to VDN-style sum mixing (mixer loss disabled). "
+                    "RL training will proceed without Coordinator-LLM / mixer objectives."
+                )
+                self._warned_no_mixer_fallback = True
 
         if hasattr(self.mac, 'init_hidden'):
             self.mac.init_hidden(batch.batch_size)
@@ -1360,10 +1399,72 @@ class ECONLearner:
 
         # Stage 1: Forward pass through time steps for individual belief formation
         self.logger.debug("Starting Stage 1: Individual belief formation")
+        # Stage4 action-distribution diagnostics (works for both mixer and mixer-disabled fallback):
+        # - action_pred_entropy: mean entropy of softmax(action_type logits) over all agents/timesteps
+        # - action_pred_mode_frac: mean fraction of the modal action among agents (per timestep)
+        action_ent_sum = torch.tensor(0.0, device=self.device)
+        action_ent_count = torch.tensor(0.0, device=self.device)
+        action_mode_sum = torch.tensor(0.0, device=self.device)
+        action_mode_count = torch.tensor(0.0, device=self.device)
+        # Executed-action diagnostics (from env/runner stored actions):
+        # - action_chosen_entropy: entropy of executed action histogram over agents (per timestep)
+        # - action_chosen_mode_frac: modal executed-action fraction over agents (per timestep)
+        chosen_ent_sum = torch.tensor(0.0, device=self.device)
+        chosen_ent_count = torch.tensor(0.0, device=self.device)
+        chosen_mode_sum = torch.tensor(0.0, device=self.device)
+        chosen_mode_count = torch.tensor(0.0, device=self.device)
         for t in range(batch.max_seq_length - 1):
             agent_outs_t, mac_info_t = self.mac.forward(batch, t, train_mode=True)
             list_belief_states_stage1.append(mac_info_t["belief_states"])
             list_prompt_embeddings_stage1.append(mac_info_t["prompt_embeddings"])
+            # Action distribution diagnostics when per-action logits are available
+            try:
+                if isinstance(agent_outs_t, torch.Tensor) and agent_outs_t.ndim == 3 and agent_outs_t.shape[-1] > 1:
+                    # agent_outs_t: (bs, n_agents, n_avail)
+                    logits = agent_outs_t
+                    p = torch.softmax(logits, dim=-1)
+                    ent = -(p * torch.log(torch.clamp(p, min=1e-8))).sum(dim=-1)  # (bs, n_agents)
+                    action_ent_sum = action_ent_sum + ent.mean()
+                    action_ent_count = action_ent_count + 1.0
+                    # mode_frac: for each bs item, fraction of most common argmax action among agents
+                    a = logits.argmax(dim=-1)  # (bs, n_agents)
+                    bs = int(a.shape[0])
+                    if bs > 0:
+                        mf = []
+                        for bi in range(bs):
+                            cnt = torch.bincount(a[bi].reshape(-1), minlength=int(logits.shape[-1])).float()
+                            denom = float(max(1, int(a.shape[1])))
+                            mf.append((cnt.max() / denom).clamp(0.0, 1.0))
+                        action_mode_sum = action_mode_sum + torch.stack(mf).mean()
+                        action_mode_count = action_mode_count + 1.0
+            except Exception:
+                pass
+            # Executed action diagnostics (from stored actions in EpisodeBatch)
+            try:
+                if "actions" in batch.scheme:
+                    a_t = batch["actions"][:, t].to(self.device)  # (bs, n_agents, 1) usually
+                    if isinstance(a_t, torch.Tensor):
+                        a = a_t.long()
+                        if a.ndim == 3 and a.shape[-1] == 1:
+                            a = a.squeeze(-1)
+                        if a.ndim == 2:
+                            bs = int(a.shape[0])
+                            A = int(agent_outs_t.shape[-1]) if (isinstance(agent_outs_t, torch.Tensor) and agent_outs_t.ndim == 3 and agent_outs_t.shape[-1] > 1) else int(getattr(self.args, "n_actions", 1))
+                            if bs > 0 and A > 1:
+                                ents = []
+                                mfs = []
+                                for bi in range(bs):
+                                    cnt = torch.bincount(a[bi].reshape(-1), minlength=A).float()
+                                    p = cnt / torch.clamp(cnt.sum(), min=1.0)
+                                    ent = -(p * torch.log(torch.clamp(p, min=1e-8))).sum()
+                                    ents.append(ent)
+                                    mfs.append((cnt.max() / float(max(1, int(a.shape[1])))).clamp(0.0, 1.0))
+                                chosen_ent_sum = chosen_ent_sum + torch.stack(ents).mean()
+                                chosen_ent_count = chosen_ent_count + 1.0
+                                chosen_mode_sum = chosen_mode_sum + torch.stack(mfs).mean()
+                                chosen_mode_count = chosen_mode_count + 1.0
+            except Exception:
+                pass
             # For RL with discrete actions, prefer chosen-action Q derived from per-action outputs.
             # This ensures action_type_head participates in TD updates (Stage4 objective).
             try:
@@ -1467,25 +1568,38 @@ class ECONLearner:
             commitment_features_flat = commitment_features_t_stacked.reshape(bs_x_seq_len, -1)
             self.logger.debug(f"Flattened commitment_features shape: {commitment_features_flat.shape}")
 
-        # Forward pass through mixer using Stage 2 coordinated values
-        mixer_results_stage2 = self.mixer(
-            local_q_values=local_q_values_stage2_flat,
-            prompt_embeddings=prompt_embeddings_stage2_flat,
-            group_representation=group_representation_stage2_flat
-        )
-        q_total_stage2_flat = mixer_results_stage2["Q_tot"] 
+        if use_mixer:
+            # Forward pass through mixer using Stage 2 coordinated values
+            mixer_results_stage2 = self.mixer(
+                local_q_values=local_q_values_stage2_flat,
+                prompt_embeddings=prompt_embeddings_stage2_flat,
+                group_representation=group_representation_stage2_flat
+            )
+            q_total_stage2_flat = mixer_results_stage2["Q_tot"]
 
-        # Target mixer forward pass using Stage 1 next values
-        # 需要计算target的group representation
-        target_group_repr_next = self.target_belief_encoder(belief_states_stage1_next_stacked.reshape(bs_x_seq_len, self.n_agents, -1)).reshape(bs_x_seq_len, -1)
-        target_prompt_embeddings_next_flat = torch.stack(list_prompt_embeddings_stage1_next, dim=1).reshape(bs_x_seq_len, self.n_agents, -1)
-        
-        target_mixer_results_next = self.target_mixer(
-            local_q_values=local_q_values_stage1_next_flat,
-            prompt_embeddings=target_prompt_embeddings_next_flat,
-            group_representation=target_group_repr_next
-        )
-        q_total_target_next_flat = target_mixer_results_next["Q_tot"].detach()
+            # Target mixer forward pass using Stage 1 next values
+            # 需要计算target的group representation
+            target_group_repr_next = self.target_belief_encoder(
+                belief_states_stage1_next_stacked.reshape(bs_x_seq_len, self.n_agents, -1)
+            ).reshape(bs_x_seq_len, -1)
+            target_prompt_embeddings_next_flat = torch.stack(list_prompt_embeddings_stage1_next, dim=1).reshape(bs_x_seq_len, self.n_agents, -1)
+            
+            target_mixer_results_next = self.target_mixer(
+                local_q_values=local_q_values_stage1_next_flat,
+                prompt_embeddings=target_prompt_embeddings_next_flat,
+                group_representation=target_group_repr_next
+            )
+            q_total_target_next_flat = target_mixer_results_next["Q_tot"].detach()
+        else:
+            # Mixer-disabled fallback:
+            # We use a *mean* aggregation instead of sum.
+            #
+            # Rationale:
+            # - Our env provides a single global scalar reward (`reward_total`), not a sum of per-agent rewards.
+            # - Using sum_i Q_i inflates Q scale by ~n_agents, which makes TD loss explode (~1e5-1e8).
+            # - Using mean_i Q_i keeps Q_tot on the same scale as the global return.
+            q_total_stage2_flat = local_q_values_stage2_flat.mean(dim=1)
+            q_total_target_next_flat = local_q_values_stage1_next_flat.mean(dim=1).detach()
 
         # Prepare reward/termination/mask as 1D vectors (N,) to avoid accidental (N,N) broadcasting
         rewards_flat = rewards.reshape(bs_x_seq_len)
@@ -1510,29 +1624,32 @@ class ECONLearner:
         )
 
         # ===========================================
-        # Mixer Loss Calculation
+        # Mixer Loss Calculation (optional)
         # ===========================================
-        
-        F_i_for_LSD = mixer_results_stage2.get("F_i_for_LSD")
-        
-        # 调试信息
-        self.logger.debug(f"F_i_for_LSD is None: {F_i_for_LSD is None}")
-        self.logger.debug(f"commitment_features_flat is None: {commitment_features_flat is None}")
-        self.logger.debug(f"lambda_sd: {self.lambda_sd}")
-        
-        total_mix_loss, loss_components = self.mixer.calculate_mix_loss(
-            Q_tot=q_total_stage2_flat,
-            local_q_values=local_q_values_stage2_flat,
-            F_i_for_LSD=F_i_for_LSD,
-            commitment_text_features=commitment_features_flat,
-            target_Q_tot=target_q_total_flat,
-            rewards_total=rewards_flat,
-            gamma=self.gamma,
-            lambda_sd=self.lambda_sd,
-            lambda_m=self.lambda_m,
-            terminated=terminated_flat,
-            mask_flat=mask_flat
-        )
+        if use_mixer:
+            F_i_for_LSD = mixer_results_stage2.get("F_i_for_LSD")
+            
+            # 调试信息
+            self.logger.debug(f"F_i_for_LSD is None: {F_i_for_LSD is None}")
+            self.logger.debug(f"commitment_features_flat is None: {commitment_features_flat is None}")
+            self.logger.debug(f"lambda_sd: {self.lambda_sd}")
+            
+            total_mix_loss, loss_components = self.mixer.calculate_mix_loss(
+                Q_tot=q_total_stage2_flat,
+                local_q_values=local_q_values_stage2_flat,
+                F_i_for_LSD=F_i_for_LSD,
+                commitment_text_features=commitment_features_flat,
+                target_Q_tot=target_q_total_flat,
+                rewards_total=rewards_flat,
+                gamma=self.gamma,
+                lambda_sd=self.lambda_sd,
+                lambda_m=self.lambda_m,
+                terminated=terminated_flat,
+                mask_flat=mask_flat
+            )
+        else:
+            total_mix_loss = torch.tensor(0.0, device=self.device)
+            loss_components = {"mixer_disabled": 1.0}
 
         # ===========================================
         # BeliefEncoder Loss
@@ -1679,9 +1796,21 @@ class ECONLearner:
             "q_total_stage2_mean": local_q_values_stage2.mean().item(),
             "reward_mean": rewards_flat.mean().item(),
         }
+        # Stage4: action distribution diagnostics (entropy/mode fraction)
+        try:
+            if float(action_ent_count.item()) > 0:
+                train_stats["action_pred_entropy"] = float((action_ent_sum / action_ent_count).item())
+            if float(action_mode_count.item()) > 0:
+                train_stats["action_pred_mode_frac"] = float((action_mode_sum / action_mode_count).item())
+            if float(chosen_ent_count.item()) > 0:
+                train_stats["action_chosen_entropy"] = float((chosen_ent_sum / chosen_ent_count).item())
+            if float(chosen_mode_count.item()) > 0:
+                train_stats["action_chosen_mode_frac"] = float((chosen_mode_sum / chosen_mode_count).item())
+        except Exception:
+            pass
         # S3b bias injection diagnostics (S4)
         try:
-            agent = getattr(self.mac, "agent", None)
+            agent = self._get_agent_module()
             if agent is not None:
                 a = getattr(agent, "last_s3b_bias_alpha", None)
                 bm = getattr(agent, "last_s3b_bias_logit_mean", None)
@@ -1904,9 +2033,22 @@ class ECONLearner:
         batch_size, seq_len, n_agents = q_values_stage1.shape
         
         # 1. Stage 1 TD Loss (个体学习)
-        target_q_expanded = target_q_total.unsqueeze(-1).expand(-1, -1, n_agents)
-        td_error_stage1 = (q_values_stage1 - target_q_expanded.detach()) * mask.unsqueeze(-1)
-        loss_td_stage1 = (td_error_stage1 ** 2).sum() / mask.sum().clamp(min=1e-6)
+        #
+        # IMPORTANT:
+        # - When mixer is disabled (VDN-style fallback), target_q_total is a *global* TD target built from
+        #   Q_tot = sum_i Q_i. In that case, the standard TD loss should be computed on Q_tot directly:
+        #       L = (Q_tot - target_Q_tot)^2
+        #   NOT by expanding the global target to every agent and forcing each agent-Q to match it.
+        #   The latter scales loss by ~n_agents and can blow up to 1e8+ even when values are reasonable.
+        if self.mixer is None or self.target_mixer is None:
+            # Keep scale consistent with the mean-mixing fallback in train().
+            q_tot_stage1 = q_values_stage1.mean(dim=-1)  # (batch, seq_len)
+            td_err_tot = (q_tot_stage1 - target_q_total.detach()) * mask  # (batch, seq_len)
+            loss_td_stage1 = (td_err_tot ** 2).sum() / mask.sum().clamp(min=1e-6)
+        else:
+            target_q_expanded = target_q_total.unsqueeze(-1).expand(-1, -1, n_agents)
+            td_error_stage1 = (q_values_stage1 - target_q_expanded.detach()) * mask.unsqueeze(-1)
+            loss_td_stage1 = (td_error_stage1 ** 2).sum() / mask.sum().clamp(min=1e-6)
         
         # 2. Stage 2 BNE Consistency Loss (协调一致性)
         # 衡量Stage 2中agents之间的Q值一致性

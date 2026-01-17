@@ -375,7 +375,16 @@ class LLMTransformerAgent(nn.Module):
         """
         # 通过置信网络获取置信状态, prompt embedding e_i, 和局部 Q值 Q_i^t
         # 'inputs' 参数现在被理解为 local_history_obs
-        belief_outputs = self.belief_network(inputs, mask)
+        # Stage4 memory optimization:
+        # If belief_network is frozen in RL, do NOT build an autograd graph for it.
+        # This keeps gradients flowing to action heads while avoiding huge attention activations.
+        freeze_bn_rl = bool(getattr(self.args, "freeze_belief_network_in_rl", False))
+        use_no_grad_bn = bool(self.training) and (not bool(test_mode)) and freeze_bn_rl
+        if use_no_grad_bn:
+            with torch.no_grad():
+                belief_outputs = self.belief_network(inputs, mask)
+        else:
+            belief_outputs = self.belief_network(inputs, mask)
         
         belief_state = belief_outputs['belief_state']
         prompt_embedding = belief_outputs['prompt_embedding'] # e_i

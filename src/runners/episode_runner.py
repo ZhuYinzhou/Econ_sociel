@@ -259,6 +259,8 @@ class EpisodeRunner:
                 # you can set args.env_action_source="discrete_action_boxed" to use the chosen discrete action.
                 action_source = str(getattr(self.args, "env_action_source", "commitment")).strip().lower()
                 action_for_env_step = ""
+                secondary_z_next_override = None
+                secondary_z_next_source = None
                 # HiSimSocialEnv sync-stage mode: pass list[dict] actions aligned to env.core_users.
                 try:
                     if bool(getattr(self.env, "sync_stage_update", False)):
@@ -301,6 +303,85 @@ class EpisodeRunner:
                             acts.append({"action_type": at, "stance_id": sid, "post_text": ""})
                         action_for_env_step = acts
                         action_source = "sync_stage_policy"
+
+                        # ===== Structured alignment for learned z-update (Stage4) =====
+                        # Goal: make env z-update depend on stage-end aggregate behavior.
+                        # We build a compact post-stage group representation from the policy-chosen
+                        # (action_type, stance_id) across all core users, then ask BeliefEncoder
+                        # to predict z_{t+1} conditioned on (z_t, group_repr_next, stage_t).
+                        try:
+                            env_name = str(getattr(self.args, "env", "") or "").strip().lower()
+                            pbm = str(getattr(getattr(self.args, "env_args", None), "population_z_updater", "") or "").strip().lower()
+                            use_sec = bool(getattr(getattr(self.args, "env_args", None), "use_secondary_belief_sim", False))
+                            if env_name == "hisim_social_env" and use_sec and pbm in ("noop", "none", "no_op", "no-op"):
+                                be = getattr(self.mac, "belief_encoder_module", None)
+                                if be is not None and hasattr(be, "predict_next_population_belief"):
+                                    # Build nonparam post-stage group repr vector
+                                    dim = int(getattr(getattr(self.args, "env_args", None), "group_representation_dim", getattr(self.args, "belief_dim", 128)))
+                                    dim = max(8, int(dim))
+                                    v = torch.zeros((dim,), dtype=torch.float32, device=self.args.device)
+                                    at_counts = torch.zeros((5,), dtype=torch.float32, device=self.args.device)
+                                    st_counts = torch.zeros((3,), dtype=torch.float32, device=self.args.device)
+                                    for a in acts:
+                                        try:
+                                            at = str(a.get("action_type") or "").strip().lower()
+                                            sid = a.get("stance_id", None)
+                                        except Exception:
+                                            at = ""
+                                            sid = None
+                                        if at == "post":
+                                            at_counts[0] += 1.0
+                                        elif at == "retweet":
+                                            at_counts[1] += 1.0
+                                        elif at == "reply":
+                                            at_counts[2] += 1.0
+                                        elif at == "like":
+                                            at_counts[3] += 1.0
+                                        else:
+                                            at_counts[4] += 1.0
+                                        if at in stance_actions and sid is not None:
+                                            try:
+                                                si = int(sid)
+                                                if 0 <= si < 3:
+                                                    st_counts[si] += 1.0
+                                            except Exception:
+                                                pass
+                                    st_sum = float(st_counts.sum().item())
+                                    at_sum = float(at_counts.sum().item())
+                                    if st_sum > 0:
+                                        v[:3] = st_counts / st_sum
+                                    if at_sum > 0:
+                                        v[3:8] = at_counts / at_sum
+
+                                    # Fetch z_t / stage_t from current batch (bs-level at current timestep)
+                                    z_t = None
+                                    st_t = None
+                                    try:
+                                        if hasattr(self.batch, "scheme") and "belief_pre_population_z" in self.batch.scheme:
+                                            z_t = self.batch["belief_pre_population_z"][:, self.t]  # (bs, K)
+                                        elif hasattr(self.batch, "scheme") and "z_t" in self.batch.scheme:
+                                            z_t = self.batch["z_t"][:, self.t]
+                                        if hasattr(self.batch, "scheme") and "stage_t" in self.batch.scheme:
+                                            st_t = self.batch["stage_t"][:, self.t]
+                                        if isinstance(st_t, torch.Tensor) and st_t.ndim == 2 and st_t.shape[1] == 1:
+                                            st_t = st_t.squeeze(1)
+                                    except Exception:
+                                        z_t = None
+                                        st_t = None
+                                    if isinstance(z_t, torch.Tensor):
+                                        bs0 = int(z_t.shape[0])
+                                        gr_next = v.view(1, -1).expand(bs0, -1)
+                                        with torch.no_grad():
+                                            secondary_z_next_override = be.predict_next_population_belief(
+                                                z_t,
+                                                group_repr=gr_next,
+                                                stage_t=st_t,
+                                                return_logits=False,
+                                            )
+                                        secondary_z_next_source = "policy_post_stage_group_repr"
+                        except Exception:
+                            secondary_z_next_override = None
+                            secondary_z_next_source = None
                 except Exception:
                     pass
                 if action_source in ("discrete_action_boxed", "boxed", "discrete"):
@@ -388,7 +469,8 @@ class EpisodeRunner:
                     "prompt_embeddings": mac_extra_info.get("prompt_embeddings"),
                     "belief_states": mac_extra_info.get("belief_states"),
                     # optional: secondary user belief for env-side simulation
-                    "secondary_z_next": mac_extra_info.get("secondary_z_next"),
+                    "secondary_z_next": secondary_z_next_override if secondary_z_next_override is not None else mac_extra_info.get("secondary_z_next"),
+                    "secondary_z_next_source": secondary_z_next_source,
                     "secondary_action_probs": mac_extra_info.get("secondary_action_probs"),
                 }
 
@@ -1008,10 +1090,30 @@ class EpisodeRunner:
             self.train_returns.append(episode_return)
             self.logger.log_stat("train_return", episode_return, self.t_env)
 
-    def _add_final_data(self, next_observation_text: str):
-        """Add final (next) observations to batch at self.t (which is 1)."""
+    def _add_final_data(self, next_observation_text: Any):
+        """
+        Add final (next) observations to batch at self.t (t == episode_limit).
+
+        NOTE:
+        - For HiSimSocialEnv in sync-stage mode, observation can be list[str] (per-agent prompts).
+        - At termination, some envs may return empty list/None as next_obs.
+        Tokenizers expect a string (or non-empty batch), so we must sanitize here.
+        """
+        safe_text = ""
+        try:
+            if isinstance(next_observation_text, (list, tuple)):
+                if len(next_observation_text) > 0:
+                    safe_text = str(next_observation_text[0])
+                else:
+                    safe_text = ""
+            elif next_observation_text is None:
+                safe_text = ""
+            else:
+                safe_text = str(next_observation_text)
+        except Exception:
+            safe_text = ""
         # Preprocess the next (dummy) observation text
-        next_obs_tensor = self.mac.preprocess_observation(next_observation_text)
+        next_obs_tensor = self.mac.preprocess_observation(safe_text)
 
         default_state_vshape = self.env_info.get("state_shape", (1,))
         default_avail_actions_vshape = (self.env_info.get("n_actions", 1),)

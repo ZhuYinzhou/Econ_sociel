@@ -145,14 +145,16 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
         config.load_model_path = str(args.load_model_path)
 
     # Distributed options (torchrun/DDP)
-    if getattr(args, "distributed", None) is not None:
-        config.distributed = bool(args.distributed)
+    # NOTE: argparse store_true flags default to False even when user didn't pass them.
+    # We should NOT override YAML config with False by default; only override when True is explicitly requested.
+    if bool(getattr(args, "distributed", False)):
+        config.distributed = True
     if getattr(args, "ddp_backend", None):
         config.ddp_backend = str(args.ddp_backend)
-    if getattr(args, "ddp_find_unused_params", None) is not None:
-        config.ddp_find_unused_params = bool(args.ddp_find_unused_params)
-    if getattr(args, "ddp_reduce_batch_by_world_size", None) is not None:
-        config.ddp_reduce_batch_by_world_size = bool(args.ddp_reduce_batch_by_world_size)
+    if bool(getattr(args, "ddp_find_unused_params", False)):
+        config.ddp_find_unused_params = True
+    if bool(getattr(args, "ddp_reduce_batch_by_world_size", False)):
+        config.ddp_reduce_batch_by_world_size = True
     
     # Add wandb related configuration
     if not hasattr(config, 'wandb'):
@@ -182,17 +184,26 @@ def setup_experiment(config: SimpleNamespace):
     log_dir = "logs"
     exp_name = None
     use_tb = True
+    write_metrics_file = True
     try:
         if hasattr(config, "logging"):
             log_dir = str(getattr(config.logging, "log_path", log_dir) or log_dir)
             exp_name = getattr(config.logging, "experiment_name", exp_name)
             use_tb = bool(getattr(config.logging, "use_tensorboard", use_tb))
+            # Allow disabling metrics.jsonl writing (rare), but keep default True.
+            write_metrics_file = bool(getattr(config.logging, "write_metrics_file", write_metrics_file))
     except Exception:
         pass
     # In DDP: only rank0 writes TensorBoard/metrics.jsonl to avoid duplicate event streams.
     if dist_enabled and rank != 0:
         use_tb = False
-    logger = get_logger(log_dir=log_dir, experiment_name=exp_name, use_tensorboard=use_tb)
+        write_metrics_file = False
+    logger = get_logger(
+        log_dir=log_dir,
+        experiment_name=exp_name,
+        use_tensorboard=use_tb,
+        write_metrics_file=write_metrics_file,
+    )
     logger.info("Setting up experiment environment...")
     
     # Set random seed
@@ -473,6 +484,18 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     dist_rank = int(getattr(config, "distributed_rank", 0) or 0)
     dist_world = int(getattr(config, "distributed_world_size", 1) or 1)
     is_rank0 = (dist_rank == 0)
+    dist_enabled = bool(dist_world > 1) and (_HAS_DIST and dist is not None and dist.is_initialized())
+
+    def _ddp_barrier(tag: str = "") -> None:
+        """Best-effort barrier to keep ranks in sync around long-running side effects (eval/save)."""
+        if not dist_enabled:
+            return
+        try:
+            dist.barrier()
+        except Exception as e:
+            # Don't crash training due to barrier issues; still surface a hint on rank0.
+            if is_rank0:
+                logger.warning(f"[DDP] barrier failed{(' '+tag) if tag else ''}: {e}")
 
     # ===== Stage1/2: supervised mini-batch replay (critical for stability) =====
     # The runner returns an EpisodeBatch with batch_size_run (often 1). If we train on it directly,
@@ -675,6 +698,15 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
                     if "reward_mean" in train_stats:
                         logger.log_stat("train/reward_mean", float(train_stats["reward_mean"]), t_env)
+                    # Stage4: S3b prior injection diagnostics (if present)
+                    for k in (
+                        "s3b_bias_alpha",
+                        "s3b_bias_logit_mean",
+                        "s3b_bias_logit_std",
+                        "s3b_bias_applied_frac",
+                    ):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
                     # Stage1/2 supervised accuracy (if present)
                     if "belief_sup_acc" in train_stats:
                         logger.log_stat("train/belief_sup_acc", float(train_stats["belief_sup_acc"]), t_env)
@@ -760,6 +792,10 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         logger.log_stat("train/action_sup_coverage", float(train_stats["belief_sup_coverage"]), t_env)
                     if "belief_sup_skipped_ratio" in train_stats:
                         logger.log_stat("train/action_sup_skipped_ratio", float(train_stats["belief_sup_skipped_ratio"]), t_env)
+                    # Stage4: action distribution diagnostics (works for RL; helps detect collapse / no-exploration)
+                    for k in ("action_pred_entropy", "action_pred_mode_frac", "action_chosen_entropy", "action_chosen_mode_frac"):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
 
                     # sliding moving averages (smoothed curves)
                     if "loss_total" in train_stats:
@@ -860,8 +896,8 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             except Exception as e:
                 logger.warning(f"Failed to log fixed train metrics: {e}")
             
-            # Log training statistics
-            if episode % log_interval == 0:
+            # Log training statistics (rank0 only in DDP to avoid duplicated console spam)
+            if is_rank0 and (episode % log_interval == 0):
                 logger.info(f"Episode {episode}, t_env: {t_env}")
                 for key, value in train_stats.items():
                     logger.info(f"  {key}: {value}")
@@ -870,19 +906,82 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 if hasattr(config, 'wandb') and config.wandb.use_wandb:
                     log_to_wandb(train_stats, episode, 'train/')
             
-            # Save model periodically (rank0 only in DDP)
-            if is_rank0 and episode % save_model_interval == 0 and episode > 0:
-                save_path = Path(config.logging.checkpoint_path) / f"episode_{episode}"
-                save_path.mkdir(parents=True, exist_ok=True)
-                learner.save_models(str(save_path))
-                logger.info(f"Model saved at episode {episode}")
+            # Save model periodically
+            # DDP NOTE: save is rank0-only, but we still sync ranks so others don't race ahead into collectives.
+            if episode % save_model_interval == 0 and episode > 0:
+                _ddp_barrier("pre-save")
+                if is_rank0:
+                    save_path = Path(config.logging.checkpoint_path) / f"episode_{episode}"
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    learner.save_models(str(save_path))
+                    logger.info(f"Model saved at episode {episode}")
+                _ddp_barrier("post-save")
             
-            # Test periodically (rank0 only in DDP)
-            if is_rank0 and episode % test_interval == 0 and episode > 0:
-                test_stats = run_test(runner, logger, config)
-                logger.info(f"Test results at episode {episode}:")
-                for key, value in test_stats.items():
-                    logger.info(f"  {key}: {value}")
+            # Test periodically
+            # CRITICAL DDP NOTE:
+            # Running eval on rank0 only will desync collectives (rank1 continues backward/allreduce
+            # while rank0 is stuck in env/forward/broadcast_buffers) -> NCCL watchdog timeout.
+            # So in DDP we run eval on ALL ranks, each handling a shard of episodes, then aggregate.
+            if episode % test_interval == 0 and episode > 0:
+                _ddp_barrier("pre-test")
+                test_stats = None
+                try:
+                    if dist_enabled:
+                        import math
+                        total = int(getattr(config, "test_nepisode", getattr(config, "test_nepisode", 10)) or 10)
+                        total = max(1, total)
+                        per = int(math.ceil(total / float(dist_world)))
+                        start = dist_rank * per
+                        end = min(total, (dist_rank + 1) * per)
+                        local_nep = max(0, int(end - start))
+                        cfg_local = copy.deepcopy(config)
+                        cfg_local.test_nepisode = max(1, local_nep) if local_nep > 0 else 1
+                        test_stats = run_test(runner, logger, cfg_local)
+
+                        # Aggregate selected numeric metrics to rank0
+                        def _allreduce_mean(key: str, weight_key: str = "test_episodes") -> float:
+                            try:
+                                v = float(test_stats.get(key, 0.0))
+                                w = float(test_stats.get(weight_key, 0.0))
+                                if not np.isfinite(v) or w <= 0:
+                                    v, w = 0.0, 0.0
+                                t = torch.tensor([v * w, w], device=device, dtype=torch.float32)
+                                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                                return float((t[0] / torch.clamp(t[1], min=1.0)).item())
+                            except Exception:
+                                return float("nan")
+
+                        def _allreduce_sum(key: str) -> float:
+                            try:
+                                v = float(test_stats.get(key, 0.0))
+                                if not np.isfinite(v):
+                                    v = 0.0
+                                t = torch.tensor([v], device=device, dtype=torch.float32)
+                                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                                return float(t[0].item())
+                            except Exception:
+                                return float("nan")
+
+                        if is_rank0:
+                            # overwrite with global aggregates for logging
+                            test_stats["test_return_mean"] = _allreduce_mean("test_return_mean", "test_episodes")
+                            test_stats["core_action_type_acc"] = _allreduce_mean("core_action_type_acc", "test_episodes")
+                            test_stats["core_stance_acc"] = _allreduce_mean("core_stance_acc", "test_episodes")
+                            test_stats["core_text_sim"] = _allreduce_mean("core_text_sim", "test_episodes")
+                            # z_kl weighted by eval steps if present
+                            test_stats["secondary_z_kl"] = _allreduce_mean("secondary_z_kl", "secondary_z_eval_steps")
+                            test_stats["test_episodes"] = int(_allreduce_sum("test_episodes"))
+                    else:
+                        if is_rank0:
+                            test_stats = run_test(runner, logger, config)
+                except Exception as e:
+                    if is_rank0:
+                        logger.warning(f"Test failed at episode {episode}: {e}")
+
+                if is_rank0 and isinstance(test_stats, dict):
+                    logger.info(f"Test results at episode {episode}:")
+                    for key, value in test_stats.items():
+                        logger.info(f"  {key}: {value}")
                 
                 # Log to wandb if enabled
                 if hasattr(config, 'wandb') and config.wandb.use_wandb:
@@ -974,6 +1073,7 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         pass
                 except Exception as e:
                     logger.warning(f"Failed to log test metrics: {e}")
+                _ddp_barrier("post-test")
         
         episode += 1
         # For multi-step environments, count the actual number of env steps executed
@@ -1024,7 +1124,14 @@ def _safe_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> float:
 
 def run_test(runner, logger, config: SimpleNamespace):
     """Run test episodes (task-specific evaluation for social-media simulation)."""
-    logger.info("Running test episodes...")
+    # In DDP, multiple ranks may run eval in parallel. Avoid duplicated console spam from non-rank0.
+    try:
+        _rank = int(getattr(config, "distributed_rank", 0) or 0)
+    except Exception:
+        _rank = 0
+    _is_rank0 = (_rank == 0)
+    if _is_rank0:
+        logger.info("Running test episodes...")
     
     test_episodes = int(getattr(config, "test_nepisode", 10))
     test_episodes = max(1, test_episodes)
@@ -1060,7 +1167,8 @@ def run_test(runner, logger, config: SimpleNamespace):
                 # reuse same scheme/groups/mac
                 eval_runner.setup(getattr(runner, "scheme", None), getattr(runner, "groups", None), getattr(runner, "preprocess", None), getattr(runner, "mac", None))
                 cache[eval_split] = eval_runner
-            logger.info(f"[Eval] Using eval_dataset_split='{eval_split}' (train split='{getattr(getattr(config, 'env_args', SimpleNamespace()), 'dataset_split', None)}').")
+            if _is_rank0:
+                logger.info(f"[Eval] Using eval_dataset_split='{eval_split}' (train split='{getattr(getattr(config, 'env_args', SimpleNamespace()), 'dataset_split', None)}').")
         except Exception as e:
             logger.warning(f"Failed to create eval runner for split='{eval_split}', fallback to training runner: {e}")
             eval_runner = runner

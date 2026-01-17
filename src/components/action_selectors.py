@@ -17,6 +17,11 @@ class MultinomialActionSelector:
         self.schedule_timesteps = getattr(args, "epsilon_anneal_time", 50000)
         self.epsilon = self.schedule_start
         self.test_greedy = getattr(args, "test_greedy", True)
+        # Action selection mode when not taking a random action:
+        # - "argmax": greedy over masked q-values (legacy)
+        # - "softmax": sample from softmax(masked_q_values / temperature)
+        self.sample_mode = str(getattr(args, "multinomial_sample_mode", "argmax") or "argmax").strip().lower()
+        self.temperature = float(getattr(args, "action_temperature", 1.0) or 1.0)
 
     def select_action(self, agent_inputs: torch.Tensor,
                     avail_actions: torch.Tensor,
@@ -46,12 +51,29 @@ class MultinomialActionSelector:
         random_numbers = torch.rand_like(agent_inputs[:, :, 0])
         pick_random = (random_numbers < epsilon).long()
         
-        # Get random and greedy actions
+        # Get random actions
         random_actions = self._get_random_actions(avail_actions)
-        greedy_actions = masked_q_values.max(dim=2)[1]
+
+        # Get policy actions (argmax or softmax-sampling)
+        if test_mode and self.test_greedy:
+            policy_actions = masked_q_values.max(dim=2)[1]
+        else:
+            if self.sample_mode in ("softmax", "sample", "sampling"):
+                temp = max(1e-6, float(self.temperature))
+                # masked_q_values has -inf for invalid actions; softmax will yield 0 prob there.
+                probs = torch.softmax(masked_q_values / temp, dim=-1)
+                # guard: if all actions are invalid (shouldn't happen), fallback to uniform over avail
+                probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+                row_sum = probs.sum(dim=-1, keepdim=True)
+                fallback = (avail_actions.float() + 1e-10)
+                fallback = fallback / fallback.sum(dim=-1, keepdim=True)
+                probs = torch.where(row_sum > 0, probs / torch.clamp(row_sum, min=1e-12), fallback)
+                policy_actions = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(probs.shape[0], -1)
+            else:
+                policy_actions = masked_q_values.max(dim=2)[1]
         
-        # Combine random and greedy actions
-        chosen_actions = pick_random * random_actions + (1 - pick_random) * greedy_actions
+        # Combine random and policy actions
+        chosen_actions = pick_random * random_actions + (1 - pick_random) * policy_actions
         
         return chosen_actions
 
