@@ -379,7 +379,6 @@ class BeliefEncoder(nn.Module):
             # residual mixing (scalar)
             if self.population_update_residual_mixing:
                 z_in = torch.clamp(z_t, min=-1.0, max=1.0)
-                mix = None
                 if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
                     mix = torch.sigmoid(self.population_update_mix_logit)  # scalar
                 else:

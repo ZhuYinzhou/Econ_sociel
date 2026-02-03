@@ -484,7 +484,9 @@ class HiSimSocialEnv(gym.Env):
         self.reward_w_stance = float(kwargs.get("reward_w_stance", 0.7))
         self.reward_w_text = float(kwargs.get("reward_w_text", 0.3))
         # Optional: z-based reward (Stage4 recommendation: start simple with z-only reward)
-        # - Computed at stage boundary where z_mask==1 (end of stage t, target is edge stance dist at t+1)
+        # - Computed at stage boundary where z_mask==1
+        # - Causal semantics (paper §2.1): at time t, core actions happen and population responds to form z_t.
+        #   Therefore the supervision/target at step t is the edge stance distribution at stage t (NOT t+1).
         # - Default 0.0 keeps backward compatibility
         self.reward_w_z = float(kwargs.get("reward_w_z", 0.0))
         self.reward_z_on_stage_end_only = bool(kwargs.get("reward_z_on_stage_end_only", True))
@@ -1508,6 +1510,33 @@ class HiSimSocialEnv(gym.Env):
         从 LLM 输出里解析 action_type / stance_id / post_text。
         向后兼容：若仅提供 {"stance_id":..,"post_text":..}，则视为 action_type="post"。
         """
+        # Stage4 / RL mode may pass discrete action ids directly (int / numpy int / torch scalar).
+        # In that case we must map id -> action_type; otherwise group_representation/core_posts
+        # will be inconsistent with action_hist and the policy's chosen actions.
+        try:
+            # torch scalar (cpu/cuda) -> int
+            import torch  # type: ignore
+
+            if isinstance(action, torch.Tensor) and action.numel() == 1:
+                try:
+                    action = int(action.detach().cpu().item())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            import numpy as np  # type: ignore
+
+            if isinstance(action, (np.integer,)):
+                action = int(action)
+        except Exception:
+            pass
+        if isinstance(action, int):
+            at_i = int(action)
+            if 0 <= at_i < len(self.action_types):
+                return str(self.action_types[at_i]), None, ""
+            return "do_nothing", None, ""
+
         if isinstance(action, dict):
             at = str(action.get("action_type") or action.get("action") or "").strip().lower()
             if not at:
@@ -1744,11 +1773,13 @@ class HiSimSocialEnv(gym.Env):
             # Non-parametric group repr for NEXT stage (based on the just-finished stage)
             group_repr_next = self._nonparam_group_representation_prev_stage(int(self.stage_t))
 
-            # z supervision: one per stage boundary (always in sync mode when t+1 exists)
-            z_mask = 1.0 if ((t + 1) < self.n_stages) else 0.0
-            z_target_stage = int(t) + 1
+            # z supervision: one per stage boundary
+            # Causal semantics: step at stage t forms z_t, so the target stage is t.
+            z_target_stage = int(t)
             labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
-            if z_mask > 0 and self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
+            z_mask = 1.0
+            # Gate: require enough labeled edge users for a valid target.
+            if self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
                 z_mask = 0.0
             if self.population_z_mode == "continuous":
                 z_target = [float(self.edge_z_scalar_by_stage.get(z_target_stage, 0.0))] if z_mask > 0 else [0.0]
@@ -2004,11 +2035,10 @@ class HiSimSocialEnv(gym.Env):
         }
 
         # === latent z supervision signal ===
-        # Only provide target once per stage: at the step that ends stage t.
-        # Target is edge distribution at stage (t+1) (transition supervision).
-        z_mask = 1.0 if (is_end_of_stage and (t + 1) < self.n_stages) else 0.0
-        # C: gate z supervision if labeled edge users at (t+1) are too few
-        z_target_stage = int(t) + 1
+        # Provide target once per stage boundary: at the step that ends stage t.
+        # Causal semantics: step at stage t forms z_t, so target stage is t (NOT t+1).
+        z_mask = 1.0 if bool(is_end_of_stage) else 0.0
+        z_target_stage = int(t)
         labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
         if z_mask > 0 and self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
             z_mask = 0.0

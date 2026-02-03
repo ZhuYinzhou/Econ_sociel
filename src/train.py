@@ -919,58 +919,44 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             
             # Test periodically
             # CRITICAL DDP NOTE:
-            # Running eval on rank0 only will desync collectives (rank1 continues backward/allreduce
-            # while rank0 is stuck in env/forward/broadcast_buffers) -> NCCL watchdog timeout.
-            # So in DDP we run eval on ALL ranks, each handling a shard of episodes, then aggregate.
+            # - DDP will run collectives (e.g., broadcast_buffers) during forward.
+            # - If different ranks execute a different number of forwards (e.g., sharded eval),
+            #   the collective sequence diverges and NCCL will timeout.
+            # Therefore in DDP we run eval on ALL ranks with the SAME number of episodes,
+            # then aggregate metrics via all_reduce (all ranks must participate in the all_reduce).
             if episode % test_interval == 0 and episode > 0:
                 _ddp_barrier("pre-test")
                 test_stats = None
                 try:
                     if dist_enabled:
-                        import math
-                        total = int(getattr(config, "test_nepisode", getattr(config, "test_nepisode", 10)) or 10)
-                        total = max(1, total)
-                        per = int(math.ceil(total / float(dist_world)))
-                        start = dist_rank * per
-                        end = min(total, (dist_rank + 1) * per)
-                        local_nep = max(0, int(end - start))
-                        cfg_local = copy.deepcopy(config)
-                        cfg_local.test_nepisode = max(1, local_nep) if local_nep > 0 else 1
-                        test_stats = run_test(runner, logger, cfg_local)
+                        test_stats = run_test(runner, logger, config)
+                        _ddp_barrier("pre-test-allreduce")
 
-                        # Aggregate selected numeric metrics to rank0
-                        def _allreduce_mean(key: str, weight_key: str = "test_episodes") -> float:
-                            try:
-                                v = float(test_stats.get(key, 0.0))
-                                w = float(test_stats.get(weight_key, 0.0))
-                                if not np.isfinite(v) or w <= 0:
-                                    v, w = 0.0, 0.0
-                                t = torch.tensor([v * w, w], device=device, dtype=torch.float32)
-                                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                                return float((t[0] / torch.clamp(t[1], min=1.0)).item())
-                            except Exception:
-                                return float("nan")
+                        # Aggregate selected numeric metrics across ranks (ALL ranks must call all_reduce).
+                        def _allreduce_mean(key: str, weight_key: str) -> float:
+                            v = float(test_stats.get(key, 0.0))
+                            w = float(test_stats.get(weight_key, 0.0))
+                            if (not np.isfinite(v)) or (not np.isfinite(w)) or w <= 0:
+                                v, w = 0.0, 0.0
+                            t = torch.tensor([v * w, w], device=device, dtype=torch.float32)
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                            return float((t[0] / torch.clamp(t[1], min=1.0)).item())
 
                         def _allreduce_sum(key: str) -> float:
-                            try:
-                                v = float(test_stats.get(key, 0.0))
-                                if not np.isfinite(v):
-                                    v = 0.0
-                                t = torch.tensor([v], device=device, dtype=torch.float32)
-                                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                                return float(t[0].item())
-                            except Exception:
-                                return float("nan")
+                            v = float(test_stats.get(key, 0.0))
+                            if not np.isfinite(v):
+                                v = 0.0
+                            t = torch.tensor([v], device=device, dtype=torch.float32)
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                            return float(t[0].item())
 
-                        if is_rank0:
-                            # overwrite with global aggregates for logging
-                            test_stats["test_return_mean"] = _allreduce_mean("test_return_mean", "test_episodes")
-                            test_stats["core_action_type_acc"] = _allreduce_mean("core_action_type_acc", "test_episodes")
-                            test_stats["core_stance_acc"] = _allreduce_mean("core_stance_acc", "test_episodes")
-                            test_stats["core_text_sim"] = _allreduce_mean("core_text_sim", "test_episodes")
-                            # z_kl weighted by eval steps if present
-                            test_stats["secondary_z_kl"] = _allreduce_mean("secondary_z_kl", "secondary_z_eval_steps")
-                            test_stats["test_episodes"] = int(_allreduce_sum("test_episodes"))
+                        # overwrite with global aggregates (on all ranks; only rank0 will print/log)
+                        test_stats["test_return_mean"] = _allreduce_mean("test_return_mean", "test_episodes")
+                        test_stats["core_action_type_acc"] = _allreduce_mean("core_action_type_acc", "test_episodes")
+                        test_stats["core_stance_acc"] = _allreduce_mean("core_stance_acc", "test_episodes")
+                        test_stats["core_text_sim"] = _allreduce_mean("core_text_sim", "test_episodes")
+                        test_stats["secondary_z_kl"] = _allreduce_mean("secondary_z_kl", "secondary_z_eval_steps")
+                        test_stats["test_episodes"] = int(_allreduce_sum("test_episodes"))
                     else:
                         if is_rank0:
                             test_stats = run_test(runner, logger, config)
@@ -982,97 +968,97 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     logger.info(f"Test results at episode {episode}:")
                     for key, value in test_stats.items():
                         logger.info(f"  {key}: {value}")
-                
-                # Log to wandb if enabled
-                if hasattr(config, 'wandb') and config.wandb.use_wandb:
-                    log_to_wandb(test_stats, episode, 'test/')
 
-                # Also write the key test metrics to TensorBoard/metrics.jsonl
-                try:
-                    for k in (
-                        "test_return_mean",
-                        "core_action_type_acc",
-                        "core_stance_acc",
-                        "core_text_sim",
-                        "secondary_z_kl",
-                        # Stage3a encoder-only eval keys
-                        "test_loss_z_transition",
-                        "test_kl_target_zt",
-                        "test_kl_target_zpred",
-                        "test_z_pred_minus_z_t_l2",
-                        "test_z_target_minus_z_t_l2",
-                        "test_z_pred_entropy",
-                        "test_z_pred_maxprob",
-                        "test_z_pred_p0_mean",
-                        "test_z_pred_p1_mean",
-                        "test_z_pred_p2_mean",
-                        "test_kl_target_zpred_nostage",
-                        "test_kl_target_zpred_nogr",
-                        "secondary_z_eval_steps",
-                        # Stage3b masked eval (HF datasets)
-                        "hf_eval_acc_masked",
-                        "hf_eval_total_masked",
-                        "hf_eval_skipped_unsup",
-                        "hf_eval_coverage",
-                        "hf_eval_skipped_ratio",
-                        # Stage3b collapse / marginal sanity (K=5 action imitation)
-                        "action_pred_entropy",
-                        "action_pred_mode_frac",
-                        "action_pred_kl_gt",
-                        "action_unsup_pred_frac",
-                        "action_unsup_gt_frac",
-                        # per-class stance metrics on eval split
-                        "stance_gt0_frac",
-                        "stance_gt1_frac",
-                        "stance_gt2_frac",
-                        "stance_pred0_frac",
-                        "stance_pred1_frac",
-                        "stance_pred2_frac",
-                        "stance_recall0",
-                        "stance_recall1",
-                        "stance_recall2",
-                        "stance_precision0",
-                        "stance_precision1",
-                        "stance_precision2",
-                        "stance_gt0_count",
-                        "stance_gt1_count",
-                        "stance_gt2_count",
-                        "stance_pred0_count",
-                        "stance_pred1_count",
-                        "stance_pred2_count",
-                        "stance_correct0_count",
-                        "stance_correct1_count",
-                        "stance_correct2_count",
-                        "stance_has_gt0",
-                        "stance_has_gt1",
-                        "stance_has_gt2",
-                        "stance_has_pred0",
-                        "stance_has_pred1",
-                        "stance_has_pred2",
-                    ):
-                        if k in test_stats:
-                            logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
-                    # Also log per-action marginals if present (Stage3b K=5)
+                    # Log to wandb if enabled
+                    if hasattr(config, 'wandb') and config.wandb.use_wandb:
+                        log_to_wandb(test_stats, episode, 'test/')
+
+                    # Also write the key test metrics to TensorBoard/metrics.jsonl
                     try:
-                        for k, v in test_stats.items():
-                            if not isinstance(k, str):
-                                continue
-                            if k.startswith("action_gt") or k.startswith("action_pred") or k.startswith("action_recall") or k.startswith("action_precision"):
-                                if isinstance(v, (int, float)) and (v == v):
+                        for k in (
+                            "test_return_mean",
+                            "core_action_type_acc",
+                            "core_stance_acc",
+                            "core_text_sim",
+                            "secondary_z_kl",
+                            # Stage3a encoder-only eval keys
+                            "test_loss_z_transition",
+                            "test_kl_target_zt",
+                            "test_kl_target_zpred",
+                            "test_z_pred_minus_z_t_l2",
+                            "test_z_target_minus_z_t_l2",
+                            "test_z_pred_entropy",
+                            "test_z_pred_maxprob",
+                            "test_z_pred_p0_mean",
+                            "test_z_pred_p1_mean",
+                            "test_z_pred_p2_mean",
+                            "test_kl_target_zpred_nostage",
+                            "test_kl_target_zpred_nogr",
+                            "secondary_z_eval_steps",
+                            # Stage3b masked eval (HF datasets)
+                            "hf_eval_acc_masked",
+                            "hf_eval_total_masked",
+                            "hf_eval_skipped_unsup",
+                            "hf_eval_coverage",
+                            "hf_eval_skipped_ratio",
+                            # Stage3b collapse / marginal sanity (K=5 action imitation)
+                            "action_pred_entropy",
+                            "action_pred_mode_frac",
+                            "action_pred_kl_gt",
+                            "action_unsup_pred_frac",
+                            "action_unsup_gt_frac",
+                            # per-class stance metrics on eval split
+                            "stance_gt0_frac",
+                            "stance_gt1_frac",
+                            "stance_gt2_frac",
+                            "stance_pred0_frac",
+                            "stance_pred1_frac",
+                            "stance_pred2_frac",
+                            "stance_recall0",
+                            "stance_recall1",
+                            "stance_recall2",
+                            "stance_precision0",
+                            "stance_precision1",
+                            "stance_precision2",
+                            "stance_gt0_count",
+                            "stance_gt1_count",
+                            "stance_gt2_count",
+                            "stance_pred0_count",
+                            "stance_pred1_count",
+                            "stance_pred2_count",
+                            "stance_correct0_count",
+                            "stance_correct1_count",
+                            "stance_correct2_count",
+                            "stance_has_gt0",
+                            "stance_has_gt1",
+                            "stance_has_gt2",
+                            "stance_has_pred0",
+                            "stance_has_pred1",
+                            "stance_has_pred2",
+                        ):
+                            if k in test_stats:
+                                logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
+                        # Also log per-action marginals if present (Stage3b K=5)
+                        try:
+                            for k, v in test_stats.items():
+                                if not isinstance(k, str):
+                                    continue
+                                if k.startswith("action_gt") or k.startswith("action_pred") or k.startswith("action_recall") or k.startswith("action_precision"):
+                                    if isinstance(v, (int, float)) and (v == v):
+                                        logger.log_stat(f"test/{k}", float(v), t_env)
+                        except Exception:
+                            pass
+                        # Stage3a per-stage buckets (dynamic keys)
+                        try:
+                            for k, v in test_stats.items():
+                                if not isinstance(k, str):
+                                    continue
+                                if k.startswith("test_z_pred_delta_l2_stage") or k.startswith("test_z_target_delta_l2_stage") or k.startswith("test_stage_mask_sum_stage"):
                                     logger.log_stat(f"test/{k}", float(v), t_env)
-                    except Exception:
-                        pass
-                    # Stage3a per-stage buckets (dynamic keys)
-                    try:
-                        for k, v in test_stats.items():
-                            if not isinstance(k, str):
-                                continue
-                            if k.startswith("test_z_pred_delta_l2_stage") or k.startswith("test_z_target_delta_l2_stage") or k.startswith("test_stage_mask_sum_stage"):
-                                logger.log_stat(f"test/{k}", float(v), t_env)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.warning(f"Failed to log test metrics: {e}")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.warning(f"Failed to log test metrics: {e}")
                 _ddp_barrier("post-test")
         
         episode += 1
@@ -1481,7 +1467,12 @@ def run_test(runner, logger, config: SimpleNamespace):
             # - reward_action_type: 1/0
             # - reward_ts: stance match 1/0
             # - reward_text: similarity 0..1
-            # Only count steps that have next-step supervision (gt_t < n_stages).
+            #
+            # IMPORTANT:
+            # - Some envs (e.g., hisim_social_env) do NOT provide gt_t/gt_available, but still provide
+            #   reward_action_type/reward_ts/reward_text and z_* signals. We should still evaluate.
+            # - Also, secondary z-eval should NOT be gated by gt_t. Previously a `continue` in the
+            #   legacy branch accidentally skipped z_* metrics entirely, producing all-0 test stats.
             valid = 0
             sum_at = 0.0
             sum_st = 0.0
@@ -1491,9 +1482,27 @@ def run_test(runner, logger, config: SimpleNamespace):
                 if not isinstance(info, dict):
                     continue
 
+                # secondary: stage boundary evaluation (z_mask == 1)
+                # Evaluate z alignment regardless of core supervision gating.
+                try:
+                    z_mask = float(info.get("z_mask", 0.0))
+                except Exception:
+                    z_mask = 0.0
+                if z_mask > 0.5 and ("z_pred" in info) and ("z_target" in info):
+                    try:
+                        z_eval_steps += 1
+                        z_kl_list.append(_safe_kl(np.array(info["z_target"]), np.array(info["z_pred"])))
+                    except Exception:
+                        # best-effort; don't crash eval due to a single bad sample
+                        pass
+
                 if use_legacy_schema:
                     try:
-                        gt_t = int(info.get("gt_t", -1))
+                        # Some envs don't emit gt_t; fall back to stage index `t` if present.
+                        _gt_t = info.get("gt_t", None)
+                        if _gt_t is None:
+                            _gt_t = info.get("t", -1)
+                        gt_t = int(_gt_t)
                     except Exception:
                         gt_t = -1
                     # A: only evaluate steps with usable supervision
@@ -1508,6 +1517,7 @@ def run_test(runner, logger, config: SimpleNamespace):
                         n_stages = 13
                     if gt_av <= 0:
                         continue
+                    # If gt_t is missing/invalid, skip ONLY core metrics, not secondary z-metrics.
                     if gt_t < 0 or gt_t >= n_stages:
                         continue
 
@@ -1549,22 +1559,13 @@ def run_test(runner, logger, config: SimpleNamespace):
                         pass
 
                     # additional masked-eval stats for Stage3b
-                    try:
+                try:
                         if gt is not None:
                             hf_eval_total += 1
                             if pr is not None and int(gt) == int(pr):
                                 hf_eval_correct += 1
-                    except Exception:
-                        pass
-
-                # secondary: stage boundary evaluation (z_mask == 1)
-                try:
-                    z_mask = float(info.get("z_mask", 0.0))
                 except Exception:
-                    z_mask = 0.0
-                if z_mask > 0.5 and ("z_pred" in info) and ("z_target" in info):
-                    z_eval_steps += 1
-                    z_kl_list.append(_safe_kl(np.array(info["z_target"]), np.array(info["z_pred"])))
+                        pass
 
             if valid > 0:
                 core_valid_steps.append(valid)

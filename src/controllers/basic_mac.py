@@ -972,6 +972,28 @@ Final Answer (max 50 tokens):"""
                                 continue
                             try:
                                 if tuple(cur[k].shape) != tuple(v.shape):
+                                    # Special-case: stage_embed weight often differs when env_args.n_stages changes
+                                    # across configs/checkpoints (e.g., curriculum vs full stages).
+                                    # For evaluation fairness, do a deterministic overlap copy instead of skipping.
+                                    if (
+                                        isinstance(k, str)
+                                        and k.endswith("stage_embed.weight")
+                                        and hasattr(cur[k], "shape")
+                                        and hasattr(v, "shape")
+                                        and (len(cur[k].shape) == 2)
+                                        and (len(v.shape) == 2)
+                                        and (int(cur[k].shape[1]) == int(v.shape[1]))
+                                    ):
+                                        try:
+                                            tgt = cur[k].detach().clone()
+                                            src = v.detach().clone() if hasattr(v, "detach") else v
+                                            n = min(int(tgt.shape[0]), int(src.shape[0]))
+                                            tgt[:n, :] = src[:n, :]
+                                            filtered[k] = tgt
+                                            continue
+                                        except Exception:
+                                            skipped_mismatch += 1
+                                            continue
                                     skipped_mismatch += 1
                                     continue
                             except Exception:

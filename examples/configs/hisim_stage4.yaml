@@ -31,10 +31,14 @@ lambda_m: 0.0
 # We enable softmax sampling (instead of greedy argmax) plus epsilon-random exploration.
 action_selector: "multinomial"
 multinomial_sample_mode: "softmax"
-action_temperature: 1.0
-epsilon_start: 0.2
-epsilon_finish: 0.05
-epsilon_anneal_time: 20000
+#
+# Stronger exploration to avoid early plateau / mode collapse:
+# - higher temperature -> softer sampling from logits
+# - higher epsilon + longer anneal -> keep random exploration longer
+action_temperature: 1.8
+epsilon_start: 0.35
+epsilon_finish: 0.15
+epsilon_anneal_time: 200000
 test_greedy: true
 
 # Stage4 (online): multi-agent RL for core users with policy→LLM decoupling and z-based reward.
@@ -134,7 +138,11 @@ env_args:
   reward_w_z: 1.0
   reward_z_on_stage_end_only: true
   mask_missing_gt: true
-  min_edge_labels_for_z_target: 200
+  # IMPORTANT:
+  # If this threshold is too high, many stages will have z_mask=0 -> reward_z=0 (no learning signal).
+  # Your stage4_debug_alignment showed many stages have edge_n < 200, so RL reward becomes too sparse.
+  # Start with 50 for better coverage; you can tune (e.g., 0/50/100) after verifying learning dynamics.
+  min_edge_labels_for_z_target: 50
 
 # === S3b prior bias injection (optional) ===
 # Treat S3b as a "preference scorer" and inject its bias into RL logits.

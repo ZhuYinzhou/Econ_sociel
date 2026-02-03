@@ -308,7 +308,10 @@ class EpisodeRunner:
                         # Goal: make env z-update depend on stage-end aggregate behavior.
                         # We build a compact post-stage group representation from the policy-chosen
                         # (action_type, stance_id) across all core users, then ask BeliefEncoder
-                        # to predict z_{t+1} conditioned on (z_t, group_repr_next, stage_t).
+                        # Causal semantics (paper §2.1):
+                        # - At stage t, core actions happen and population responds to form z_t.
+                        # - Policy is conditioned on z_{t-1} (pre-stage belief input), and we predict z_t.
+                        # Therefore this call predicts the *current* stage population state from the *previous* one.
                         try:
                             env_name = str(getattr(self.args, "env", "") or "").strip().lower()
                             pbm = str(getattr(getattr(self.args, "env_args", None), "population_z_updater", "") or "").strip().lower()
@@ -384,7 +387,11 @@ class EpisodeRunner:
                             secondary_z_next_source = None
                 except Exception:
                     pass
-                if action_source in ("discrete_action_boxed", "boxed", "discrete"):
+                # If we're in HiSim sync-stage policy mode, we've already constructed a per-agent
+                # list[dict] action aligned to env.core_users. Do NOT override it with commitment/LLM text.
+                if action_source in ("sync_stage_policy",):
+                    pass
+                elif action_source in ("discrete_action_boxed", "boxed", "discrete"):
                     try:
                         # discrete_actions is typically shape (bs, n_agents) or (n_agents,)
                         a = discrete_actions
@@ -644,7 +651,7 @@ class EpisodeRunner:
 
         pre_data: Dict[str, Any] = {
             "obs": obs_field,
-            "state": [torch.zeros(*default_state_vshape, device=self.args.device)],
+            "state": [torch.zeros(*default_state_vshape, device=self.args.device)], 
             "avail_actions": [
                 torch.ones(*default_avail_actions_vshape, device=self.args.device, dtype=torch.int64) for _ in range(self.n_agents)
             ],
