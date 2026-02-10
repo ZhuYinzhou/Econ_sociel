@@ -18,20 +18,13 @@ import json
 class LLMConfig:
     """Configuration for LLM parameters."""
     api_key: str
-    # Default to an OpenAI-style model name; can be overridden by config/args
-    model_name: str = "gpt-4.1"
+    model_name: str = "gpt-3.5-turbo"
     belief_dim: int = 64
     debug: bool = False
     max_retries: int = 6
     max_workers: int = 5
-    # OpenAI-compatible base URL root (NOT the full endpoint).
-    # Endpoints are derived as:
-    # - {base_url}/chat/completions
-    # - {base_url}/embeddings
     base_url: str = "https://pro.xiaoai.plus/v1"
     embeddings_base_url: Optional[str] = None
-    # If your provider supports extra non-standard fields (e.g. repetition_penalty),
-    # keep this enabled. If it errors, set False to send only OpenAI-standard params.
     allow_nonstandard_params: bool = True
     timeout: float = 60.0  # 增加默认超时时间
     retry_delay: float = 2.0  # 重试延迟
@@ -67,11 +60,9 @@ class DynamicParamNetwork(nn.Module):
         self.p_min = p_min
         self.p_max = p_max
         
-        # Temperature generation network
         self.W_t = nn.Linear(belief_dim, 1)
         self.b_t = nn.Parameter(torch.zeros(1))
         
-        # Top-p generation network
         self.W_p = nn.Linear(belief_dim, 1)
         self.b_p = nn.Parameter(torch.zeros(1))
         
@@ -87,11 +78,9 @@ class DynamicParamNetwork(nn.Module):
         Returns:
             Tuple of (temperature, top_p) parameters
         """
-        # Generate temperature parameter
         t = self.sigmoid(self.W_t(belief_state) + self.b_t)
         temperature = self.t_min + (self.t_max - self.t_min) * t
         
-        # Generate top-p parameter
         p = self.sigmoid(self.W_p(belief_state) + self.b_p)
         top_p = self.p_min + (self.p_max - self.p_min) * p
         
@@ -109,7 +98,6 @@ class APIHandler:
             config: LLM configuration
         """
         self.config = config
-        # Default embeddings endpoint to the same provider unless overridden.
         if (not hasattr(self.config, "embeddings_base_url")) or (self.config.embeddings_base_url is None):
             self.config.embeddings_base_url = self.config.base_url
         self.sleep_times = [2 ** i for i in range(config.max_retries)]  # Exponential backoff
@@ -126,12 +114,10 @@ class APIHandler:
             "Content-Type": "application/json",
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
-        # Keep raw text for debugging
         try:
             data = resp.json()
         except Exception:
             data = {"_raw_text": resp.text, "_status_code": resp.status_code}
-        # Raise for explicit HTTP errors (but still return parsed body for logging)
         if resp.status_code >= 400:
             raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}", response=resp)
         return data
@@ -145,7 +131,6 @@ class APIHandler:
         temperature: float = 0.7,
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
-        # OpenAI-compatible optional params
         response_format: Optional[Dict[str, Any]] = None,
         presence_penalty: Optional[float] = None,
         frequency_penalty: Optional[float] = None,
@@ -180,7 +165,6 @@ class APIHandler:
             frequency_penalty=frequency_penalty,
         )
     
-    # Backward-compatible name. This now sends an OpenAI-compatible Chat Completions request.
     def generate_together(
         self,
         model: str,
@@ -190,7 +174,6 @@ class APIHandler:
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
         streaming: bool = False,
-        # OpenAI-compatible optional params
         response_format: Optional[Dict[str, Any]] = None,
         presence_penalty: Optional[float] = None,
         frequency_penalty: Optional[float] = None,
@@ -227,23 +210,18 @@ class APIHandler:
                 if top_p is not None:
                     payload["top_p"] = float(top_p)
                 if response_format is not None:
-                    # OpenAI: {"type":"json_object"} etc.
                     payload["response_format"] = response_format
                 if presence_penalty is not None:
                     payload["presence_penalty"] = float(presence_penalty)
                 if frequency_penalty is not None:
                     payload["frequency_penalty"] = float(frequency_penalty)
-                # Non-standard: keep for providers that accept it (Together-like)
                 if repetition_penalty is not None and bool(getattr(self.config, "allow_nonstandard_params", True)):
                     payload["repetition_penalty"] = float(repetition_penalty)
                 
                 if streaming:
-                    # Keep legacy streaming helper (may not work for all providers).
                     return self._stream_response(payload)
 
                 url = self._chat_completions_url()
-                # Some providers may not support OpenAI "response_format".
-                # If it fails with a client error, retry once without response_format.
                 try:
                     data = self._post_json(url, payload)
                 except requests.exceptions.HTTPError as he:
@@ -264,7 +242,6 @@ class APIHandler:
                 if isinstance(data, dict) and "error" in data:
                     logger.error(f"API Error: {data.get('error')}")
                     return None
-                # OpenAI response: choices[0].message.content
                 output = str(data["choices"][0]["message"]["content"]).strip()
                 break
                 
@@ -311,7 +288,6 @@ class APIHandler:
                         embeddings_list.append(item["embedding"])
                     else:
                         logger.error(f"API Error: 'embedding' field missing or invalid in item: {item}")
-                        # Continue to process other embeddings if possible, or decide to return None
                 
                 if not embeddings_list: # If all items failed or data was empty
                     logger.warning("No embeddings were successfully extracted.")
@@ -320,7 +296,6 @@ class APIHandler:
                 break # Successful API call
                 
             except requests.exceptions.HTTPError as http_err:
-                # best-effort extract response body
                 body = ""
                 status = None
                 try:
@@ -338,7 +313,6 @@ class APIHandler:
                     time.sleep(sleep_time)
                 else: # Other client-side errors (4xx)
                     logger.error("Client-side error, not retrying for this attempt.")
-                    # No break here, will go to next sleep_time or fail if it's the last retry
             except Exception as e:
                 logger.error(f"API call for embeddings failed: {str(e)}")
                 if self.config.debug:
@@ -394,7 +368,7 @@ Responses from models:"""
 class ImprovedLLMWrapper:
     def __init__(self,
                  api_key: str,
-                 model_name: str = "gpt-4.1",
+                 model_name: str = "gpt-3.5-turbo",
                  belief_dim: int = 64,
                  encoding_dim: int = 384,
                  debug: bool = False,
@@ -436,11 +410,9 @@ class ImprovedLLMWrapper:
         
         self.encoding_dim = encoding_dim
         
-        # 缓存机制
         self.response_cache = {}
         self.max_cache_size = 1000
         
-        # 统计信息
         self.request_count = 0
         self.timeout_count = 0
         self.success_count = 0
@@ -578,7 +550,6 @@ class ImprovedLLMWrapper:
                 if attempt == self.api_handler.config.max_retries - 1:
                     return None
             
-            # 重试前等待
             if attempt < self.api_handler.config.max_retries - 1:
                 time.sleep(self.api_handler.config.retry_delay * (attempt + 1))  # 指数退避
         
@@ -594,7 +565,6 @@ class ImprovedLLMWrapper:
                          repetition_penalty: Optional[float] = None,
                          top_p: Optional[float] = None,
                          llm_model_name: Optional[str] = None,
-                         # OpenAI-compatible: request strict JSON output when supported by provider
                          response_format: Optional[Dict[str, Any]] = None) -> str:
        
         final_temp = temperature
@@ -655,10 +625,8 @@ class ImprovedLLMWrapper:
         """
         temperature, top_p = self.param_network(belief_states)
         
-        # Compute loss based on rewards
         loss = -torch.mean(rewards * (temperature + top_p))
         
-        # Update parameters
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

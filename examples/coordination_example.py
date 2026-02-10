@@ -24,7 +24,6 @@ def demonstrate_bne_coordination():
     print("3. Equilibrium: No agent can improve by unilaterally changing strategy")
     print("4. Convergence: Iterative updates lead to stable coordination")
     
-    # Simulate belief evolution
     simulate_belief_evolution()
     
     print("\n🔄 Two-Stage Process:")
@@ -48,28 +47,22 @@ def simulate_belief_evolution():
     print("\n📊 Belief Evolution Simulation")
     print("-" * 30)
     
-    # Simulate 3 agents, 5 coordination rounds
     n_agents = 3
     n_rounds = 5
     
-    # Initial beliefs (random starting points)
     np.random.seed(42)
     beliefs = np.random.uniform(0, 1, (n_agents, n_rounds))
     
-    # Simulate convergence
     for round_idx in range(1, n_rounds):
-        # Each agent updates based on others' beliefs
         for agent_idx in range(n_agents):
             other_beliefs = np.mean([beliefs[i, round_idx-1] 
                                    for i in range(n_agents) if i != agent_idx])
-            # Weighted combination of own belief and others'
             beliefs[agent_idx, round_idx] = (
                 0.7 * beliefs[agent_idx, round_idx-1] + 
                 0.3 * other_beliefs +
                 np.random.normal(0, 0.05)  # Small noise
             )
     
-    # Display convergence
     print("Agent belief evolution across rounds:")
     print("Round", end="")
     for i in range(n_rounds):
@@ -82,7 +75,6 @@ def simulate_belief_evolution():
             print(f"\t{beliefs[agent_idx, round_idx]:.3f}", end="")
         print()
     
-    # Check convergence
     final_std = np.std(beliefs[:, -1])
     print(f"\nFinal belief variance: {final_std:.4f}")
     if final_std < 0.1:
@@ -98,7 +90,6 @@ def demonstrate_coordination_benefits():
     print("\n🎯 Coordination vs Independent Reasoning")
     print("-" * 45)
     
-    # Simulate accuracy improvements
     scenarios = [
         ("Independent Agents", 0.65, "Each agent works alone"),
         ("Message Passing", 0.72, "Agents share explicit messages"),
@@ -124,7 +115,6 @@ def show_reward_breakdown():
     print("\n💰 Reward System Components")
     print("=" * 35)
     
-    # Example reward calculation
     example_scenario = {
         "correct_answer": True,
         "agent_consistency": 0.85,  # High agreement between agents
@@ -132,13 +122,11 @@ def show_reward_breakdown():
         "coordination_quality": 0.80  # Effective collaboration
     }
     
-    # Calculate individual rewards
     ts_reward = 1.0 if example_scenario["correct_answer"] else 0.0
     al_reward = example_scenario["agent_consistency"]
     cc_reward = (example_scenario["response_quality"] + 
                  example_scenario["coordination_quality"]) / 2
     
-    # Weighted total (typical weights)
     weights = {"TS": 0.5, "AL": 0.3, "CC": 0.2}
     total_reward = (weights["TS"] * ts_reward + 
                    weights["AL"] * al_reward + 
@@ -168,7 +156,6 @@ def create_coordination_diagram():
     try:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         
-        # Stage 1: Individual Analysis
         ax1.set_title("Stage 1: Individual Belief Formation")
         ax1.text(0.5, 0.8, "Question", ha='center', va='center', 
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
@@ -184,10 +171,8 @@ def create_coordination_diagram():
         ax1.set_ylim(0, 1)
         ax1.axis('off')
         
-        # Stage 2: Coordination
         ax2.set_title("Stage 2: BNE Coordination")
         
-        # Draw coordination connections
         for i, x1 in enumerate(agents_x):
             ax2.text(x1, 0.7, f"Agent {i+1}", ha='center', va='center',
                     bbox=dict(boxstyle="round,pad=0.2", facecolor="lightcoral"))
@@ -208,7 +193,6 @@ def create_coordination_diagram():
         
         plt.tight_layout()
         
-        # Save diagram
         output_dir = Path("examples/outputs")
         output_dir.mkdir(exist_ok=True)
         plt.savefig(output_dir / "coordination_flow.png", dpi=150, bbox_inches='tight')

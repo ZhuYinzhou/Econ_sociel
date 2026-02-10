@@ -19,27 +19,25 @@ class BeliefEncoder(nn.Module):
         n_heads: int = 4,
         key_dim: int = 64,
         device: torch.device = None,
-        # --- extensions for HiSim social simulation ---
         population_belief_dim: int = 3,
         use_population_token: bool = True,
         n_stages: int = 13,
         use_stage_token: bool = False,
-        # --- population belief update head (z(t) -> z(t+1)) ---
+        use_brief_encoder: bool = False,
+        brief_encoder_input_dim: int = 128,
+        brief_encoder_hidden_dim: int = 256,
+        brief_encoder_use_stage: bool = False,
         use_population_update_head: bool = True,
         population_update_hidden_dim: int = 128,
         population_update_use_group_repr: bool = True,
         population_update_use_stage: bool = False,
-        # --- population belief (categorical vs dirichlet) ---
         population_update_parametrization: str = "categorical",
         dirichlet_alpha_min: float = 1e-3,
-        # --- optional structured conditioning vector for z-transition ---
         population_update_use_extra_cond: bool = False,
         population_update_extra_cond_dim: int = 0,
-        # residual mixing: z_next = mix * z_hat + (1-mix) * z_t
         population_update_residual_mixing: bool = True,
         population_update_mixing_init: float = 0.5,
         population_update_mixing_learnable: bool = True,
-        # --- secondary user action belief head (optional) ---
         secondary_action_dim: int = 5,
         use_secondary_action_head: bool = False,
         secondary_action_hidden_dim: int = 128,
@@ -74,7 +72,11 @@ class BeliefEncoder(nn.Module):
         self.n_stages = int(n_stages)
         self.use_stage_token = bool(use_stage_token)
 
-        # population belief update head config
+        self.use_brief_encoder = bool(use_brief_encoder)
+        self.brief_encoder_input_dim = int(brief_encoder_input_dim)
+        self.brief_encoder_hidden_dim = int(brief_encoder_hidden_dim)
+        self.brief_encoder_use_stage = bool(brief_encoder_use_stage)
+
         self.use_population_update_head = bool(use_population_update_head)
         self.population_update_hidden_dim = int(population_update_hidden_dim)
         self.population_update_use_group_repr = bool(population_update_use_group_repr)
@@ -93,7 +95,6 @@ class BeliefEncoder(nn.Module):
         self.population_update_mixing_init = float(population_update_mixing_init)
         self.population_update_mixing_learnable = bool(population_update_mixing_learnable)
 
-        # secondary action belief head config
         self.secondary_action_dim = int(secondary_action_dim)
         self.use_secondary_action_head = bool(use_secondary_action_head)
         self.secondary_action_hidden_dim = int(secondary_action_hidden_dim)
@@ -101,14 +102,12 @@ class BeliefEncoder(nn.Module):
         self.secondary_action_use_stage = bool(secondary_action_use_stage)
         self.secondary_action_use_population = bool(secondary_action_use_population)
         
-        # 多头注意力层
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=belief_dim,
             num_heads=n_heads,
             batch_first=True
         )
 
-        # 将 population_belief(z) 投影到 belief_dim 作为 token
         if self.use_population_token:
             self.population_proj = nn.Sequential(
                 nn.Linear(self.population_belief_dim, belief_dim),
@@ -118,23 +117,28 @@ class BeliefEncoder(nn.Module):
         else:
             self.population_proj = None
 
-        # stage embedding (用于显式时序条件化)
-        #
-        # IMPORTANT:
-        # - 历史上 `stage_embed` 只在 use_stage_token=True 时初始化（用于 attention token）。
-        # - 但 Stage3a 希望 population_update_head 显式带 stage 条件，此时即使不把 stage 作为 token
-        #   融入 attention（use_stage_token=False），population_update_head 仍需要 stage_embed。
         need_stage_embed = bool(self.use_stage_token or self.population_update_use_stage or self.secondary_action_use_stage)
         if need_stage_embed:
-            # stage_t 预期为 [0..n_stages-1]，额外留一个 padding/unknown
             self.stage_embed = nn.Embedding(max(1, self.n_stages) + 1, belief_dim)
         else:
             self.stage_embed = None
 
-        # ===== Population Belief Update Head: z(t) -> z(t+1) =====
-        # 说明：
-        # - 输入默认包含 z(t)；可选拼接 group_repr（核心用户聚合的 belief）与 stage embedding
-        # - 输出 logits，再 softmax 得到 z(t+1) ∈ Δ^K
+        self.brief_encoder: Optional[nn.Module]
+        if self.use_brief_encoder:
+            in_dim = max(1, int(self.brief_encoder_input_dim))
+            if self.brief_encoder_use_stage:
+                in_dim += belief_dim
+            hid = max(8, int(self.brief_encoder_hidden_dim))
+            self.brief_encoder = nn.Sequential(
+                nn.Linear(in_dim, hid),
+                nn.ReLU(),
+                nn.Linear(hid, belief_dim),
+                nn.LayerNorm(belief_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.brief_encoder = None
+
         self.population_update_head: Optional[nn.Module]
         if self.use_population_update_head:
             in_dim = self.population_belief_dim
@@ -152,12 +156,9 @@ class BeliefEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hid, self.population_belief_dim),
             )
-            # residual mixing gate（可选）
             if self.population_update_residual_mixing:
                 if self.population_update_mixing_learnable:
-                    # 全局可学习标量 gate，经 sigmoid 映射到 (0,1)
                     init = torch.tensor(self.population_update_mixing_init).clamp(0.0, 1.0)
-                    # 把 init 反推到 logit 空间，避免训练初期饱和
                     eps = 1e-6
                     init = torch.clamp(init, eps, 1 - eps)
                     init_logit = torch.log(init / (1 - init))
@@ -174,8 +175,6 @@ class BeliefEncoder(nn.Module):
         else:
             self.population_update_head = None
 
-        # ===== Secondary Action Belief Head: predict secondary users' action-type distribution =====
-        # 输入默认包含 z(t)；可选拼接 group_repr（核心用户聚合的 belief）与 stage embedding
         self.secondary_action_head: Optional[nn.Module]
         if self.use_secondary_action_head:
             in_dim = 0
@@ -196,21 +195,62 @@ class BeliefEncoder(nn.Module):
         else:
             self.secondary_action_head = None
         
-        # 输出投影层
         self.out_proj = nn.Linear(belief_dim, belief_dim)
         
-        # 层归一化
         self.layer_norm = nn.LayerNorm(belief_dim)
         
-        # 前馈网络
         self.feedforward = nn.Sequential(
             nn.Linear(belief_dim, 4 * belief_dim),
             nn.ReLU(),
             nn.Linear(4 * belief_dim, belief_dim)
         )
         
-        # 最终层归一化
         self.final_layer_norm = nn.LayerNorm(belief_dim)
+
+    def encode_brief(
+        self,
+        brief_features: torch.Tensor,
+        *,
+        stage_t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Encode a non-parametric action-summary vector into a compact brief embedding g_t.
+
+        Args:
+            brief_features: Tensor [bs, D] or [D]
+            stage_t: Optional stage index [bs] or [bs,1] (only used when brief_encoder_use_stage=True)
+        Returns:
+            g_t: Tensor [bs, belief_dim]
+        """
+        if self.brief_encoder is None:
+            raise RuntimeError("brief_encoder is disabled. Set use_brief_encoder=True to enable it.")
+        x = brief_features
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        x = x.to(self.device, dtype=torch.float32)
+        if int(x.size(-1)) != int(self.brief_encoder_input_dim):
+            d = int(self.brief_encoder_input_dim)
+            if int(x.size(-1)) > d:
+                x = x[..., :d]
+            else:
+                pad = torch.zeros(x.size(0), d - int(x.size(-1)), device=x.device, dtype=x.dtype)
+                x = torch.cat([x, pad], dim=-1)
+        if self.brief_encoder_use_stage:
+            if stage_t is None or self.stage_embed is None:
+                raise ValueError("brief_encoder_use_stage=True but stage_t/stage_embed is missing.")
+            st = stage_t
+            if isinstance(st, torch.Tensor):
+                if st.ndim == 2 and st.shape[-1] == 1:
+                    st = st.squeeze(-1)
+                st = st.reshape(-1).long().to(self.device)
+            else:
+                st = torch.tensor([int(st)], dtype=torch.int64, device=self.device)
+            st = torch.clamp(st, min=0, max=max(0, int(self.n_stages)))
+            st_tok = self.stage_embed(st)  # (bs, belief_dim)
+            x = torch.cat([x, st_tok], dim=-1)
+        return self.brief_encoder(x)
         
     def forward(
         self,
@@ -242,17 +282,14 @@ class BeliefEncoder(nn.Module):
 
         extra_tokens: List[torch.Tensor] = []
 
-        # population token
         if self.use_population_token and self.population_proj is not None and population_belief is not None:
             if population_belief.ndim == 1:
                 population_belief = population_belief.unsqueeze(0)  # (K,) -> (1,K)
-            # 允许 (bs,1,K)
             if population_belief.ndim == 3 and population_belief.shape[1] == 1:
                 population_belief = population_belief.squeeze(1)
             pop_token = self.population_proj(population_belief.to(tokens.device, dtype=tokens.dtype)).unsqueeze(1)  # (bs,1,belief_dim)
             extra_tokens.append(pop_token)
 
-        # stage token
         if self.use_stage_token and self.stage_embed is not None and stage_t is not None:
             st = stage_t
             if st.ndim == 2 and st.shape[1] == 1:
@@ -266,31 +303,22 @@ class BeliefEncoder(nn.Module):
         if extra_tokens:
             tokens = torch.cat([tokens] + extra_tokens, dim=1)  # (bs, n_agents + n_extra, belief_dim)
         
-        # 应用多头注意力
-        # tokens: [batch_size, n_tokens, belief_dim]
         attn_output, _ = self.multihead_attn(
             query=tokens,
             key=tokens,
             value=tokens
         )
-        # attn_output: [batch_size, n_tokens, belief_dim]
         
-        # 残差连接和层归一化
         attn_output = tokens + attn_output
         attn_output = self.layer_norm(attn_output)
         
-        # 前馈网络
         ff_output = self.feedforward(attn_output)
         
-        # 残差连接和层归一化
         ff_output = attn_output + ff_output
         ff_output = self.final_layer_norm(ff_output)
         
-        # 聚合所有智能体的表征，生成群体表征
-        # 默认：只对 agent tokens 做平均池化（不把 pop/stage token 的表征混进来，稳定性更好）
         group_repr = ff_output[:, : self.n_agents].mean(dim=1)  # [batch_size, belief_dim]
         
-        # 输出投影
         group_repr = self.out_proj(group_repr)
 
         if return_tokens:
@@ -361,7 +389,6 @@ class BeliefEncoder(nn.Module):
                 ec = ec.unsqueeze(0)
             if ec.ndim != 2:
                 raise ValueError(f"extra_cond 期望形状 [bs, D]，实际={tuple(extra_cond.shape)}")
-            # Best-effort check on dim if configured
             if int(self.population_update_extra_cond_dim) > 0 and ec.size(-1) != int(self.population_update_extra_cond_dim):
                 raise ValueError(
                     f"extra_cond dim 不匹配: expect D={int(self.population_update_extra_cond_dim)} got {ec.size(-1)}"
@@ -372,11 +399,8 @@ class BeliefEncoder(nn.Module):
         logits = self.population_update_head(x)
         if return_logits:
             return logits
-        # === continuous scalar mode: K=1 means z ∈ [-1,1] ===
         if int(self.population_belief_dim) == 1:
-            # tanh squashes to [-1,1]
             z_hat = torch.tanh(logits)
-            # residual mixing (scalar)
             if self.population_update_residual_mixing:
                 z_in = torch.clamp(z_t, min=-1.0, max=1.0)
                 if self.population_update_mixing_learnable and self.population_update_mix_logit is not None:
@@ -387,7 +411,6 @@ class BeliefEncoder(nn.Module):
                 z_hat = mix * z_hat + (1.0 - mix) * z_in
             return torch.clamp(z_hat, min=-1.0, max=1.0)
 
-        # === categorical / dirichlet mode: K>1 on simplex ===
         if self.population_update_parametrization == "dirichlet":
             alpha = self._dirichlet_alpha_from_logits(logits)  # (bs,K) positive
             mean = self.population_belief_mean_from_alpha(alpha)  # (bs,K)
@@ -404,7 +427,6 @@ class BeliefEncoder(nn.Module):
                 mean = mean / torch.clamp(mean.sum(dim=-1, keepdim=True), min=1e-8)
             return mean
 
-        # categorical logits -> softmax probs (legacy)
         z_hat = F.softmax(logits, dim=-1)
         if self.population_update_residual_mixing:
             z_in = torch.clamp(z_t, min=0.0)
@@ -424,7 +446,6 @@ class BeliefEncoder(nn.Module):
         Convert unconstrained head output logits -> Dirichlet alpha (>0).
         We use softplus for stable positivity, plus a small floor.
         """
-        # softplus(logits) is strictly positive; alpha_min avoids extremely tiny concentrations
         alpha = F.softplus(logits) + float(self.dirichlet_alpha_min)
         return alpha
 
@@ -451,7 +472,6 @@ class BeliefEncoder(nn.Module):
             raise RuntimeError("predict_next_population_belief_alpha is not defined for scalar z (population_belief_dim==1).")
         if self.population_update_parametrization != "dirichlet":
             raise RuntimeError("predict_next_population_belief_alpha requires population_update_parametrization='dirichlet'.")
-        # reuse input assembly from predict_next_population_belief (but we need logits)
         logits = self.predict_next_population_belief(
             z_t,
             group_repr=group_repr,
@@ -506,14 +526,10 @@ class BeliefEncoder(nn.Module):
         if int(alpha_pred.size(-1)) == 1:
             raise RuntimeError("Dirichlet KL is not defined for K=1 scalar mode.")
 
-        # normalize target to simplex
         zt = torch.clamp(z_target, min=0.0)
         zt = zt / torch.clamp(zt.sum(dim=-1, keepdim=True), min=eps)
 
         a_min = float(self.dirichlet_alpha_min)
-        # alpha0_target can be:
-        # - float: shared scalar for the whole batch
-        # - Tensor: per-sample alpha0 with shape [bs] or [bs,1]
         a0_t = alpha0_target
         if isinstance(a0_t, torch.Tensor):
             a0v = a0_t
@@ -522,7 +538,6 @@ class BeliefEncoder(nn.Module):
             if a0v.ndim != 1:
                 a0v = a0v.reshape(-1)
             a0v = a0v.to(device=zt.device, dtype=zt.dtype)
-            # safety clamp: avoid tiny/negative/NaN
             a0v = torch.nan_to_num(a0v, nan=0.0, posinf=0.0, neginf=0.0)
             a0v = torch.clamp(a0v, min=1.0)
             alpha_tgt = (a0v.unsqueeze(-1) * zt) + a_min
@@ -538,7 +553,6 @@ class BeliefEncoder(nn.Module):
         ap = torch.clamp(alpha_pred, min=a_min)
         at = torch.clamp(alpha_tgt, min=a_min)
 
-        # KL(Dir(at) || Dir(ap))
         at0 = at.sum(dim=-1)
         ap0 = ap.sum(dim=-1)
         t1 = torch.lgamma(at0) - torch.sum(torch.lgamma(at), dim=-1)
@@ -688,17 +702,13 @@ class BeliefEncoder(nn.Module):
         if z_pred.size(-1) != z_target.size(-1):
             raise ValueError(f"z_pred/z_target K 不一致: {z_pred.size(-1)} vs {z_target.size(-1)}")
 
-        # === continuous scalar mode: K=1 -> regression in [-1,1] ===
         if int(z_pred.size(-1)) == 1:
-            # coerce mask
             if z_mask.ndim == 2 and z_mask.shape[-1] == 1:
                 z_mask = z_mask.squeeze(-1)
             z_mask = z_mask.to(z_pred.device, dtype=z_pred.dtype)
 
-            # clamp to valid range
             z_pred = torch.clamp(z_pred, min=-1.0, max=1.0)
             z_target = torch.clamp(z_target, min=-1.0, max=1.0)
-            # choose regression loss
             lt = str(loss_type or "mse").lower()
             if lt in ("smooth_l1", "huber"):
                 per = F.smooth_l1_loss(z_pred, z_target, reduction="none").squeeze(-1)
@@ -707,7 +717,6 @@ class BeliefEncoder(nn.Module):
             per = per * z_mask
             return per.sum() / (z_mask.sum() + eps)
 
-        # normalize for safety (categorical simplex)
         z_pred = torch.clamp(z_pred, min=0.0)
         z_target = torch.clamp(z_target, min=0.0)
         z_pred = z_pred / torch.clamp(z_pred.sum(dim=-1, keepdim=True), min=eps)

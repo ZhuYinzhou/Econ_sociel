@@ -21,11 +21,11 @@ use_causal_mask: false
 max_seq_length: 1024  # same with max_question_length
 n_actions: 2 
 
-# LLM模型配置 - 统一使用meta-llama/Llama-3.3-70B-Instruct-Turbo
+# LLM模型配置（用于在线 LLM API 调用）
 llm_model_name: "gpt2"  # 仅用于tokenizer
 together_api_key: "${TOGETHER_API_KEY}"  
-coordinator_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo"  
-executor_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo"  
+coordinator_model: "gpt-3.5-turbo"
+executor_model: "gpt-3.5-turbo"
 # 使用有效的嵌入模型
 commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
 
@@ -142,9 +142,9 @@ logging:
   log_path: "./logs"
   experiment_name: "llm_marl_math"
 
-# LLM配置块 - 统一使用meta-llama/Llama-3.3-70B-Instruct-Turbo
+# LLM配置块（用于在线 LLM API 调用）
 llm:
   together_api_key: "${TOGETHER_API_KEY}"
-  coordinator_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-  executor_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+  coordinator_model: "gpt-3.5-turbo"
+  executor_model: "gpt-3.5-turbo"
   max_tokens: 2048

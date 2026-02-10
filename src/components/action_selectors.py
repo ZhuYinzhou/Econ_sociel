@@ -1,4 +1,3 @@
-# components/action_selectors.py
 
 import torch
 import torch.nn.functional as F
@@ -17,9 +16,6 @@ class MultinomialActionSelector:
         self.schedule_timesteps = getattr(args, "epsilon_anneal_time", 50000)
         self.epsilon = self.schedule_start
         self.test_greedy = getattr(args, "test_greedy", True)
-        # Action selection mode when not taking a random action:
-        # - "argmax": greedy over masked q-values (legacy)
-        # - "softmax": sample from softmax(masked_q_values / temperature)
         self.sample_mode = str(getattr(args, "multinomial_sample_mode", "argmax") or "argmax").strip().lower()
         self.temperature = float(getattr(args, "action_temperature", 1.0) or 1.0)
 
@@ -41,28 +37,22 @@ class MultinomialActionSelector:
         """
         masked_q_values = self._mask_actions(agent_inputs, avail_actions)
         
-        # Epsilon schedule
         if test_mode and self.test_greedy:
             epsilon = 0.0
         else:
             epsilon = self.epsilon if t_env <= self.schedule_timesteps else self.schedule_finish
             
-        # Random exploration
         random_numbers = torch.rand_like(agent_inputs[:, :, 0])
         pick_random = (random_numbers < epsilon).long()
         
-        # Get random actions
         random_actions = self._get_random_actions(avail_actions)
 
-        # Get policy actions (argmax or softmax-sampling)
         if test_mode and self.test_greedy:
             policy_actions = masked_q_values.max(dim=2)[1]
         else:
             if self.sample_mode in ("softmax", "sample", "sampling"):
                 temp = max(1e-6, float(self.temperature))
-                # masked_q_values has -inf for invalid actions; softmax will yield 0 prob there.
                 probs = torch.softmax(masked_q_values / temp, dim=-1)
-                # guard: if all actions are invalid (shouldn't happen), fallback to uniform over avail
                 probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
                 row_sum = probs.sum(dim=-1, keepdim=True)
                 fallback = (avail_actions.float() + 1e-10)
@@ -72,7 +62,6 @@ class MultinomialActionSelector:
             else:
                 policy_actions = masked_q_values.max(dim=2)[1]
         
-        # Combine random and policy actions
         chosen_actions = pick_random * random_actions + (1 - pick_random) * policy_actions
         
         return chosen_actions
@@ -86,13 +75,10 @@ class MultinomialActionSelector:
 
     def _get_random_actions(self, avail_actions: torch.Tensor) -> torch.Tensor:
         """Sample random available actions."""
-        # Replace zeros with very small value to avoid division by zero
         avail_actions_nonzero = avail_actions + 1e-10
         
-        # Normalize to create probability distribution
         probs = avail_actions_nonzero / avail_actions_nonzero.sum(dim=-1, keepdim=True)
         
-        # Sample from distribution
         return torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(probs.shape[0], -1)
 
     def epsilon_decay(self, t_env: int):
@@ -133,11 +119,9 @@ class GaussianActionSelector:
         if test_mode and self.test_greedy:
             return agent_inputs
             
-        # Add Gaussian noise
         noise = torch.randn_like(agent_inputs) * self.gaussian_std
         actions = agent_inputs + noise
         
-        # Clip actions if needed
         if hasattr(self.args, "action_range"):
             actions = torch.clamp(actions, 
                                 min=self.args.action_range[0],

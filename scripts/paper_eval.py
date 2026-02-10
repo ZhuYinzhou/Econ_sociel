@@ -11,6 +11,7 @@ Goals (paper-facing):
         by overriding chosen_actions, then measure response of z_sim trajectory.
   (C) Micro-level sanity:
       - Action distribution entropy/mode-frac and mode-collapse frequency (from chosen actions).
+      - Stance accuracy (1/2/3/all) using the same t+1 imitation-style alignment as the env reward.
   (D) Efficiency:
       - Trainable / total parameter counts
       - Wall-clock inference time per episode (best-effort)
@@ -29,6 +30,7 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -97,7 +99,6 @@ def _pearson(x: Sequence[float], y: Sequence[float]) -> float:
 
 
 def _rankdata(a: np.ndarray) -> np.ndarray:
-    # simple rank (no tie correction; good enough for paper trend sanity)
     order = a.argsort()
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, len(a) + 1, dtype=np.float64)
@@ -225,7 +226,6 @@ def _aggregate_z_by_stage(zpts: List[ZPoint]) -> List[ZStageAgg]:
     out: List[ZStageAgg] = []
     for t in sorted(by_t.keys()):
         pts = by_t[t]
-        # mean z vectors
         zp = np.mean(np.asarray([p.z_pred for p in pts], dtype=np.float64), axis=0)
         zg = np.mean(np.asarray([p.z_gt for p in pts], dtype=np.float64), axis=0)
         out.append(
@@ -275,6 +275,20 @@ def _summarize_z_stage_curve(stages: List[ZStageAgg]) -> Dict[str, Any]:
     ent_dtw = dtw_distance(ent_pred, ent_gt)
     pol_dtw = dtw_distance(pol_pred, pol_gt)
 
+    def _mean2(a: float, b: float) -> float:
+        try:
+            fa = float(a)
+            fb = float(b)
+        except Exception:
+            return float("nan")
+        if (not math.isfinite(fa)) and (not math.isfinite(fb)):
+            return float("nan")
+        if not math.isfinite(fa):
+            return float(fb)
+        if not math.isfinite(fb):
+            return float(fa)
+        return 0.5 * (fa + fb)
+
     return {
         "n_stages": int(len(stages)),
         "kl_mean": float(np.mean(kls)),
@@ -287,13 +301,15 @@ def _summarize_z_stage_curve(stages: List[ZStageAgg]) -> Dict[str, Any]:
         "polarization_gt_mean": float(np.mean(pol_gt)),
         "bias_entropy_mean": float(np.mean(ent_pred) - np.mean(ent_gt)),
         "bias_polarization_mean": float(np.mean(pol_pred) - np.mean(pol_gt)),
+        "corr_entropy": float(ent_pearson),
+        "corr_polarization": float(pol_pearson),
+        "corr_mean": float(_mean2(ent_pearson, pol_pearson)),
         "entropy_pearson": float(ent_pearson),
         "entropy_spearman": float(ent_spearman),
         "entropy_dtw": float(ent_dtw),
         "polarization_pearson": float(pol_pearson),
         "polarization_spearman": float(pol_spearman),
         "polarization_dtw": float(pol_dtw),
-        # curves (for plotting; per-episode)
         "stage_t": stage_t,
         "stage_kl": [float(x) for x in kls],
         "stage_js": [float(x) for x in jss],
@@ -322,8 +338,6 @@ def _extract_actions_from_batch(batch: Any, n_actions: int = 5) -> Dict[str, Any
 
         if not isinstance(acts, torch.Tensor):
             return out
-        # common shapes:
-        # - (bs, T, n_agents, 1) or (bs, T, n_agents)
         a = acts.detach().cpu()
         if a.ndim == 4 and a.shape[-1] == 1:
             a = a[..., 0]
@@ -337,7 +351,6 @@ def _extract_actions_from_batch(batch: Any, n_actions: int = 5) -> Dict[str, Any
         out["action_counts"] = counts.tolist()
         out["action_freq"] = (counts / max(1, int(counts.sum()))).tolist()
 
-        # per-step stats (stage-level)
         per_step_entropy: List[float] = []
         per_step_mode_frac: List[float] = []
         per_step_counts: List[List[int]] = []
@@ -359,10 +372,98 @@ def _extract_actions_from_batch(batch: Any, n_actions: int = 5) -> Dict[str, Any
         out["per_step_action_mode_frac"] = per_step_mode_frac
         out["per_step_action_counts"] = per_step_counts
 
-        # mode collapse frequency (sanity)
         out["mode_collapse_frac_gt095"] = float(np.mean([1.0 if x >= 0.95 else 0.0 for x in per_step_mode_frac])) if per_step_mode_frac else float("nan")
     except Exception:
         return out
+    return out
+
+
+def _extract_stance_accuracy_from_env(env: Any, n_stances: int = 3, gt_offset: int = 1) -> Dict[str, Any]:
+    """
+    Compute stance accuracy from env internal traces.
+
+    Why env-based?
+    - In sync-stage mode, per-user (pred,gt) stance ids are not necessarily emitted in env_infos.
+    - However, env always stores predicted posts in env.core_posts[(user, t)] and exposes _gt_for(user, t_gt).
+
+    Alignment (IMPORTANT, matches hisim_social_env reward semantics):
+      pred at stage t is evaluated against ground-truth at stage (t + gt_offset), default gt_offset=1.
+
+    Returns:
+      - stance_acc_all: overall accuracy over valid stance-expressing actions
+      - stance_acc_1/2/3: per-class accuracy by GT stance id (reported as 1..K for paper readability)
+      - stance_n_all / stance_n_1/2/3: denominators
+    """
+    out: Dict[str, Any] = {}
+    k = max(1, int(n_stances))
+    try:
+        posts = getattr(env, "core_posts", None)
+        gt_for = getattr(env, "_gt_for", None)
+        n_stages = int(getattr(env, "n_stages", 0) or 0)
+    except Exception:
+        posts = None
+        gt_for = None
+        n_stages = 0
+    if not isinstance(posts, dict) or not callable(gt_for):
+        return out
+
+    stance_actions = {"post", "retweet", "reply"}
+    total = 0
+    correct = 0
+    denom_by_gt = [0 for _ in range(k)]
+    corr_by_gt = [0 for _ in range(k)]
+
+    for key, p in posts.items():
+        if not (isinstance(key, tuple) and len(key) >= 2):
+            continue
+        user, t_pred = key[0], key[1]
+        if not isinstance(p, dict):
+            continue
+        at = str(p.get("action_type") or "").strip().lower()
+        if at not in stance_actions:
+            continue
+        sid = p.get("stance_id", None)
+        try:
+            sid_i = int(sid) if sid is not None else None
+        except Exception:
+            sid_i = None
+        if sid_i is None or sid_i < 0 or sid_i >= k:
+            continue
+
+        try:
+            t_gt = int(t_pred) + int(gt_offset)
+        except Exception:
+            continue
+        if n_stages > 0 and t_gt >= n_stages:
+            continue
+
+        try:
+            gt_sid, _gt_lab, _gt_text = gt_for(str(user), int(t_gt))
+        except Exception:
+            gt_sid = None
+        if gt_sid is None:
+            continue
+        try:
+            gt_i = int(gt_sid)
+        except Exception:
+            continue
+        if gt_i < 0 or gt_i >= k:
+            continue
+
+        total += 1
+        denom_by_gt[gt_i] += 1
+        if int(sid_i) == int(gt_i):
+            correct += 1
+            corr_by_gt[gt_i] += 1
+
+    def _acc(n: int, d: int) -> float:
+        return float(n) / float(d) if d > 0 else float("nan")
+
+    out["stance_n_all"] = int(total)
+    out["stance_acc_all"] = _acc(correct, total)
+    for j in range(min(3, k)):
+        out[f"stance_n_{j+1}"] = int(denom_by_gt[j])
+        out[f"stance_acc_{j+1}"] = _acc(corr_by_gt[j], denom_by_gt[j])
     return out
 
 
@@ -422,7 +523,6 @@ def _summarize_z(zpts: List[ZPoint]) -> Dict[str, Any]:
     pol_pred = [p.pol_pred for p in zpts]
     pol_gt = [p.pol_gt for p in zpts]
 
-    # trend alignment
     ent_pearson = _pearson(ent_pred, ent_gt)
     ent_spearman = _spearman(ent_pred, ent_gt)
     pol_pearson = _pearson(pol_pred, pol_gt)
@@ -430,7 +530,20 @@ def _summarize_z(zpts: List[ZPoint]) -> Dict[str, Any]:
     ent_dtw = dtw_distance(ent_pred, ent_gt)
     pol_dtw = dtw_distance(pol_pred, pol_gt)
 
-    # stage-wise curves (sorted by stage_t)
+    def _mean2(a: float, b: float) -> float:
+        try:
+            fa = float(a)
+            fb = float(b)
+        except Exception:
+            return float("nan")
+        if (not math.isfinite(fa)) and (not math.isfinite(fb)):
+            return float("nan")
+        if not math.isfinite(fa):
+            return float(fb)
+        if not math.isfinite(fb):
+            return float(fa)
+        return 0.5 * (fa + fb)
+
     zpts_sorted = sorted(zpts, key=lambda x: x.stage_t)
     stage_t = [int(p.stage_t) for p in zpts_sorted]
     stage_kl = [float(p.kl_gt_pred) for p in zpts_sorted]
@@ -447,9 +560,11 @@ def _summarize_z(zpts: List[ZPoint]) -> Dict[str, Any]:
         "entropy_gt_mean": float(np.mean(ent_gt)),
         "polarization_pred_mean": float(np.mean(pol_pred)),
         "polarization_gt_mean": float(np.mean(pol_gt)),
-        # Bias proxies (systematic offset): pred_mean - gt_mean
         "bias_entropy_mean": float(np.mean(ent_pred) - np.mean(ent_gt)),
         "bias_polarization_mean": float(np.mean(pol_pred) - np.mean(pol_gt)),
+        "corr_entropy": float(ent_pearson),
+        "corr_polarization": float(pol_pearson),
+        "corr_mean": float(_mean2(ent_pearson, pol_pearson)),
         "entropy_pearson": float(ent_pearson),
         "entropy_spearman": float(ent_spearman),
         "entropy_dtw": float(ent_dtw),
@@ -472,16 +587,25 @@ def main() -> int:
     ap.add_argument("--cpu", action="store_true", help="Force CPU mode")
     ap.add_argument("--out_json", type=str, default="paper_eval_results.json")
     ap.add_argument("--out_csv", type=str, default="paper_eval_stagewise.csv")
+    ap.add_argument(
+        "--stagewise_source",
+        type=str,
+        default="last",
+        choices=["last", "all_mean"],
+        help=(
+            "How to build the stage-wise CSV curve. "
+            "'last' uses z points from the last episode only (backward compatible). "
+            "'all_mean' aggregates z across ALL episodes by stage_t and writes mean z_pred/z_gt per stage."
+        ),
+    )
     ap.add_argument("--max_core_users", type=int, default=0, help="Optional cap to speed up eval (0 = keep config)")
     ap.add_argument("--n_stages", type=int, default=0, help="Optional override n_stages for eval (0 = keep config)")
 
-    # Intervention grid: vary retweet probability vs post (action ids: post=0, retweet=1)
     ap.add_argument("--do_intervention", action="store_true", help="Run action->outcome sensitivity grid")
     ap.add_argument("--intervention_grid", type=str, default="0.1,0.3,0.5,0.7,0.9", help="Comma list of retweet probs")
     ap.add_argument("--intervention_episodes", type=int, default=10, help="Episodes per intervention point")
     args = ap.parse_args()
 
-    # Import project code (relative to ECON/ directory)
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     src_dir = os.path.join(repo_root, "src")
     import sys
@@ -499,7 +623,6 @@ def main() -> int:
         cfg.system.use_cuda = False
         cfg.system.device_num = 0
 
-    # optional speed knobs
     if hasattr(cfg, "env_args"):
         if int(args.max_core_users) > 0:
             cfg.env_args.max_core_users = int(args.max_core_users)
@@ -509,7 +632,6 @@ def main() -> int:
 
     runner, mac, learner, logger, device = setup_experiment(cfg)
 
-    # Params
     tot_agent, tr_agent = _count_params(getattr(mac, "agent_module", mac.agent))
     tot_be, tr_be = _count_params(getattr(mac, "belief_encoder_module", None) or getattr(mac, "belief_encoder", None) or mac.agent)
     params_info = {
@@ -520,14 +642,10 @@ def main() -> int:
         "device": str(device),
     }
 
-    # === Base evaluation (policy rollout) ===
-    # Note:
-    # - We keep TWO summaries:
-    #   (1) global_concat: concatenate all episodes' z points and compute KL/JS/DTW/Corr once (length-dependent DTW!)
-    #   (2) per_episode: compute metrics per episode then average across episodes (recommended for comparison)
     all_zpts_concat: List[ZPoint] = []
     per_ep_summaries: List[Dict[str, Any]] = []
     per_ep_stage_summaries: List[Dict[str, Any]] = []
+    per_ep_stance: List[Dict[str, Any]] = []
     all_dt: List[float] = []
     last_batch = None
     last_infos: List[Dict[str, Any]] = []
@@ -539,13 +657,15 @@ def main() -> int:
         zpts_i = _extract_z_series(infos)
         all_zpts_concat.extend(zpts_i)
         per_ep_summaries.append(_summarize_z(zpts_i))
-        # New: macro curve by stage_t within episode
         stages_i = _aggregate_z_by_stage(zpts_i)
         per_ep_stage_summaries.append(_summarize_z_stage_curve(stages_i))
+        try:
+            per_ep_stance.append(_extract_stance_accuracy_from_env(getattr(runner, "env", None), n_stances=3, gt_offset=1))
+        except Exception:
+            per_ep_stance.append({})
 
     z_summary_concat = _summarize_z(all_zpts_concat)
 
-    # Per-episode aggregation (more comparable across runs; DTW/Corr not inflated by concatenation length)
     def _mean_std(key: str) -> Tuple[float, float]:
         xs = []
         for s in per_ep_summaries:
@@ -571,6 +691,9 @@ def main() -> int:
         "bias_entropy_mean_std": _mean_std("bias_entropy_mean")[1],
         "bias_polarization_mean_mean": _mean_std("bias_polarization_mean")[0],
         "bias_polarization_mean_std": _mean_std("bias_polarization_mean")[1],
+        "corr_entropy_mean": _mean_std("corr_entropy")[0],
+        "corr_polarization_mean": _mean_std("corr_polarization")[0],
+        "corr_mean_mean": _mean_std("corr_mean")[0],
         "entropy_pearson_mean": _mean_std("entropy_pearson")[0],
         "entropy_spearman_mean": _mean_std("entropy_spearman")[0],
         "entropy_dtw_mean": _mean_std("entropy_dtw")[0],
@@ -583,7 +706,6 @@ def main() -> int:
         ),
     }
 
-    # New: per-episode macro-curve (by stage_t) aggregation
     def _mean_std_stage(key: str) -> Tuple[float, float]:
         xs = []
         for s in per_ep_stage_summaries:
@@ -609,6 +731,9 @@ def main() -> int:
         "bias_entropy_mean_std": _mean_std_stage("bias_entropy_mean")[1],
         "bias_polarization_mean_mean": _mean_std_stage("bias_polarization_mean")[0],
         "bias_polarization_mean_std": _mean_std_stage("bias_polarization_mean")[1],
+        "corr_entropy_mean": _mean_std_stage("corr_entropy")[0],
+        "corr_polarization_mean": _mean_std_stage("corr_polarization")[0],
+        "corr_mean_mean": _mean_std_stage("corr_mean")[0],
         "entropy_pearson_mean": _mean_std_stage("entropy_pearson")[0],
         "entropy_spearman_mean": _mean_std_stage("entropy_spearman")[0],
         "entropy_dtw_mean": _mean_std_stage("entropy_dtw")[0],
@@ -621,6 +746,26 @@ def main() -> int:
         ),
     }
     action_summary = _extract_actions_from_batch(last_batch, n_actions=int(getattr(cfg, "n_actions", 5)))
+
+    def _mean_stance(key: str) -> float:
+        xs = []
+        for s in per_ep_stance:
+            v = s.get(key, float("nan"))
+            try:
+                v = float(v)
+            except Exception:
+                v = float("nan")
+            if math.isfinite(v):
+                xs.append(v)
+        return float(np.mean(xs)) if xs else float("nan")
+
+    stance_acc = {
+        "stance_acc_all": _mean_stance("stance_acc_all"),
+        "stance_acc_1": _mean_stance("stance_acc_1"),
+        "stance_acc_2": _mean_stance("stance_acc_2"),
+        "stance_acc_3": _mean_stance("stance_acc_3"),
+        "note": "Stance accuracy computed from env.core_posts and env._gt_for(user, t+1), matching env imitation-style reward semantics.",
+    }
 
     results: Dict[str, Any] = {
         "meta": {
@@ -635,16 +780,15 @@ def main() -> int:
             "episode_time_sec_mean": float(np.mean(all_dt)) if all_dt else float("nan"),
             "episode_time_sec_std": float(np.std(all_dt)) if all_dt else float("nan"),
         },
-        # Backward compatible key: keep the original (global concatenation) behavior.
         "population_metrics": z_summary_concat,
-        # Recommended for comparisons (matches the user's expected magnitudes for DTW/bias/div in many setups).
         "population_metrics_per_episode": pop_per_ep,
-        # New: macro curve (by stage_t) per-episode summary (recommended for HiSim-style macro comparisons).
         "population_metrics_per_episode_by_stage": pop_per_ep_by_stage,
-        "micro_sanity": action_summary,
+        "micro_sanity": {
+            **(action_summary or {}),
+            "stance_accuracy": stance_acc,
+        },
     }
 
-    # === Intervention / sensitivity grid ===
     if bool(args.do_intervention):
         try:
             grid = [float(x.strip()) for x in str(args.intervention_grid).split(",") if x.strip()]
@@ -654,7 +798,6 @@ def main() -> int:
 
         intervention_rows: List[Dict[str, Any]] = []
         for pr in grid:
-            # action probs over 5 actions: [post, retweet, reply, like, do_nothing]
             probs = [1.0 - pr, pr, 0.0, 0.0, 0.0]
             orig_sel, wrapped = _with_action_intervention(runner, probs)
             runner.mac.select_actions = wrapped  # type: ignore
@@ -664,10 +807,8 @@ def main() -> int:
                     _, infos, _dt = _rollout_policy_once(runner, test_mode=True)
                     zpts_i.extend(_extract_z_series(infos))
                 summ_i = _summarize_z(zpts_i)
-                # response proxies: final-stage z_pred (use last zpt in time)
                 zpts_sorted = sorted(zpts_i, key=lambda z: z.stage_t)
                 z_last = zpts_sorted[-1].z_pred if zpts_sorted else []
-                # common: report Support prob (id=2) if K=3
                 z_support = float(_normalize_prob(z_last)[2]) if len(z_last) >= 3 else float("nan")
                 intervention_rows.append(
                     {
@@ -684,7 +825,6 @@ def main() -> int:
             finally:
                 runner.mac.select_actions = orig_sel  # type: ignore
 
-        # sensitivity summary (monotonicity + slope)
         xs = [r["retweet_prob"] for r in intervention_rows]
         ys = [r.get("z_pred_support_last", float("nan")) for r in intervention_rows]
         xs2 = [x for x, y in zip(xs, ys) if math.isfinite(x) and math.isfinite(float(y))]
@@ -699,23 +839,63 @@ def main() -> int:
             "note": "Intervention overrides core-user action_type distribution by sampling chosen_actions; stance ids still come from model stance head.",
         }
 
-    # Write outputs
     out_json = str(args.out_json)
+    try:
+        Path(out_json).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
-    # Stage-wise CSV (z points from last episode for quick plotting)
     out_csv = str(args.out_csv)
     try:
-        z_last = _extract_z_series(last_infos)
-        z_last = sorted(z_last, key=lambda z: z.stage_t)
-        # write minimal csv without pandas
+        Path(out_csv).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        stagewise_source = str(getattr(args, "stagewise_source", "last") or "last").strip().lower()
+        stagewise_source = stagewise_source if stagewise_source in ("last", "all_mean") else "last"
+
         with open(out_csv, "w", encoding="utf-8") as f:
-            f.write("stage_t,kl_gt_pred,js_gt_pred,ent_pred,ent_gt,pol_pred,pol_gt,labeled_edge_n\n")
-            for p in z_last:
-                f.write(
-                    f"{p.stage_t},{p.kl_gt_pred:.8f},{p.js_gt_pred:.8f},{p.ent_pred:.8f},{p.ent_gt:.8f},{p.pol_pred:.8f},{p.pol_gt:.8f},{p.labeled_edge_n}\n"
-                )
+            f.write(
+                "stage_t,"
+                "z_pred_neutral,z_pred_oppose,z_pred_support,"
+                "z_gt_neutral,z_gt_oppose,z_gt_support,"
+                "kl_gt_pred,js_gt_pred,ent_pred,ent_gt,pol_pred,pol_gt,"
+                "labeled_edge_n\n"
+            )
+
+            if stagewise_source == "all_mean":
+                stages_all = _aggregate_z_by_stage(all_zpts_concat)
+                for s in stages_all:
+                    zp = _normalize_prob(list(s.z_pred_mean))
+                    zg = _normalize_prob(list(s.z_gt_mean))
+                    k = kl_div(zg, zp)
+                    j = js_div(zg, zp)
+                    ep = entropy(zp)
+                    eg = entropy(zg)
+                    pp = polarization_index(zp)
+                    pg = polarization_index(zg)
+                    f.write(
+                        f"{int(s.stage_t)},"
+                        f"{float(zp[0]):.8f},{float(zp[1]):.8f},{float(zp[2]):.8f},"
+                        f"{float(zg[0]):.8f},{float(zg[1]):.8f},{float(zg[2]):.8f},"
+                        f"{float(k):.8f},{float(j):.8f},{float(ep):.8f},{float(eg):.8f},{float(pp):.8f},{float(pg):.8f},"
+                        f"{int(getattr(s, 'labeled_edge_n_sum', 0) or 0)}\n"
+                    )
+            else:
+                z_last = _extract_z_series(last_infos)
+                z_last = sorted(z_last, key=lambda z: z.stage_t)
+                for p in z_last:
+                    zp = _normalize_prob(list(p.z_pred))
+                    zg = _normalize_prob(list(p.z_gt))
+                    f.write(
+                        f"{int(p.stage_t)},"
+                        f"{float(zp[0]):.8f},{float(zp[1]):.8f},{float(zp[2]):.8f},"
+                        f"{float(zg[0]):.8f},{float(zg[1]):.8f},{float(zg[2]):.8f},"
+                        f"{float(p.kl_gt_pred):.8f},{float(p.js_gt_pred):.8f},{float(p.ent_pred):.8f},{float(p.ent_gt):.8f},{float(p.pol_pred):.8f},{float(p.pol_gt):.8f},"
+                        f"{int(p.labeled_edge_n)}\n"
+                    )
     except Exception:
         pass
 

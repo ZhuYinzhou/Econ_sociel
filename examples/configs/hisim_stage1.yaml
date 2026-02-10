@@ -60,8 +60,8 @@ commitment_embedding_dim: 1024
 
 enable_llm_rollout: false
 together_api_key: ""
-coordinator_model: "gpt-4.1"
-executor_model: "gpt-4.1"
+coordinator_model: "gpt-3.5-turbo"
+executor_model: "gpt-3.5-turbo"
 llm_model_name: "gpt2"
 
 env: "huggingface_dataset_env"

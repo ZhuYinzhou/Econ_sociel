@@ -83,14 +83,18 @@ env_action_source: "sync_stage_policy"
 enable_llm_rollout: false
 llm_model_name: "gpt2"
 together_api_key: "${TOGETHER_API_KEY}"
-coordinator_model: "gpt-4.1"
-executor_model: "gpt-4.1"
-commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
+coordinator_model: "gpt-3.5-turbo"
+executor_model: "gpt-3.5-turbo"
 llm_response_format_json: true
 use_nonparam_group_repr: true
 population_update_use_group_repr: true
 # Match Stage3a BeliefEncoder conditioning so `belief_encoder.th` loads without shape mismatch.
 population_update_use_stage: true
+# Use the learned brief encoder (trained in Stage3a) to map non-parametric action summaries -> compact briefs.
+use_brief_encoder: false
+brief_encoder_input_dim: 128
+brief_encoder_hidden_dim: 256
+brief_encoder_use_stage: false
 # Match Stage3a Dirichlet parametrization (rollout/control uses E[z]; no sampling).
 population_update_parametrization: "dirichlet"
 dirichlet_alpha_min: 0.001
@@ -103,6 +107,15 @@ env_args:
   max_question_length: 1024
   max_answer_length: 512
   label2id_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_metoo_e1/label2id.json"
+
+# env: "hisim_social_env"
+# env_args:
+#   hisim_data_root: "/data/zhuyinzhou/HiSim/data"
+#   topic: "blm"
+#   event: "p1"
+#   max_question_length: 1024
+#   max_answer_length: 512
+#   label2id_path: "/home/zhuyinzhou/MAS/ECON/data/hisim_belief_dataset_blm_p1/label2id.json"
 
   # short episode first (curriculum below will extend)
   n_stages: 10
@@ -142,20 +155,26 @@ env_args:
   # If this threshold is too high, many stages will have z_mask=0 -> reward_z=0 (no learning signal).
   # Your stage4_debug_alignment showed many stages have edge_n < 200, so RL reward becomes too sparse.
   # Start with 50 for better coverage; you can tune (e.g., 0/50/100) after verifying learning dynamics.
-  min_edge_labels_for_z_target: 50
+  min_edge_labels_for_z_target: 20
+  # Optional: soften z_mask (density) instead of hard 0/1 gating. When edge_n < threshold,
+  # z_mask becomes edge_n/threshold and reward_z is scaled by z_mask.
+  soft_z_mask: true
 
 # === S3b prior bias injection (optional) ===
 # Treat S3b as a "preference scorer" and inject its bias into RL logits.
 # bias = g_s3b(state); logits[RETWEET]+=alpha*bias, logits[POST]-=alpha*bias
 s3b_bias_enabled: true
 s3b_bias_mode: "diff01"
-s3b_bias_alpha: 1.0
-s3b_bias_alpha_trainable: true
+# Scheme-2 (recommended): keep the prior but bound it to avoid logit domination / mode collapse.
+# In your hisim-s4-8000 run, alpha quickly saturated to max and bias logits became huge (~30),
+# which can freeze the policy into near-deterministic actions and hurt reward_z learning.
+s3b_bias_alpha: 0.5
+s3b_bias_alpha_trainable: false
 # Constrain alpha to be non-negative and optionally bounded (alpha = exp(beta))
-s3b_bias_alpha_max: 3.0
+s3b_bias_alpha_max: 0.8
 # Gate bias injection by stance-head confidence (only inject when stance is confident)
 s3b_bias_gate_by_stance: true
-s3b_bias_stance_min_conf: 0.9
+s3b_bias_stance_min_conf: 0.95
 
 # Curriculum: gradually increase number of stages once training is stable
 curriculum:
@@ -180,9 +199,9 @@ train_stance_head_in_rl: true
 
 train:
   episodes_per_task: 1
-  buffer_size: 32
-  batch_size: 8
-  update_interval: 10
+  buffer_size: 128
+  batch_size: 32
+  update_interval: 5
   optimizer: "adam"
   learning_rate: 0.001
   coordinator_learning_rate: 0.0005

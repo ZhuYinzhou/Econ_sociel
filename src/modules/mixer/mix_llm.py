@@ -10,18 +10,14 @@ class TransformerMixingNetwork(nn.Module):
     def __init__(self, args: Any):
         super().__init__()
         
-        # Entity embedding
         self.entity_embedding = nn.Linear(args.state_dim, args.entity_dim)
         
-        # Positional encoding
         self.pos_encoder = nn.Parameter(
             torch.zeros(1, args.max_seq_length, args.entity_dim)
         )
         
-        # Layer normalization
         self.layer_norm = nn.LayerNorm(args.entity_dim, eps=args.layer_norm_epsilon)
         
-        # Multi-head attention for mixing
         self.attention = nn.MultiheadAttention(
             embed_dim=args.entity_dim,
             num_heads=args.attention_heads,
@@ -29,7 +25,6 @@ class TransformerMixingNetwork(nn.Module):
             batch_first=True
         )
         
-        # Feed-forward networks
         self.ff_network = nn.Sequential(
             nn.Linear(args.entity_dim, args.feedforward_size),
             nn.ReLU(),
@@ -51,27 +46,21 @@ class TransformerMixingNetwork(nn.Module):
         Returns:
             Mixed Q-values
         """
-        # Embed states
         state_embed = self.entity_embedding(states)
         if len(state_embed.shape) == 2:
             state_embed = state_embed.unsqueeze(1)
             
-        # Add positional encoding
         state_embed = state_embed + self.pos_encoder[:, :state_embed.size(1)]
         
-        # Apply layer normalization
         state_embed = self.layer_norm(state_embed)
         
-        # Self-attention on states
         state_attended, _ = self.attention(
             state_embed, state_embed, state_embed,
             key_padding_mask=mask
         )
         
-        # Residual connection and layer norm
         state_mixed = self.layer_norm(state_embed + state_attended)
         
-        # Feed-forward network
         state_final = self.layer_norm(state_mixed + self.ff_network(state_mixed))
         
         return state_final
@@ -101,11 +90,8 @@ class LLMQMixer(nn.Module):
         self.dropout_rate = getattr(args, "dropout_rate", 0.1)
         self.commitment_embedding_dim = getattr(args, "commitment_embedding_dim", self.entity_dim)
 
-        # --- ECON specific components ---
-        # Dimension of prompt_embedding e_i (T_i, p_i) -> 2
         self.prompt_embedding_dim = 2 
         
-        # 1. Self-attention for prompt embeddings {e_i} to get {w_i}
         self.prompt_attention_heads = getattr(args, "prompt_attention_heads", 4)
         self.prompt_self_attention = nn.MultiheadAttention(
             embed_dim=self.prompt_embedding_dim, 
@@ -116,7 +102,6 @@ class LLMQMixer(nn.Module):
         self.w_i_projection_dim = getattr(args, "w_i_dim", self.entity_dim // 2)
         self.project_w_i = nn.Linear(self.prompt_embedding_dim, self.w_i_projection_dim)
 
-        # 2. Network to combine w_i (projected) and group_repr (E) to get F_i
         self.F_i_input_dim = self.w_i_projection_dim + self.belief_dim
         self.F_i_dim = getattr(args, "F_i_dim", self.entity_dim)
         self.feature_transform_F_i = nn.Sequential(
@@ -171,8 +156,6 @@ class LLMQMixer(nn.Module):
         self.max_cache_size = getattr(args, 'max_cache_size', 1000)
         self.commitment_cache = {}
         
-        # 设备配置
-        # 正确访问use_cuda属性
         use_cuda = hasattr(args, 'system') and hasattr(args.system, 'use_cuda') and args.system.use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -203,11 +186,9 @@ class LLMQMixer(nn.Module):
         """
         batch_size = local_q_values.size(0)
         
-        # 1. Process prompt embeddings {e_i} through self-attention to get {w_i}
         attn_output_w, _ = self.prompt_self_attention(prompt_embeddings, prompt_embeddings, prompt_embeddings)
         w_i_projected = self.project_w_i(attn_output_w) # (batch, n_agents, w_i_projection_dim)
 
-        # 2. Combine {w_i_projected} with group_representation (E^t) to produce {F_i^t}
         E_t_expanded = group_representation.unsqueeze(1).repeat(1, self.n_agents, 1) 
         combined_for_F_i = torch.cat([w_i_projected, E_t_expanded], dim=-1)
         
@@ -215,7 +196,6 @@ class LLMQMixer(nn.Module):
         F_i_transformed_flat = self.feature_transform_F_i(combined_for_F_i_flat)
         F_i_transformed = F_i_transformed_flat.view(batch_size, self.n_agents, self.F_i_dim)
 
-        # 3. Compute global Q-value Q_tot^t using QMIX methodology
         agent_qs_reshaped = local_q_values.unsqueeze(-1) # (batch, n_agents, 1)
 
         w1 = torch.abs(self.hyper_w_1(group_representation)) 
@@ -224,10 +204,6 @@ class LLMQMixer(nn.Module):
         b1 = self.hyper_b_1(group_representation) 
         b1 = b1.view(batch_size, 1, self.mixing_embed_dim)
 
-        # Element-wise product Q_i * w1_i then sum over agents
-        # agent_qs_reshaped: (batch, n_agents, 1)
-        # w1:                (batch, n_agents, mixing_embed_dim)
-        # After product: (batch, n_agents, mixing_embed_dim)
         hidden = F.elu(torch.sum(agent_qs_reshaped * w1, dim=1, keepdim=True) + b1) # (batch, 1, mixing_embed_dim)
 
         w2 = torch.abs(self.hyper_w_2(group_representation))
@@ -239,18 +215,13 @@ class LLMQMixer(nn.Module):
         Q_tot = torch.bmm(hidden, w2) + b2 
         Q_tot = Q_tot.squeeze(-1).squeeze(-1) # (batch_size)
 
-        # --- Commitment Generation (if agent_raw_outputs are provided) ---
         generated_commitment_texts = None
         if agent_raw_outputs is not None:
             generated_commitment_texts = []
             for i in range(batch_size):
-                # Pass E^t for the current batch item
                 current_E_t = group_representation[i:i+1] # Keep batch dim for coordinator if it expects it
-                # Alternatively, if coordinator does not need E_t or takes it in a different form:
-                # current_E_t_for_llm = some_processing(group_representation[i]) 
                 commitment_str = self._generate_commitment(
                     agent_raw_outputs=agent_raw_outputs[i], # List[str] for current batch item
-                    # group_representation_single=current_E_t_for_llm # Pass processed E_t if needed
                 )
                 generated_commitment_texts.append(commitment_str)
 
@@ -261,7 +232,6 @@ class LLMQMixer(nn.Module):
             "generated_commitment_text": generated_commitment_texts, 
         }
         
-        # 总是计算F_i_for_LSD以支持SD loss计算
         F_i_for_LSD = self.F_i_project_for_LSD(F_i_transformed) 
         outputs["F_i_for_LSD"] = F_i_for_LSD
 
@@ -323,8 +293,6 @@ class LLMQMixer(nn.Module):
         """
         loss_components = {}
 
-        # ---- shape hygiene (avoid accidental broadcasting to (N,N)) ----
-        # We expect 1D vectors of length N for TD computations.
         if isinstance(mask_flat, torch.Tensor) and mask_flat.ndim > 1:
             mask_flat = mask_flat.view(-1)
         if isinstance(rewards_total, torch.Tensor) and rewards_total.ndim > 1:
@@ -336,25 +304,15 @@ class LLMQMixer(nn.Module):
         if isinstance(Q_tot, torch.Tensor) and Q_tot.ndim > 1:
             Q_tot = Q_tot.view(-1)
 
-        # 1. Global TD Loss: L_TD^tot(φ)
-        # td_target = r_tot + γ * target_Q_tot (if not terminated)
-        # td_target = r_tot (if terminated)
         td_target = rewards_total + gamma * target_Q_tot * (1 - terminated.float())
         
-        # Inside LLMQMixer.calculate_mix_loss, assuming mask_flat (bs*seq, 1) is passed
         td_error_tot = (Q_tot - td_target.detach()) # expected (N,)
-        # Ensure mask_flat is correctly shaped and broadcastable with td_error_tot
         masked_td_error_tot = td_error_tot * mask_flat 
         loss_td_tot = (masked_td_error_tot**2).sum() / mask_flat.sum().clamp(min=1e-6) # clamp for stability
         loss_components["L_TD_tot"] = loss_td_tot
 
-        # 2. Similarity Difference Loss: L_SD
-        # L_SD = λ_b Σ_i (1 - sim(F_i^t, C))^2 (mean over batch)
         loss_sd = torch.tensor(0.0, device=self.device)
         if lambda_sd > 0 and F_i_for_LSD is not None and commitment_text_features is not None:
-            # Expand C_embedding for per-agent comparison
-            # F_i_for_LSD: (batch, n_agents, C_embed_dim)
-            # commitment_text_features: (batch, C_embed_dim) -> (batch, 1, C_embed_dim)
             C_embedding_expanded = commitment_text_features.unsqueeze(1)
             
             cosine_sim = F.cosine_similarity(F_i_for_LSD, C_embedding_expanded, dim=-1) # (batch, n_agents)
@@ -363,18 +321,15 @@ class LLMQMixer(nn.Module):
             loss_sd = loss_sd_per_agent.sum(dim=1).mean() # Sum over agents, mean over batch items
         loss_components["L_SD"] = loss_sd
 
-        # 3. Local-Global Q Consistency Loss: λ_m Σ_i ||Q_i^t - Q_tot^t||^2 (mean over batch)
         loss_q_consistency = torch.tensor(0.0, device=self.device)
         if lambda_m > 0:
             Q_tot_expanded = Q_tot.unsqueeze(1).repeat(1, self.n_agents) # (batch, n_agents)
             loss_q_consistency = (local_q_values - Q_tot_expanded.detach()).pow(2).sum(dim=1).mean()
         loss_components["L_Q_consistency"] = loss_q_consistency
 
-        # Total Mix Loss
         total_mix_loss = loss_td_tot + lambda_sd * loss_sd + lambda_m * loss_q_consistency
         loss_components["L_mix_total"] = total_mix_loss
 
-        # Final safety: avoid silently propagating NaNs
         if not torch.isfinite(total_mix_loss):
             logger.warning(f"[LLMQMixer] total_mix_loss is not finite: {total_mix_loss}. "
                            f"Shapes: Q_tot={tuple(Q_tot.shape)}, td_target={tuple(td_target.shape)}, mask={tuple(mask_flat.shape)}")
@@ -382,16 +337,9 @@ class LLMQMixer(nn.Module):
         return total_mix_loss, loss_components
 
     def calculate_similarity_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # This is the old similarity loss, likely needs to be deprecated or adapted.
-        # For ECON, L_SD is calculated within calculate_mix_loss.
-        # logger.warning("Deprecated: calculate_similarity_loss called. L_SD is part of calculate_mix_loss.")
             return torch.tensor(0.0, device=self.device)
     
     def calculate_reward_diff_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # This method seems related to dynamic reward weights, which is a separate mechanism.
-        # The loss L_dr for reward weights is Σ (r_actual - r_expected)^2.
-        # This function in QMixer might be for something else or needs to be in the learner.
-        # logger.warning("Deprecated: calculate_reward_diff_loss in LLMQMixer called.")
             return torch.tensor(0.0, device=self.device)
     
     def _get_default_outputs(self, agent_qs: torch.Tensor) -> Dict[str, torch.Tensor]:

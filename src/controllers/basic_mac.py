@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from modules.agents.transformer_agent import LLMTransformerAgent
 from modules.llm.llm_wrapper import ImprovedLLMWrapper, LLMConfig
-from modules.llm.commitment_embedder import CommitmentEmbedder
 from components.action_selectors import REGISTRY as action_REGISTRY
 from torch.nn import functional as F
 import numpy as np
@@ -19,9 +18,6 @@ class LLMBasicMAC:
     def __init__(self, scheme: Dict, groups: Dict, args: Any):
         self.n_agents = args.n_agents
         self.args = args
-        # ---- Backward-compatible defaults for minimal YAML configs ----
-        # Many configs only override a small subset of keys; BasicMAC historically assumed
-        # defaults from src/config/config.yaml. Provide safe fallbacks here.
         if not hasattr(self.args, "agent_output_type"):
             self.args.agent_output_type = "q_values"
         if not hasattr(self.args, "action_selector"):
@@ -29,48 +25,37 @@ class LLMBasicMAC:
         if not hasattr(self.args, "use_causal_mask"):
             self.args.use_causal_mask = False
         if not hasattr(self.args, "max_seq_length"):
-            # Prefer env max_question_length when available
             self.args.max_seq_length = getattr(getattr(self.args, "env_args", object()), "max_question_length", 1024)
-        # Correctly access use_cuda attribute
         use_cuda = hasattr(args, 'system') and hasattr(args.system, 'use_cuda') and args.system.use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
         
-        # Initialize tokenizer with better error handling
         model_name = args.llm_model_name if hasattr(args, "llm_model_name") else "gpt2"
         try:
-            # Try to load tokenizer with local_files_only first
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
             logger.info(f"Successfully loaded tokenizer for {model_name} from local cache")
         except (OSError, ConnectionError, Exception) as e:
             logger.warning(f"Failed to load tokenizer for model '{model_name}' from cache: {e}")
             logger.info("Trying to create a simple tokenizer as fallback...")
             try:
-                # Create a basic tokenizer as fallback
                 from transformers import GPT2Tokenizer
                 self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2", local_files_only=True)
                 logger.info("Using cached GPT-2 tokenizer as fallback")
             except Exception as e2:
                 logger.error(f"Failed to load any tokenizer: {e2}")
-                # Create a minimal tokenizer
                 self.tokenizer = self._create_minimal_tokenizer()
                 logger.info("Created minimal tokenizer as last resort")
                 
-        # Ensure pad_token is set
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             logger.info(f"Tokenizer missing pad_token, set to eos_token: {self.tokenizer.eos_token}")
 
-        # Get input shape for agents (now based on tokenized obs)
         input_shape = self._get_input_shape(scheme) 
         
-        # Initialize agents (executors)
         self._build_agents(input_shape)
         self.agent_output_type = args.agent_output_type
         
-        # Action selector
         self.action_selector = action_REGISTRY[args.action_selector](args)
         
-        # Common LLM Config for Coordinator and Embedder API access
         common_llm_config = LLMConfig(
             api_key=args.together_api_key,
             model_name=args.coordinator_model,
@@ -79,7 +64,6 @@ class LLMBasicMAC:
             max_workers=getattr(args, "llm_max_workers", 5)
         )
 
-        # Initialize coordinator LLM
         self.coordinator = ImprovedLLMWrapper(
             api_key=args.together_api_key,
             model_name=args.coordinator_model,
@@ -87,24 +71,24 @@ class LLMBasicMAC:
             debug=getattr(args, "debug", False)
         )
         
-        # Initialize BeliefEncoder
         self.belief_encoder = BeliefEncoder(
             belief_dim=args.belief_dim,
             n_agents=args.n_agents,
             n_heads=args.arch.attention_heads if hasattr(args, 'arch') and hasattr(args.arch, 'attention_heads') else 4,
             key_dim=args.arch.key_dim if hasattr(args, 'arch') and hasattr(args.arch, 'key_dim') else 64,
             device=self.device,
-            # --- HiSim social extensions (all optional; default values keep backward compatibility) ---
             population_belief_dim=getattr(args, "population_belief_dim", 3),
             use_population_token=getattr(args, "use_population_token", True),
             n_stages=getattr(getattr(args, "env_args", object()), "n_stages", 13),
             use_stage_token=getattr(args, "use_stage_token", False),
-            # --- population belief update head options ---
+            use_brief_encoder=getattr(args, "use_brief_encoder", False),
+            brief_encoder_input_dim=getattr(args, "brief_encoder_input_dim", getattr(getattr(args, "env_args", object()), "group_representation_dim", 128)),
+            brief_encoder_hidden_dim=getattr(args, "brief_encoder_hidden_dim", 256),
+            brief_encoder_use_stage=getattr(args, "brief_encoder_use_stage", False),
             use_population_update_head=getattr(args, "use_population_update_head", True),
             population_update_hidden_dim=getattr(args, "population_update_hidden_dim", 128),
             population_update_use_group_repr=getattr(args, "population_update_use_group_repr", True),
             population_update_use_stage=getattr(args, "population_update_use_stage", False),
-            # --- z dynamics parametrization ---
             population_update_parametrization=getattr(args, "population_update_parametrization", "categorical"),
             dirichlet_alpha_min=getattr(args, "dirichlet_alpha_min", 1e-3),
             population_update_use_extra_cond=getattr(args, "population_update_use_extra_cond", False),
@@ -112,7 +96,6 @@ class LLMBasicMAC:
             population_update_residual_mixing=getattr(args, "population_update_residual_mixing", True),
             population_update_mixing_init=getattr(args, "population_update_mixing_init", 0.5),
             population_update_mixing_learnable=getattr(args, "population_update_mixing_learnable", True),
-            # --- optional: secondary user action belief head ---
             secondary_action_dim=getattr(args, "secondary_action_dim", 5),
             use_secondary_action_head=getattr(args, "use_secondary_action_head", False),
             secondary_action_hidden_dim=getattr(args, "secondary_action_hidden_dim", 128),
@@ -121,21 +104,11 @@ class LLMBasicMAC:
             secondary_action_use_population=getattr(args, "secondary_action_use_population", True),
         )
 
-        # Initialize Commitment Embedder
-        self.commitment_embedder = CommitmentEmbedder(args, common_llm_config)
-        
-        # Response caches with size limits
         self.max_cache_size = getattr(args, 'max_cache_size', 1000)
         self.strategy_cache = {}
-        self.commitment_cache = {}
         
-        # Initialize attention masks
         self.setup_attention_masks()
 
-    # ---- DDP helpers ----
-    # When using DistributedDataParallel, `self.agent` / `self.belief_encoder` may be wrapped,
-    # and non-forward methods (e.g., generate_answer / save_models / predict_next_population_b_tri) live on `.module`.
-    # These helpers make the rest of the code DDP-safe.
     def _unwrap(self, m: Any) -> Any:
         return getattr(m, "module", m)
 
@@ -159,7 +132,6 @@ class LLMBasicMAC:
         if max_length is None:
             max_length = getattr(self.args.env_args, "max_question_length", 512)
 
-        # Tokenize the text
         encoding = self.tokenizer(
             observation_text,
             add_special_tokens=True,
@@ -170,7 +142,6 @@ class LLMBasicMAC:
             return_tensors='pt',
         )
         
-        # .input_ids is typically shape (1, seq_len). We want (seq_len,)
         return encoding.input_ids.squeeze(0).to(self.device)
 
     def setup_attention_masks(self):
@@ -181,7 +152,6 @@ class LLMBasicMAC:
             device=self.device
         )
         
-        # Create causal attention mask if needed
         if bool(getattr(self.args, "use_causal_mask", False)):
             mask = torch.triu(
                 torch.ones(self.args.max_seq_length, self.args.max_seq_length),
@@ -223,33 +193,24 @@ class LLMBasicMAC:
         """
         bs = batch.batch_size
         
-        # For token-based input, use observation sequence directly
-        # batch["obs"] shape: (batch_size, max_seq_len, n_agents, max_token_len)
-        # We need: (batch_size * n_agents, max_token_len)
         obs_tokens = batch["obs"][:, t]  # (batch_size, n_agents, max_token_len)
         inputs = obs_tokens.reshape(bs * self.n_agents, -1)  # (batch_size * n_agents, max_token_len)
         
-        # Create attention mask based on token validity
         seq_len = inputs.size(1)  # max_token_len
         
-        # Simple padding detection: find pad token positions
         if hasattr(self, 'tokenizer'):
             if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None:
                 pad_token_id = self.tokenizer.pad_token_id
             else:
-                # If pad_token_id is None, use eos_token_id
                 pad_token_id = self.tokenizer.eos_token_id
         else:
             pad_token_id = 50256  # GPT2's eos_token_id
             
         mask = (inputs == pad_token_id)
-        # Safety: avoid the "all-masked" case (e.g., empty text + pad_token==eos) which can
-        # produce NaNs inside attention (all positions masked -> softmax over all -inf).
         try:
             if isinstance(mask, torch.Tensor) and mask.ndim == 2:
                 all_masked = mask.all(dim=1)  # (bs*n_agents,)
                 if bool(all_masked.any().item()):
-                    # Unmask a single position so downstream models always have at least one valid token
                     mask[all_masked, 0] = False
         except Exception:
             pass
@@ -273,44 +234,31 @@ class LLMBasicMAC:
         Returns:
             Tuple of (actions, info_dict)
         """
-        # Get available actions
         avail_actions = ep_batch["avail_actions"][:, t_ep]
         
-        # Forward pass through agents
         agent_outputs, agent_info = self.forward(ep_batch, t_ep, test_mode)
         
-        # Select actions based on agent outputs
         chosen_actions = self.action_selector.select_action(
             agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode
         )
         
-        # Generate LLM responses if raw text is provided AND enabled.
-        # For offline belief-network training on HF datasets, you typically want to disable
-        # expensive online LLM calls and use discrete actions instead.
         enable_llm_rollout = bool(getattr(self.args, "enable_llm_rollout", True))
         if raw_observation_text is not None and enable_llm_rollout:
-            # Social-mode detection:
-            # - hisim_social_env expects executor to output JSON actions.
-            # - coordinator math-style strategy/commitment prompts can hurt; default to NO coordinator in social mode.
             env_name = str(getattr(self.args, "env", "") or "").strip().lower()
             action_source = str(getattr(self.args, "env_action_source", "") or "").strip().lower()
             is_social = (env_name == "hisim_social_env") or (action_source in ("llm_response_0", "executor0", "executor_0", "response0"))
 
-            # Coordinator hint (optional). For social tasks default to empty hint to avoid math prompt leakage.
             if is_social:
                 strategy = ""
             else:
                 strategy = self._get_strategy(raw_observation_text)
             
-            # Get executor responses
-            # Social-mode: align credit assignment by forcing LLM to output the policy-chosen action_type (+ stance_id).
             executor_responses = []
             forced_action_types = []
             forced_stance_ids = []
             action_type_names = ["post", "retweet", "reply", "like", "do_nothing"]
             stance_actions = {"post", "retweet", "reply"}
 
-            # chosen_actions: typically (bs, n_agents) or (n_agents,)
             ca = chosen_actions
             try:
                 if isinstance(ca, torch.Tensor) and ca.ndim >= 2:
@@ -320,7 +268,6 @@ class LLMBasicMAC:
             except Exception:
                 ca0 = ca
 
-            # stance logits from stance head (3-way) if available: (bs, n_agents, 3)
             stance_q = agent_info.get("stance_action_q_values")
             try:
                 if isinstance(stance_q, torch.Tensor) and stance_q.ndim >= 3:
@@ -334,7 +281,6 @@ class LLMBasicMAC:
                 forced_at = "do_nothing"
                 forced_sid = None
 
-                # force action_type from discrete policy (5-way)
                 try:
                     if isinstance(ca0, torch.Tensor):
                         aid = int(ca0[agent_id].item()) if ca0.numel() > agent_id else 4
@@ -347,7 +293,6 @@ class LLMBasicMAC:
                 except Exception:
                     forced_at = "do_nothing"
 
-                # force stance_id from stance head (3-way) ONLY when action expresses stance
                 if forced_at in stance_actions:
                     try:
                         if isinstance(stance_q0, torch.Tensor) and stance_q0.ndim == 2 and stance_q0.shape[0] > agent_id:
@@ -360,9 +305,7 @@ class LLMBasicMAC:
                 forced_action_types.append(forced_at)
                 forced_stance_ids.append(forced_sid)
 
-                # Call executor
                 if is_social:
-                    # Be robust to agents that don't accept forced_* kwargs
                     try:
                         response = self.agent_module.generate_answer(
                             question=raw_observation_text,
@@ -382,35 +325,21 @@ class LLMBasicMAC:
                     )
                 executor_responses.append(response)
 
-            if is_social:
-                # For social simulation, we don't need a "final answer" commitment.
-                # Use executor outputs directly as env actions (EpisodeRunner env_action_source=llm_response_0).
-                agent_info.update({
-                    "strategy": strategy,
-                    "llm_responses": executor_responses,
-                    "executor_responses": executor_responses,
-                    "forced_action_types": forced_action_types,
-                    "forced_stance_ids": forced_stance_ids,
-                    "commitment": "",
-                    "commitment_text": "",
-                    "commitment_embedding": None
-                })
-            else:
-                # Generate commitment (math-style coordinator). Kept for backward compatibility with original ECON tasks.
-                commitment_text = self._generate_commitment(
-                    raw_observation_text, strategy, executor_responses,
-                    agent_info.get("group_repr"), agent_info.get("prompt_embeddings")
+            if not is_social:
+                raise RuntimeError(
+                    "Non-social LLM commitment branch has been removed. "
+                    "Use hisim_social_env (is_social=True) or restore the old commitment pipeline if needed."
                 )
-                # Get commitment embedding
-                commitment_embedding = self.commitment_embedder.embed_commitments([commitment_text])
-                agent_info.update({
-                    "strategy": strategy,
-                    "llm_responses": executor_responses,
-                    "executor_responses": executor_responses,
-                    "commitment": commitment_text,
-                    "commitment_text": commitment_text,
-                    "commitment_embedding": commitment_embedding
-                })
+            agent_info.update({
+                "strategy": strategy,
+                "llm_responses": executor_responses,
+                "executor_responses": executor_responses,
+                "forced_action_types": forced_action_types,
+                "forced_stance_ids": forced_stance_ids,
+                "commitment": "",
+                "commitment_text": "",
+                "commitment_embedding": None
+            })
         
         return chosen_actions, agent_info
 
@@ -427,14 +356,10 @@ class LLMBasicMAC:
         Returns:
             Tuple of (agent_outputs, info_dict)
         """
-        # Use train_mode if provided, otherwise use the inverse of test_mode
         actual_test_mode = test_mode if not train_mode else False
         
-        # Build inputs for agents
         inputs, mask = self._build_inputs(ep_batch, t)
 
-        # Fetch structured conditioning signals from EpisodeBatch (global, bs-level).
-        # These fields are written by EpisodeRunner for HuggingFaceDatasetEnv / social envs.
         population_belief = None
         stage_t = None
         try:
@@ -450,8 +375,6 @@ class LLMBasicMAC:
             population_belief = None
             stage_t = None
 
-        # Optional: pass population belief z_t / stage_t into agent for conditioning
-        # (Stage3b goal: action imitation conditioned on z_t learned in Stage3a).
         pop_flat = None
         st_flat = None
         try:
@@ -459,7 +382,6 @@ class LLMBasicMAC:
                 pb = population_belief
                 if pb.ndim == 3 and pb.shape[1] == 1:
                     pb = pb.squeeze(1)
-                # expected pb: (batch, K)
                 if pb.ndim == 2 and pb.shape[0] == int(ep_batch.batch_size):
                     pop_flat = pb.unsqueeze(1).expand(int(ep_batch.batch_size), int(self.n_agents), int(pb.shape[-1])).reshape(int(ep_batch.batch_size) * int(self.n_agents), int(pb.shape[-1]))
         except Exception:
@@ -469,13 +391,11 @@ class LLMBasicMAC:
                 st = stage_t
                 if st.ndim == 2 and st.shape[1] == 1:
                     st = st.squeeze(1)
-                # expected st: (batch,)
                 if st.ndim == 1 and st.shape[0] == int(ep_batch.batch_size):
                     st_flat = st.unsqueeze(1).expand(int(ep_batch.batch_size), int(self.n_agents)).reshape(int(ep_batch.batch_size) * int(self.n_agents))
         except Exception:
             st_flat = None
 
-        # Forward pass through agents (be robust to older agents that don't accept new kwargs)
         try:
             agent_outs, hidden_states = self.agent(
                 inputs, mask,
@@ -486,30 +406,18 @@ class LLMBasicMAC:
         except TypeError:
             agent_outs, hidden_states = self.agent(inputs, mask, test_mode=actual_test_mode)
         
-        # Extract data from agent outputs
-        # agent_outs contains outputs for all agents in the batch
         batch_size = ep_batch.batch_size
         
-        # Extract and reshape outputs for each agent
         belief_states = agent_outs.get('belief_state', torch.zeros(batch_size * self.n_agents, self.args.belief_dim, device=self.device))
         prompt_embeddings = agent_outs.get('prompt_embedding', torch.zeros(batch_size * self.n_agents, 2, device=self.device))
-        # local scalar Q_i^t
         q_values = agent_outs.get('q_value', torch.zeros(batch_size * self.n_agents, 1, device=self.device))
-        # optional discrete-action Q-values (for multinomial selector)
-        # NOTE: to avoid Stage1(stance=3) and Stage4(action_type=5) head conflicts,
-        # the agent may output multiple heads:
-        # - stance_action_q_values: (bs*n_agents, 3)
-        # - action_type_q_values: (bs*n_agents, 5)
-        # - action_q_values: backward-compat default (usually action_type)
         action_q_values = agent_outs.get('action_q_values')
         stance_action_q_values = agent_outs.get('stance_action_q_values')
         action_type_q_values = agent_outs.get('action_type_q_values')
         
-        # Reshape from (batch_size * n_agents, feature_dim) to (batch_size, n_agents, feature_dim)
         belief_states = belief_states.view(batch_size, self.n_agents, -1)
         prompt_embeddings = prompt_embeddings.view(batch_size, self.n_agents, -1)
         q_values = q_values.view(batch_size, self.n_agents, -1)
-        # For learner: prefer scalar q-values shaped (bs, n_agents) when possible
         q_values_scalar = q_values.squeeze(-1) if isinstance(q_values, torch.Tensor) and q_values.shape[-1] == 1 else q_values
         if isinstance(action_q_values, torch.Tensor):
             action_q_values = action_q_values.view(batch_size, self.n_agents, -1)
@@ -518,25 +426,32 @@ class LLMBasicMAC:
         if isinstance(action_type_q_values, torch.Tensor):
             action_type_q_values = action_type_q_values.view(batch_size, self.n_agents, -1)
         
-        # Generate group representation:
-        # - Default: use BeliefEncoder(belief_states, population_belief, stage_t)
-        # - B2-2 option: use non-parametric group_representation provided by env/dataset via ep_batch (global field)
-        # 对 HiSim social：显式注入 population belief（边缘用户 latent z）与 stage_t
-        # NOTE: reuse population_belief/stage_t fetched above (bs-level), NOT the per-agent expanded pop_flat/st_flat.
 
-        # Stage1/2 supervised mode: optionally freeze encoder and avoid building a grad graph
         freeze_enc_sup = bool(getattr(self.args, "freeze_belief_encoder_in_supervised", False))
         is_sup = bool(getattr(self.args, "train_belief_supervised", False))
         use_no_grad = bool(train_mode and is_sup and freeze_enc_sup)
 
         group_representation = None
         use_nonparam_gr = bool(getattr(self.args, "use_nonparam_group_repr", False))
+        use_brief_enc = bool(getattr(self.args, "use_brief_encoder", False))
         if use_nonparam_gr:
             try:
                 if "group_representation" in ep_batch.scheme:
-                    grb = ep_batch["group_representation"][:, t]  # (bs, belief_dim)
+                    grb = ep_batch["group_representation"][:, t]  # (bs, D_raw)
                     if isinstance(grb, torch.Tensor):
-                        group_representation = grb.to(self.device)
+                        raw_gr = grb.to(self.device).float()
+                        if use_brief_enc:
+                            try:
+                                be = self.belief_encoder_module
+                                if be is not None and hasattr(be, "encode_brief"):
+                                    group_representation = be.encode_brief(raw_gr, stage_t=stage_t)
+                                else:
+                                    group_representation = raw_gr
+                            except Exception as e:
+                                logger.warning(f"BriefEncoder encode_brief failed, fallback to raw group_representation: {e}")
+                                group_representation = raw_gr
+                        else:
+                            group_representation = raw_gr
             except Exception:
                 group_representation = None
 
@@ -556,7 +471,6 @@ class LLMBasicMAC:
                         stage_t=stage_t,
                     )  # (batch, belief_dim)
             except Exception as e:
-                # 回退：不注入 population/stage（保持可运行）
                 logger.warning(f"BeliefEncoder forward with population_belief failed, fallback to vanilla: {e}")
                 if use_no_grad:
                     with torch.no_grad():
@@ -564,7 +478,6 @@ class LLMBasicMAC:
                 else:
                     group_representation = self.belief_encoder(belief_states)
 
-        # ===== Innovation hook: belief about secondary users (used for env-side simulation) =====
         secondary_z_next = None
         secondary_action_probs = None
         try:
@@ -593,8 +506,6 @@ class LLMBasicMAC:
             logger.debug(f"Secondary action probs prediction skipped: {e}")
             secondary_action_probs = None
         
-        # Prepare outputs for action selector:
-        # MultinomialActionSelector expects agent_inputs: (bs, n_agents, n_avail_actions)
         try:
             avail_actions_t = ep_batch["avail_actions"][:, t]  # (bs, n_agents, n_avail)
             n_avail = int(avail_actions_t.shape[-1])
@@ -602,13 +513,8 @@ class LLMBasicMAC:
             avail_actions_t = None
             n_avail = 1
 
-        # Default: use scalar q_values if we only have 1 action
         agent_outputs = q_values  # (bs, n_agents, 1)
 
-        # Prefer the correct discrete head based on n_avail:
-        # - n_avail==3: stance head (Stage1/2 HF datasets)
-        # - n_avail==5: action_type head (Stage4 social simulation, if using discrete selector)
-        # Otherwise: fall back to generic action_q_values.
         aq_src = None
         if n_avail == 3 and isinstance(stance_action_q_values, torch.Tensor):
             aq_src = stance_action_q_values
@@ -617,12 +523,10 @@ class LLMBasicMAC:
         elif isinstance(action_q_values, torch.Tensor):
             aq_src = action_q_values
 
-        # Prefer selected discrete-action Q-values if it exists and can be aligned to n_avail
         if isinstance(aq_src, torch.Tensor):
             aq = aq_src
             if aq.ndim == 2:
                 aq = aq.unsqueeze(0)
-            # align last dim to n_avail (slice/pad) to avoid shape mismatch
             if aq.shape[-1] > n_avail:
                 aq = aq[..., :n_avail]
             elif aq.shape[-1] < n_avail:
@@ -630,21 +534,17 @@ class LLMBasicMAC:
                 aq = torch.cat([aq, pad], dim=-1)
             agent_outputs = aq
         else:
-            # If config/action-space says multiple actions but agent didn't output per-action values,
-            # repeat scalar q_values to match n_avail so selector doesn't crash.
             if n_avail > 1 and isinstance(q_values, torch.Tensor) and q_values.shape[-1] == 1:
                 agent_outputs = q_values.repeat(1, 1, n_avail)
         
         info_dict = {
             "belief_states": belief_states,
             "prompt_embeddings": prompt_embeddings,
-            # NOTE: keep learner-facing q_values as (bs, n_agents) if available
             "q_values": q_values_scalar,
             "action_q_values": action_q_values if isinstance(action_q_values, torch.Tensor) else None,
             "stance_action_q_values": stance_action_q_values if isinstance(stance_action_q_values, torch.Tensor) else None,
             "action_type_q_values": action_type_q_values if isinstance(action_type_q_values, torch.Tensor) else None,
             "group_repr": group_representation,
-            # optional: for env-side secondary user simulation
             "secondary_z_next": secondary_z_next,
             "secondary_action_probs": secondary_action_probs,
             "hidden_states": hidden_states
@@ -662,11 +562,9 @@ class LLMBasicMAC:
         Returns:
             Generated strategy (limited to 50 tokens)
         """
-        # Check cache first
         if question in self.strategy_cache:
             return self.strategy_cache[question]
         
-        # Generate improved strategy prompt with explicit token limit - NO DIRECT ANSWERS
         strategy_prompt = f"""You are a coordinator for mathematical problem-solving agents. Analyze this math problem and provide a clear solving strategy WITHOUT calculating the final answer.
 
 Problem: {question}
@@ -692,10 +590,8 @@ Strategy (method only, no calculations):"""
                 max_tokens=50  # Strict limit to prevent exceeding
             )
             
-            # Log the generated strategy
             logger.info(f"📋 COORDINATOR STRATEGY: {strategy}")
             
-            # Cache the strategy
             if len(self.strategy_cache) < self.max_cache_size:
                 self.strategy_cache[question] = strategy
             
@@ -707,132 +603,6 @@ Strategy (method only, no calculations):"""
             logger.info(f"📋 COORDINATOR STRATEGY (FALLBACK): {fallback_strategy}")
             return fallback_strategy
 
-    def _generate_commitment(self, question: str, strategy: str, 
-                           responses: List[str], group_repr: Optional[torch.Tensor] = None,
-                           prompt_embeddings: Optional[torch.Tensor] = None) -> str:
-        """
-        Generate commitment using coordinator LLM with token limit.
-        
-        Args:
-            question: Original question
-            strategy: Generated strategy
-            responses: Agent responses
-            group_repr: Group representation tensor
-            prompt_embeddings: Prompt embeddings tensor
-            
-        Returns:
-            Generated commitment (limited to 50 tokens)
-        """
-        # Create cache key
-        cache_key = f"{question}_{strategy}_{hash(tuple(responses))}"
-        
-        # Check cache first
-        if cache_key in self.commitment_cache:
-            return self.commitment_cache[cache_key]
-        
-        # Format responses for display
-        formatted_responses = self._format_responses(responses)
-        
-        # Log the formatted responses
-        logger.info(f"💬 EXECUTOR RESPONSES:")
-        for i, response in enumerate(responses):
-            logger.info(f"    Agent {i+1}: {response}")
-        
-        # Generate improved commitment prompt with explicit token limit
-        commitment_prompt = f"""You are a coordinator. Review these math solutions and provide the final answer.
-
-Question: {question}
-
-Strategy: {strategy}
-
-Agent Solutions:
-{formatted_responses}
-
-REQUIREMENTS:
-1. Your response must be EXACTLY 50 tokens or less
-2. Check each solution for correctness
-3. Identify the right approach and calculation
-4. Your response must end with \\boxed{{final_numerical_answer}}
-5. Inside the box, put ONLY the numerical answer (no units, no text)
-
-IMPORTANT: Keep your commitment concise and within 50 tokens. Do not exceed this limit.
-
-Final Answer (max 50 tokens):"""
-        
-        try:
-            commitment = self.coordinator.generate_response(
-                prompt=commitment_prompt,
-                temperature=0.1,  # Very low temperature for precise commitments
-                max_tokens=50  # Strict limit to prevent exceeding
-            )
-            
-            # Validate and fix boxed answer format
-            commitment = self._ensure_boxed_format(commitment)
-            
-            # Log the commitment
-            logger.info(f"🎯 COORDINATOR COMMITMENT: {commitment}")
-            
-            # Cache the commitment
-            if len(self.commitment_cache) < self.max_cache_size:
-                self.commitment_cache[cache_key] = commitment
-            
-            return commitment
-            
-        except Exception as e:
-            logger.warning(f"Failed to generate commitment: {e}")
-            fallback_commitment = f"Analyzing problem... \\boxed{{0}}"
-            logger.info(f"🎯 COORDINATOR COMMITMENT (FALLBACK): {fallback_commitment}")
-            return fallback_commitment
-
-    def _ensure_boxed_format(self, commitment: str) -> str:
-        """
-        Ensure commitment contains properly formatted boxed answer.
-        
-        Args:
-            commitment: Generated commitment text
-            
-        Returns:
-            Commitment with proper boxed format
-        """
-        import re
-        
-        # Check if already has boxed format
-        if "\\boxed{" in commitment and "}" in commitment:
-            # Extract and clean the boxed content
-            boxed_match = re.search(r'\\boxed\{([^}]*)\}', commitment)
-            if boxed_match:
-                boxed_content = boxed_match.group(1).strip()
-                # Clean up content - keep only numerical answer
-                clean_content = re.sub(r'[^0-9\.\-]', '', boxed_content)
-                if clean_content:
-                    # Replace with cleaned content
-                    commitment = re.sub(r'\\boxed\{[^}]*\}', f'\\boxed{{{clean_content}}}', commitment)
-                    return commitment
-        
-        # If no boxed format or invalid format, try to extract numerical answer
-        numbers = re.findall(r'-?\d+(?:\.\d+)?', commitment)
-        if numbers:
-            # Use the last number found as the answer
-            answer = numbers[-1]
-            if "\\boxed{" in commitment:
-                # Replace existing boxed content
-                commitment = re.sub(r'\\boxed\{[^}]*\}', f'\\boxed{{{answer}}}', commitment)
-            else:
-                # Add boxed format
-                commitment += f" \\boxed{{{answer}}}"
-        else:
-            # No numbers found, add fallback
-            if "\\boxed{" not in commitment:
-                commitment += " \\boxed{0}"
-        
-        return commitment
-
-    def _format_responses(self, responses: List[str]) -> str:
-        """Format agent responses for commitment generation."""
-        formatted = []
-        for i, response in enumerate(responses):
-            formatted.append(f"Agent {i+1}: {response}")
-        return "\n".join(formatted)
 
     def _get_input_shape(self, scheme: Dict) -> int:
         """
@@ -844,18 +614,15 @@ Final Answer (max 50 tokens):"""
         Returns:
             Input shape for agents
         """
-        # For tokenized observations, use the vocabulary size
         if hasattr(self.args, 'vocab_size'):
             return self.args.vocab_size
         else:
-            # Default vocabulary size (GPT2)
             return 50257
 
     def _get_default_actions(self, bs: slice, 
                            avail_actions: torch.Tensor) -> torch.Tensor:
         """Get default actions when agent forward fails."""
         batch_size = avail_actions.shape[0]
-        # Return random valid actions
         random_actions = torch.randint(0, 2, (batch_size, self.n_agents), device=self.device)
         return random_actions
 
@@ -866,7 +633,6 @@ Final Answer (max 50 tokens):"""
 
     def cuda(self):
         """Move all components to CUDA."""
-        # Only torch modules should receive .cuda().
         try:
             if getattr(self, "agent", None) is not None and hasattr(self.agent, "cuda"):
                 self.agent.cuda()
@@ -877,9 +643,7 @@ Final Answer (max 50 tokens):"""
                 self.belief_encoder.cuda()
         except Exception as e:
             logger.warning(f"Failed to cuda() belief_encoder: {e}")
-        # coordinator / commitment_embedder are wrappers (not necessarily nn.Module); do not force cuda().
-        # If they implement cuda(), call it best-effort.
-        for name in ("coordinator", "commitment_embedder"):
+        for name in ("coordinator",):
             obj = getattr(self, name, None)
             if obj is None:
                 continue
@@ -890,7 +654,6 @@ Final Answer (max 50 tokens):"""
                 except Exception as e:
                     logger.debug(f"Skipping {name}.cuda() due to error: {e}")
 
-    # ---- PyTorch-like state sync helpers (for target MAC updates) ----
     def state_dict(self) -> Dict[str, Any]:
         """
         Provide a minimal state dict so learners can sync target networks via:
@@ -919,7 +682,6 @@ Final Answer (max 50 tokens):"""
             try:
                 self.agent_module.load_state_dict(state_dict["agent"], strict=strict)
             except TypeError:
-                # some modules don't support strict kw
                 self.agent_module.load_state_dict(state_dict["agent"])
         if "belief_encoder" in state_dict and self.belief_encoder_module is not None and hasattr(self.belief_encoder_module, "load_state_dict"):
             try:
@@ -930,22 +692,17 @@ Final Answer (max 50 tokens):"""
 
     def save_models(self, path: str):
         """Save all model components."""
-        # If agent is DDP-wrapped, save underlying module weights.
         self.agent_module.save_models(path)
-        # Save BeliefEncoder (critical for HiSim: includes population_update_head for z_transition)
         try:
             bm = self.belief_encoder_module
             if bm is not None:
                 torch.save(bm.state_dict(), f"{path}/belief_encoder.th")
         except Exception as e:
             logger.warning(f"Failed to save belief_encoder: {e}")
-        # Note: coordinator / commitment_embedder are stateless wrappers around external APIs.
 
     def load_models(self, path: str):
         """Load all model components."""
-        # If agent is DDP-wrapped, load into underlying module.
         self.agent_module.load_models(path)
-        # Load BeliefEncoder if present
         try:
             import os
 
@@ -957,10 +714,6 @@ Final Answer (max 50 tokens):"""
                     bm.load_state_dict(sd, strict=True)
                 except Exception as e_strict:
                     logger.warning(f"Strict load for belief_encoder failed ({e_strict}); retrying strict=False")
-                    # NOTE:
-                    # strict=False still errors on size mismatch. This commonly happens across stages, e.g.:
-                    # - Stage3a enables population_update_use_stage => adds stage_embed and changes population_update_head input dim
-                    # We therefore do a "shape-filtered" partial load: keep only keys that exist and match shapes.
                     try:
                         cur = bm.state_dict()
                         filtered = {}
@@ -972,9 +725,6 @@ Final Answer (max 50 tokens):"""
                                 continue
                             try:
                                 if tuple(cur[k].shape) != tuple(v.shape):
-                                    # Special-case: stage_embed weight often differs when env_args.n_stages changes
-                                    # across configs/checkpoints (e.g., curriculum vs full stages).
-                                    # For evaluation fairness, do a deterministic overlap copy instead of skipping.
                                     if (
                                         isinstance(k, str)
                                         and k.endswith("stage_embed.weight")
@@ -1011,11 +761,9 @@ Final Answer (max 50 tokens):"""
                         bm.load_state_dict(sd, strict=False)
         except Exception as e:
             logger.warning(f"Failed to load belief_encoder: {e}")
-        # Additional loading logic for other components if needed
 
     def _create_minimal_tokenizer(self):
         """Create a minimal tokenizer."""
-        # Create a simple character-level tokenizer as fallback
         class MinimalTokenizer:
             class _Encoding(dict):
                 """Minimal BatchEncoding-like container supporting both dict and attribute access."""
@@ -1028,7 +776,6 @@ Final Answer (max 50 tokens):"""
                     return self.get("attention_mask", None)
 
             def __init__(self):
-                # Create a basic vocabulary
                 self.vocab = {chr(i): i for i in range(32, 127)}  # ASCII printable characters
                 self.vocab.update({'[PAD]': 0, '[UNK]': 1, '[BOS]': 2, '[EOS]': 3})
                 self.pad_token = '[PAD]'
@@ -1051,11 +798,9 @@ Final Answer (max 50 tokens):"""
                 if isinstance(text, str):
                     text = [text]
                 
-                # Simple tokenization by character
                 tokenized = []
                 attn_masks = []
                 for t in text:
-                    # reserve 1 position for EOS if max_length is provided
                     if max_length is not None and max_length > 0:
                         t = t[: max(0, max_length - 1)]
 
@@ -1096,14 +841,12 @@ Final Answer (max 50 tokens):"""
                     add_special_tokens=add_special_tokens,
                     return_attention_mask=False,
                 )
-                # enc["input_ids"] is a list of lists when text is str (we normalize to list)
                 ids = enc["input_ids"]
                 if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
                     return ids[0]
                 return ids
                 
             def decode(self, token_ids, skip_special_tokens=True):
-                # Simple decode implementation
                 if hasattr(token_ids, 'tolist'):
                     token_ids = token_ids.tolist()
                 
@@ -1131,14 +874,10 @@ Final Answer (max 50 tokens):"""
             截断后的文本
         """
         try:
-            # 对文本进行tokenize
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
             
-            # 如果token数量超过限制，进行截断
             if len(tokens) > max_tokens:
-                # 截断token序列
                 truncated_tokens = tokens[:max_tokens]
-                # 解码回文本
                 truncated_text = self.tokenizer.decode(truncated_tokens, skip_special_tokens=True)
                 
                 logger.debug(f"Truncated text from {len(tokens)} to {len(truncated_tokens)} tokens")
@@ -1148,7 +887,6 @@ Final Answer (max 50 tokens):"""
                 
         except Exception as e:
             logger.warning(f"Error during token truncation: {e}")
-            # 如果tokenizer出错，使用简单的单词截断作为后备
             words = text.split()
             if len(words) > max_tokens:
                 return " ".join(words[:max_tokens])

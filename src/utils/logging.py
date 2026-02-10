@@ -38,22 +38,17 @@ class Logger:
         self.console_logger = console_logger
         self.experiment_name = experiment_name
         self.use_tensorboard = use_tensorboard
-        # In DDP we usually want ONLY rank0 to write metrics.jsonl to avoid duplicates.
         self.write_metrics_file = bool(write_metrics_file)
         
-        # Setup log directory
         self.log_dir = Path(directory) / experiment_name
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize stat tracking
         self.stats: Dict[str, collections.deque] = {}
         self.stat_windows: Dict[str, int] = {}
         
-        # Setup TensorBoard
         if use_tensorboard:
             self.tb_writer = SummaryWriter(str(self.log_dir / "tb_logs"))
         
-        # Setup metric logging
         self.metric_log_path = self.log_dir / "metrics.jsonl"
         
     def info(self, message: str) -> None:
@@ -137,7 +132,6 @@ class Logger:
         if self.use_tensorboard:
             self.tb_writer.add_scalar(key, value, t)
             
-        # Log to metrics file (optional; disable on non-rank0 in DDP)
         if self.write_metrics_file:
             with open(self.metric_log_path, 'a') as f:
                 log_entry = {
@@ -186,7 +180,6 @@ class Logger:
         """
         prefix = 'train' if is_training else 'test'
         
-        # Log basic episode stats
         self.log_metrics(
             {
                 'episode_length': episode_metrics.get('length', 0),
@@ -197,7 +190,6 @@ class Logger:
             prefix=prefix
         )
         
-        # Log LLM-specific metrics
         if 'llm_metrics' in episode_metrics:
             self.log_metrics(
                 episode_metrics['llm_metrics'],
@@ -214,11 +206,9 @@ class Logger:
             name: Model name
         """
         if self.use_tensorboard:
-            # Log model graph
             dummy_input = model.get_dummy_input()
             self.tb_writer.add_graph(model, dummy_input)
             
-            # Log model parameters
             for name, param in model.named_parameters():
                 self.tb_writer.add_histogram(f"params/{name}", param, 0)
 
@@ -272,7 +262,6 @@ class Logger:
             outputs: Dictionary of LLM outputs
             step: Current step
         """
-        # Log to file
         output_log_path = self.log_dir / "llm_outputs.jsonl"
         with open(output_log_path, 'a') as f:
             log_entry = {
@@ -282,7 +271,6 @@ class Logger:
             }
             f.write(json.dumps(log_entry) + '\n')
         
-        # Log any numerical metrics to TensorBoard
         if self.use_tensorboard:
             for key, value in outputs.items():
                 if isinstance(value, (int, float)):

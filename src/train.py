@@ -17,13 +17,11 @@ try:
 except Exception:  # pragma: no cover
     wandb = None  # type: ignore
 
-# Import necessary components
 from utils.logging import get_logger
 from runners import REGISTRY as r_REGISTRY
 from controllers import REGISTRY as mac_REGISTRY
 from learners import REGISTRY as le_REGISTRY
 
-# Optional distributed support (torchrun/DDP)
 try:  # pragma: no cover
     import torch.distributed as dist  # type: ignore
     from torch.nn.parallel import DistributedDataParallel as DDP  # type: ignore
@@ -33,7 +31,6 @@ except Exception:  # pragma: no cover
     DDP = None  # type: ignore
     _HAS_DIST = False
 
-# YAML loader: prefer PyYAML; fallback to ruamel.yaml if PyYAML isn't available.
 try:
     import yaml  # type: ignore
     _HAS_PYYAML = True
@@ -49,7 +46,6 @@ def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='ECON Framework Training Script')
     
-    # Basic parameters
     parser.add_argument('--config', type=str, default='src/config/config.yaml', help='Configuration file path')
     parser.add_argument('--executor_model', type=str, help='Executor LLM model name')
     parser.add_argument('--coordinator_model', type=str, help='Coordinator LLM model name')
@@ -63,13 +59,11 @@ def parse_args():
     parser.add_argument('--env', type=str, help='Environment name')
     parser.add_argument('--load_model_path', type=str, help='Optional checkpoint directory to load (expects files saved by learner.save_models)')
 
-    # Distributed training (torchrun)
     parser.add_argument('--distributed', action='store_true', help='Enable DistributedDataParallel (use with torchrun).')
     parser.add_argument('--ddp_backend', type=str, default='nccl', help='DDP backend (nccl/gloo).')
     parser.add_argument('--ddp_find_unused_params', action='store_true', help='DDP find_unused_parameters=True (safer, slower).')
     parser.add_argument('--ddp_reduce_batch_by_world_size', action='store_true', help='In DDP, divide config.train.batch_size by world_size per rank (keeps global effective batch).')
     
-    # wandb related parameters
     parser.add_argument('--use_wandb', action='store_true', help='Whether to use wandb for experiment logging')
     parser.add_argument('--wandb_project', type=str, default='ECON-Framework', help='wandb project name')
     parser.add_argument('--wandb_entity', type=str, help='wandb username or organization name')
@@ -86,7 +80,6 @@ def load_config(config_path: str) -> SimpleNamespace:
             y = YAML(typ="safe")
             config_dict = y.load(f)
     
-    # Recursively convert to SimpleNamespace for easy access
     def dict_to_namespace(d):
         if isinstance(d, dict):
             return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
@@ -100,7 +93,6 @@ def load_config(config_path: str) -> SimpleNamespace:
 
 def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespace:
     """Update configuration with command line arguments"""
-    # Only update non-None parameters
     if args.executor_model:
         if hasattr(config, 'llm'):
             config.llm.executor_model = args.executor_model
@@ -126,11 +118,9 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
         config.logging.checkpoint_path = str(args.checkpoint_dir)
 
     if getattr(args, "final_save_dir", None):
-        # Dedicated final output dir; used by run_training() at the very end.
         config.final_save_dir = str(args.final_save_dir)
     
     if args.api_key:
-        # Set API key in both places for compatibility
         config.together_api_key = args.api_key  # For direct access as args.together_api_key
         if hasattr(config, 'llm'):
             config.llm.together_api_key = args.api_key
@@ -144,9 +134,6 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
     if getattr(args, "load_model_path", None):
         config.load_model_path = str(args.load_model_path)
 
-    # Distributed options (torchrun/DDP)
-    # NOTE: argparse store_true flags default to False even when user didn't pass them.
-    # We should NOT override YAML config with False by default; only override when True is explicitly requested.
     if bool(getattr(args, "distributed", False)):
         config.distributed = True
     if getattr(args, "ddp_backend", None):
@@ -156,7 +143,6 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
     if bool(getattr(args, "ddp_reduce_batch_by_world_size", False)):
         config.ddp_reduce_batch_by_world_size = True
     
-    # Add wandb related configuration
     if not hasattr(config, 'wandb'):
         config.wandb = SimpleNamespace()
     
@@ -172,7 +158,6 @@ def update_config_with_args(config: SimpleNamespace, args: Any) -> SimpleNamespa
 
 def setup_experiment(config: SimpleNamespace):
     """Setup experiment environment and components"""
-    # --- detect distributed env early (so we can silence TB on non-zero ranks) ---
     rank = int(os.environ.get("RANK", "0") or "0")
     local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
     world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
@@ -180,7 +165,6 @@ def setup_experiment(config: SimpleNamespace):
     if dist_enabled and (not _HAS_DIST):
         raise RuntimeError("distributed=True but torch.distributed is not available in this environment.")
 
-    # Respect config logging settings so TensorBoard points to the expected directory.
     log_dir = "logs"
     exp_name = None
     use_tb = True
@@ -190,11 +174,9 @@ def setup_experiment(config: SimpleNamespace):
             log_dir = str(getattr(config.logging, "log_path", log_dir) or log_dir)
             exp_name = getattr(config.logging, "experiment_name", exp_name)
             use_tb = bool(getattr(config.logging, "use_tensorboard", use_tb))
-            # Allow disabling metrics.jsonl writing (rare), but keep default True.
             write_metrics_file = bool(getattr(config.logging, "write_metrics_file", write_metrics_file))
     except Exception:
         pass
-    # In DDP: only rank0 writes TensorBoard/metrics.jsonl to avoid duplicate event streams.
     if dist_enabled and rank != 0:
         use_tb = False
         write_metrics_file = False
@@ -206,14 +188,12 @@ def setup_experiment(config: SimpleNamespace):
     )
     logger.info("Setting up experiment environment...")
     
-    # Set random seed
     seed = config.system.seed if hasattr(config, 'system') and hasattr(config.system, 'seed') else 42
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
-    # Set device (DDP uses LOCAL_RANK)
     use_cuda = hasattr(config, 'system') and hasattr(config.system, 'use_cuda') and config.system.use_cuda and torch.cuda.is_available()
     device_num = config.system.device_num if hasattr(config, 'system') and hasattr(config.system, 'device_num') else 0
     if dist_enabled:
@@ -225,30 +205,24 @@ def setup_experiment(config: SimpleNamespace):
             pass
     device = torch.device(f"cuda:{device_num}" if use_cuda else "cpu")
     
-    # Add device to config object for runner access
     config.device = device
     
     if use_cuda:
         torch.cuda.set_device(device_num)
 
-    # Initialize process group (after device is set)
     if dist_enabled:
         try:
             backend = str(getattr(config, "ddp_backend", "nccl") or "nccl")
             if dist is not None and (not dist.is_initialized()):
                 dist.init_process_group(backend=backend, init_method="env://", rank=rank, world_size=world_size)
-            # expose for later logic (saving/batch scaling)
             config.distributed_rank = int(rank)
             config.distributed_local_rank = int(local_rank)
             config.distributed_world_size = int(world_size)
         except Exception as e:
             raise RuntimeError(f"Failed to init distributed process group: {e}")
     
-    # Initialize Runner
     runner = r_REGISTRY[config.runner](args=config, logger=logger)
     
-    # Setup schemes and groups
-    # Prefer runner-provided scheme/groups (supports tokenized obs, extra fields, etc.)
     try:
         if hasattr(runner, "_build_scheme") and callable(getattr(runner, "_build_scheme")):
             scheme = runner._build_scheme()
@@ -288,16 +262,11 @@ def setup_experiment(config: SimpleNamespace):
     if groups is None:
         groups = {"agents": config.n_agents}
     
-    # Initialize MAC
     mac = mac_REGISTRY[config.mac](scheme, groups, config)
     
-    # Setup runner
     runner.setup(scheme, groups, None, mac)
     
-    # Initialize learner
     learner = le_REGISTRY[config.learner](mac=mac, scheme=scheme, logger=logger, args=config)
-    # Ensure model components are moved to the intended device.
-    # Some runners/envs place tensors on CUDA when enabled; without this, we can hit CPU/GPU mismatch.
     if use_cuda:
         try:
             learner.cuda()
@@ -305,14 +274,8 @@ def setup_experiment(config: SimpleNamespace):
         except Exception as e:
             logger.warning(f"Failed to move learner to CUDA: {e}")
 
-    # Wrap trainable modules with DDP (must happen AFTER cuda() and AFTER optional load_models()).
-    # Note: BasicMAC has DDP-safe wrappers for non-forward methods (generate_answer/save_models/etc).
     if dist_enabled and use_cuda:
         try:
-            # In several ECON stages we intentionally train only a subset of heads/parameters
-            # (e.g., Stage1/2 stance_head only; Stage3b action_type_head (+ optional z-fusion)),
-            # so "unused parameters" in a given forward/backward is expected.
-            # DDP requires find_unused_parameters=True in that case.
             find_unused = bool(getattr(config, "ddp_find_unused_params", False))
             if not find_unused:
                 if bool(getattr(config, "train_belief_supervised", False)) or bool(getattr(config, "train_action_imitation", False)):
@@ -326,7 +289,6 @@ def setup_experiment(config: SimpleNamespace):
                 except Exception:
                     return False
 
-            # Wrap agent (only if it has trainable params)
             if getattr(mac, "agent", None) is not None and DDP is not None:
                 if _has_trainable_params(mac.agent):
                     mac.agent = DDP(mac.agent, device_ids=[device_num], output_device=device_num, find_unused_parameters=find_unused)
@@ -334,8 +296,6 @@ def setup_experiment(config: SimpleNamespace):
                     if rank == 0:
                         logger.info("[DDP] Skipping DDP wrap for mac.agent: no trainable params (requires_grad=False).")
 
-            # Wrap belief_encoder ONLY if it has trainable params.
-            # In Stage1/2 you freeze BeliefEncoder, so DDP should be skipped to avoid PyTorch error.
             if getattr(mac, "belief_encoder", None) is not None and DDP is not None:
                 if _has_trainable_params(mac.belief_encoder):
                     mac.belief_encoder = DDP(
@@ -348,7 +308,6 @@ def setup_experiment(config: SimpleNamespace):
                     if rank == 0:
                         logger.info("[DDP] Skipping DDP wrap for mac.belief_encoder: frozen in this stage (0 trainable params).")
 
-            # Expose rank/world_size on runner for convenience
             try:
                 runner.distributed_rank = int(rank)
                 runner.distributed_world_size = int(world_size)
@@ -359,7 +318,6 @@ def setup_experiment(config: SimpleNamespace):
         except Exception as e:
             raise RuntimeError(f"Failed to wrap modules with DDP: {e}")
 
-    # Optional: resume/load checkpoint
     load_path = str(getattr(config, "load_model_path", "") or "").strip()
     if load_path:
         try:
@@ -379,19 +337,15 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     
     begin_time = time.time()
     
-    # Training configuration
     t_max = getattr(config, 't_max', 2000000)
     test_interval = getattr(config, 'test_interval', 50000)
     log_interval = getattr(config, 'logging', SimpleNamespace()).log_interval if hasattr(config, 'logging') else 2000
     save_model_interval = getattr(config, 'logging', SimpleNamespace()).save_model_interval if hasattr(config, 'logging') else 10000
     
-    # Early stopping related variables
     last_commitment = None
     last_total_loss = None
     patience_counter = 0
 
-    # ===== Sliding window moving average (for noisy per-episode stats) =====
-    # Default window=200; you can override via config.logging.moving_avg_window
     try:
         _logging_cfg = getattr(config, "logging", SimpleNamespace())
         moving_avg_window = int(getattr(_logging_cfg, "moving_avg_window", 200))
@@ -402,7 +356,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         "loss_total": deque(maxlen=moving_avg_window),
         "belief_sup_acc": deque(maxlen=moving_avg_window),
         "reward_mean": deque(maxlen=moving_avg_window),
-        # supervised diagnostics
         "belief_sup_soft_available_frac": deque(maxlen=moving_avg_window),
         "belief_sup_soft_used_frac": deque(maxlen=moving_avg_window),
         "belief_sup_soft_p1_mean": deque(maxlen=moving_avg_window),
@@ -462,25 +415,21 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             buf = deque(maxlen=moving_avg_window)
             ma_buffers[name] = buf
         v = float(value)
-        # Do NOT let a single NaN/Inf poison the whole moving average curve
         if not np.isfinite(v):
             ma_skipped[name] = int(ma_skipped.get(name, 0)) + 1
             return float(np.mean(buf)) if len(buf) > 0 else float("nan")
         buf.append(v)
         return float(np.mean(buf)) if len(buf) > 0 else v
     
-    # Get early stopping thresholds from configuration
     early_stopping = getattr(config, 'early_stopping', SimpleNamespace())
     commitment_threshold = getattr(early_stopping, 'commitment_threshold', 0.01)
     reward_threshold = getattr(early_stopping, 'reward_threshold', 0.7)
     loss_threshold = getattr(early_stopping, 'loss_threshold', 0.0001)
     patience = getattr(early_stopping, 'patience', 5)
 
-    # Training loop
     episode = 0
     t_env = 0
 
-    # Distributed info (rank0 handles side effects like saving/checkpointing/eval)
     dist_rank = int(getattr(config, "distributed_rank", 0) or 0)
     dist_world = int(getattr(config, "distributed_world_size", 1) or 1)
     is_rank0 = (dist_rank == 0)
@@ -493,26 +442,16 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
         try:
             dist.barrier()
         except Exception as e:
-            # Don't crash training due to barrier issues; still surface a hint on rank0.
             if is_rank0:
                 logger.warning(f"[DDP] barrier failed{(' '+tag) if tag else ''}: {e}")
 
-    # ===== Stage1/2: supervised mini-batch replay (critical for stability) =====
-    # The runner returns an EpisodeBatch with batch_size_run (often 1). If we train on it directly,
-    # supervised learning degenerates into single-sample SGD (effective_count ~= n_agents), which is
-    # extremely unstable and prone to fast collapse for imbalanced labels.
-    #
-    # Here we keep a small replay of recent EpisodeBatch samples (size=train.buffer_size) and,
-    # every train.update_interval episodes, sample train.batch_size of them to form a true mini-batch.
     supervised_mode = bool(getattr(config, "train_belief_supervised", False))
-    # store tuples: (gt_label:int|None, EpisodeBatch)
     supervised_replay = []
     try:
         _train_cfg = getattr(config, "train", SimpleNamespace())
         supervised_batch_size = int(getattr(_train_cfg, "batch_size", 16))
         supervised_buffer_size = int(getattr(_train_cfg, "buffer_size", 128))
         supervised_update_interval = int(getattr(_train_cfg, "update_interval", 1))
-        # optional: enforce at least K samples of label-1 in each supervised batch (if available in replay)
         supervised_min_label1 = int(getattr(_train_cfg, "supervised_min_label1_per_batch", 0))
     except Exception:
         supervised_batch_size = 16
@@ -524,8 +463,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
     supervised_update_interval = max(1, supervised_update_interval)
     supervised_min_label1 = max(0, supervised_min_label1)
 
-    # In DDP: reduce per-rank batch_size so global effective batch stays the same (and per-GPU memory drops).
-    # Example: global batch_size=64, world_size=4 -> per-rank=16.
     try:
         reduce_bs_flag = getattr(config, "ddp_reduce_batch_by_world_size", None)
         reduce_bs = True if reduce_bs_flag is None else bool(reduce_bs_flag)
@@ -555,34 +492,24 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             try:
                 out.data[k] = torch.cat([b.data[k] for b in batches], dim=0)
             except Exception:
-                # keep default zeros for this key if concat fails
                 pass
         return out
 
-    # ===== B: curriculum schedule (optional) =====
-    # config.curriculum example:
-    # curriculum:
-    #   enabled: true
-    #   t_env_steps: [20000, 60000]   # thresholds (env steps) to advance
-    #   n_stages: [7, 10, 13]         # must be len(t_env_steps)+1
     cur = getattr(config, "curriculum", SimpleNamespace())
     cur_enabled = bool(getattr(cur, "enabled", False))
     cur_t_env_steps = list(getattr(cur, "t_env_steps", [])) if cur_enabled else []
     cur_n_stages = list(getattr(cur, "n_stages", [])) if cur_enabled else []
     cur_idx = 0
     if cur_enabled and cur_n_stages:
-        # initialize to the first stage count (should be <= original env_args.n_stages)
         try:
             ns0 = int(cur_n_stages[0])
             runner.set_env_n_stages(ns0)
-            # keep config in sync for logging
             if hasattr(config, "env_args"):
                 config.env_args.n_stages = ns0
         except Exception as e:
             logger.warning(f"Failed to initialize curriculum: {e}")
     
     while t_env < t_max:
-        # curriculum advance
         if cur_enabled and cur_n_stages and cur_t_env_steps and (cur_idx + 1) < len(cur_n_stages):
             try:
                 next_threshold = int(cur_t_env_steps[cur_idx])
@@ -599,22 +526,13 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 except Exception as e:
                     logger.warning(f"Failed to advance curriculum at t_env={t_env}: {e}")
 
-        # Run episode
         episode_batch = runner.run(test_mode=False)
         
-        # Train learner
         if episode_batch is not None:
             if supervised_mode:
-                # IMPORTANT (OOM fix):
-                # EpisodeRunner builds EpisodeBatch tensors on args.device (CUDA in our runs).
-                # If we keep a replay of EpisodeBatch objects on GPU, GPU memory will grow roughly
-                # linearly with replay size until OOM (and DDP duplicates this on each rank).
-                # So we store replay batches on CPU, and move only the sampled mini-batch back to CUDA.
                 try:
                     if hasattr(episode_batch, "to"):
                         episode_batch = episode_batch.to(torch.device("cpu"))
-                        # Optional: pin CPU memory to speed up non_blocking CPU->GPU transfer of sampled mini-batches.
-                        # This improves throughput after moving replay to CPU.
                         try:
                             pin_flag = getattr(config, "supervised_replay_pin_memory", None)
                             pin_replay = True if pin_flag is None else bool(pin_flag)
@@ -624,11 +542,9 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             pass
                 except Exception:
                     pass
-                # Push into supervised replay (also extract gt_action label for stratified sampling)
                 gt_label = None
                 try:
                     gt_t = episode_batch.data.get("gt_action", None)
-                    # gt_action shape: (bs, T, 1); runner batch_size_run is usually 1
                     if isinstance(gt_t, torch.Tensor) and gt_t.numel() > 0:
                         gt_label = int(gt_t.view(-1)[0].item())
                 except Exception:
@@ -637,13 +553,9 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 if len(supervised_replay) > supervised_buffer_size:
                     supervised_replay = supervised_replay[-supervised_buffer_size:]
 
-                # Only train when we have enough and on update_interval
                 if len(supervised_replay) >= supervised_batch_size and (episode % supervised_update_interval == 0):
                     import random
-                    # sample without replacement for a more diverse mini-batch
                     if supervised_min_label1 > 0:
-                        # True "at least K": first ensure K label-1 samples, then fill remaining from the
-                        # *entire remaining pool* (which may include more label-1).
                         n = len(supervised_replay)
                         one_idx = [i for i, (lab, _b) in enumerate(supervised_replay) if lab == 1]
                         k = min(int(supervised_min_label1), len(one_idx), supervised_batch_size)
@@ -656,7 +568,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             if len(pool_idx) >= rem:
                                 picked_idx.update(random.sample(pool_idx, rem))
                             else:
-                                # fallback: if replay is tiny, sample with replacement from all
                                 picked_idx.update(random.choices(list(range(n)), k=rem))
                         picked_list = [supervised_replay[i][1] for i in list(picked_idx)[:supervised_batch_size]]
                         sampled_batches = picked_list
@@ -665,14 +576,12 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         sampled_batches = [b for (_lab, b) in random.sample(supervised_replay, supervised_batch_size)]
                         label1_in_batch = float("nan")
                     mb = _concat_episode_batches(sampled_batches)
-                    # Move sampled mini-batch to the intended training device (per-rank CUDA in DDP).
                     try:
                         if mb is not None and hasattr(mb, "to"):
                             mb = mb.to(device)
                     except Exception:
                         pass
                     train_stats = learner.train(mb, t_env, episode)
-                    # annotate for visibility
                     if isinstance(train_stats, dict):
                         train_stats["supervised_replay_size"] = float(len(supervised_replay))
                         train_stats["supervised_batch_size"] = float(supervised_batch_size)
@@ -688,17 +597,13 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             else:
                 train_stats = learner.train(episode_batch, t_env, episode)
 
-            # === High-signal fixed metrics (core reward + secondary belief loss) ===
-            # These are written to metrics.jsonl and TensorBoard regardless of console verbosity.
             try:
                 if isinstance(train_stats, dict):
-                    # core losses
                     for k in ("loss_total", "loss_belief", "loss_encoder", "loss_mixer"):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
                     if "reward_mean" in train_stats:
                         logger.log_stat("train/reward_mean", float(train_stats["reward_mean"]), t_env)
-                    # Stage4: S3b prior injection diagnostics (if present)
                     for k in (
                         "s3b_bias_alpha",
                         "s3b_bias_logit_mean",
@@ -707,19 +612,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     ):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
-                    # Stage1/2 supervised accuracy (if present)
                     if "belief_sup_acc" in train_stats:
                         logger.log_stat("train/belief_sup_acc", float(train_stats["belief_sup_acc"]), t_env)
-                        # Stage3b-friendly alias (masked supervision)
                         logger.log_stat("train/action_sup_acc_masked", float(train_stats["belief_sup_acc"]), t_env)
-                    # Stage3b masked CE loss alias (same as loss_total in supervised mode)
                     if bool(getattr(config, "train_action_imitation", False)):
-                        # Prefer loss_belief (explicit supervised CE) to avoid confusion across modes.
                         if "loss_belief" in train_stats:
                             logger.log_stat("train/action_sup_loss_masked", float(train_stats["loss_belief"]), t_env)
                         elif "loss_total" in train_stats:
                             logger.log_stat("train/action_sup_loss_masked", float(train_stats["loss_total"]), t_env)
-                        # Sanity: log difference if both exist (should be ~0 in S3b supervised mode)
                         if ("loss_belief" in train_stats) and ("loss_total" in train_stats):
                             try:
                                 logger.log_stat(
@@ -729,7 +629,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                                 )
                             except Exception:
                                 pass
-                    # Stage1/2 supervised diagnostics (if present)
                     for k in (
                         "belief_sup_soft_available_frac",
                         "belief_sup_soft_used_frac",
@@ -759,14 +658,12 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "belief_sup_gt0_frac",
                         "belief_sup_gt1_frac",
                         "belief_sup_gt2_frac",
-                        # per-class recall/precision (helps debug collapse / class-0 missing)
                         "belief_sup_recall0",
                         "belief_sup_recall1",
                         "belief_sup_recall2",
                         "belief_sup_precision0",
                         "belief_sup_precision1",
                         "belief_sup_precision2",
-                        # counts/flags (helps interpret recall/precision; avoids NaN confusion)
                         "belief_sup_gt0_count",
                         "belief_sup_gt1_count",
                         "belief_sup_gt2_count",
@@ -779,7 +676,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         "belief_sup_has_gt0",
                         "belief_sup_has_gt1",
                         "belief_sup_has_gt2",
-                        # Stage3b masked-supervision diagnostics
                         "belief_sup_possible_count",
                         "belief_sup_supervised_count",
                         "belief_sup_coverage",
@@ -787,25 +683,27 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     ):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
-                    # Stage3b: expose coverage/skipped under action_sup namespace too
                     if "belief_sup_coverage" in train_stats:
                         logger.log_stat("train/action_sup_coverage", float(train_stats["belief_sup_coverage"]), t_env)
                     if "belief_sup_skipped_ratio" in train_stats:
                         logger.log_stat("train/action_sup_skipped_ratio", float(train_stats["belief_sup_skipped_ratio"]), t_env)
-                    # Stage4: action distribution diagnostics (works for RL; helps detect collapse / no-exploration)
                     for k in ("action_pred_entropy", "action_pred_mode_frac", "action_chosen_entropy", "action_chosen_mode_frac"):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
+                    for k in ("loss_td_qtot", "td_error_abs_mean", "q_tot_mean", "target_q_tot_mean"):
+                        if k in train_stats:
+                            logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
 
-                    # sliding moving averages (smoothed curves)
                     if "loss_total" in train_stats:
                         ma_loss = _ma_update("loss_total", float(train_stats["loss_total"]))
                         logger.log_stat(f"train/loss_total_ma{moving_avg_window}", ma_loss, t_env)
+                    if "loss_td_qtot" in train_stats:
+                        ma_td = _ma_update("loss_td_qtot", float(train_stats["loss_td_qtot"]))
+                        logger.log_stat(f"train/loss_td_qtot_ma{moving_avg_window}", ma_td, t_env)
                     if "belief_sup_acc" in train_stats:
                         ma_acc = _ma_update("belief_sup_acc", float(train_stats["belief_sup_acc"]))
                         logger.log_stat(f"train/belief_sup_acc_ma{moving_avg_window}", ma_acc, t_env)
                         logger.log_stat(f"train/action_sup_acc_masked_ma{moving_avg_window}", ma_acc, t_env)
-                    # Optional: moving averages for supervised diagnostics (helps when noisy)
                     for k in (
                         "belief_sup_soft_available_frac",
                         "belief_sup_soft_used_frac",
@@ -860,22 +758,18 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     if "reward_mean" in train_stats:
                         ma_r = _ma_update("reward_mean", float(train_stats["reward_mean"]))
                         logger.log_stat(f"train/reward_mean_ma{moving_avg_window}", ma_r, t_env)
-                    # Optional: surface how often we skipped non-finite values for MA (debugging stability)
                     try:
                         if int(ma_skipped.get("loss_total", 0)) > 0:
                             logger.log_stat("train/loss_total_ma_skipped_nonfinite", float(ma_skipped["loss_total"]), t_env)
                     except Exception:
                         pass
 
-                    # z(t)->z(t+1) transition supervision (secondary users belief)
                     if "loss_z_transition" in train_stats:
                         logger.log_stat("train/loss_z_transition", float(train_stats["loss_z_transition"]), t_env)
-                    # Stage3a diagnostics: ||z_pred - z_t|| and ||z_target - z_t||
                     if "z_pred_minus_z_t_l2" in train_stats:
                         logger.log_stat("train/z_pred_minus_z_t_l2", float(train_stats["z_pred_minus_z_t_l2"]), t_env)
                     if "z_target_minus_z_t_l2" in train_stats:
                         logger.log_stat("train/z_target_minus_z_t_l2", float(train_stats["z_target_minus_z_t_l2"]), t_env)
-                    # Stage3a diagnostics: distribution + per-stage buckets + head norms
                     for k in (
                         "z_pred_entropy",
                         "z_pred_maxprob",
@@ -887,7 +781,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     ):
                         if k in train_stats:
                             logger.log_stat(f"train/{k}", float(train_stats[k]), t_env)
-                    # per-stage buckets (avoid hardcoding stage count; just scan keys)
                     for k, v in train_stats.items():
                         if not isinstance(k, str):
                             continue
@@ -896,18 +789,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             except Exception as e:
                 logger.warning(f"Failed to log fixed train metrics: {e}")
             
-            # Log training statistics (rank0 only in DDP to avoid duplicated console spam)
             if is_rank0 and (episode % log_interval == 0):
                 logger.info(f"Episode {episode}, t_env: {t_env}")
                 for key, value in train_stats.items():
                     logger.info(f"  {key}: {value}")
                 
-                # Log to wandb if enabled
                 if hasattr(config, 'wandb') and config.wandb.use_wandb:
                     log_to_wandb(train_stats, episode, 'train/')
             
-            # Save model periodically
-            # DDP NOTE: save is rank0-only, but we still sync ranks so others don't race ahead into collectives.
             if episode % save_model_interval == 0 and episode > 0:
                 _ddp_barrier("pre-save")
                 if is_rank0:
@@ -917,22 +806,14 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     logger.info(f"Model saved at episode {episode}")
                 _ddp_barrier("post-save")
             
-            # Test periodically
-            # CRITICAL DDP NOTE:
-            # - DDP will run collectives (e.g., broadcast_buffers) during forward.
-            # - If different ranks execute a different number of forwards (e.g., sharded eval),
-            #   the collective sequence diverges and NCCL will timeout.
-            # Therefore in DDP we run eval on ALL ranks with the SAME number of episodes,
-            # then aggregate metrics via all_reduce (all ranks must participate in the all_reduce).
             if episode % test_interval == 0 and episode > 0:
                 _ddp_barrier("pre-test")
                 test_stats = None
                 try:
                     if dist_enabled:
-                        test_stats = run_test(runner, logger, config)
+                        test_stats = run_test(runner, learner, logger, config)
                         _ddp_barrier("pre-test-allreduce")
 
-                        # Aggregate selected numeric metrics across ranks (ALL ranks must call all_reduce).
                         def _allreduce_mean(key: str, weight_key: str) -> float:
                             v = float(test_stats.get(key, 0.0))
                             w = float(test_stats.get(weight_key, 0.0))
@@ -950,16 +831,20 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             dist.all_reduce(t, op=dist.ReduceOp.SUM)
                             return float(t[0].item())
 
-                        # overwrite with global aggregates (on all ranks; only rank0 will print/log)
                         test_stats["test_return_mean"] = _allreduce_mean("test_return_mean", "test_episodes")
                         test_stats["core_action_type_acc"] = _allreduce_mean("core_action_type_acc", "test_episodes")
                         test_stats["core_stance_acc"] = _allreduce_mean("core_stance_acc", "test_episodes")
                         test_stats["core_text_sim"] = _allreduce_mean("core_text_sim", "test_episodes")
                         test_stats["secondary_z_kl"] = _allreduce_mean("secondary_z_kl", "secondary_z_eval_steps")
+                        test_stats["test_loss_td_qtot"] = _allreduce_mean("test_loss_td_qtot", "test_td_steps")
+                        test_stats["test_td_error_abs_mean"] = _allreduce_mean("test_td_error_abs_mean", "test_td_steps")
+                        test_stats["test_q_tot_mean"] = _allreduce_mean("test_q_tot_mean", "test_td_steps")
+                        test_stats["test_target_q_tot_mean"] = _allreduce_mean("test_target_q_tot_mean", "test_td_steps")
+                        test_stats["test_td_steps"] = float(_allreduce_sum("test_td_steps"))
                         test_stats["test_episodes"] = int(_allreduce_sum("test_episodes"))
                     else:
                         if is_rank0:
-                            test_stats = run_test(runner, logger, config)
+                            test_stats = run_test(runner, learner, logger, config)
                 except Exception as e:
                     if is_rank0:
                         logger.warning(f"Test failed at episode {episode}: {e}")
@@ -969,11 +854,9 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                     for key, value in test_stats.items():
                         logger.info(f"  {key}: {value}")
 
-                    # Log to wandb if enabled
                     if hasattr(config, 'wandb') and config.wandb.use_wandb:
                         log_to_wandb(test_stats, episode, 'test/')
 
-                    # Also write the key test metrics to TensorBoard/metrics.jsonl
                     try:
                         for k in (
                             "test_return_mean",
@@ -981,7 +864,11 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             "core_stance_acc",
                             "core_text_sim",
                             "secondary_z_kl",
-                            # Stage3a encoder-only eval keys
+                            "test_loss_td_qtot",
+                            "test_td_error_abs_mean",
+                            "test_q_tot_mean",
+                            "test_target_q_tot_mean",
+                            "test_td_steps",
                             "test_loss_z_transition",
                             "test_kl_target_zt",
                             "test_kl_target_zpred",
@@ -995,19 +882,16 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                             "test_kl_target_zpred_nostage",
                             "test_kl_target_zpred_nogr",
                             "secondary_z_eval_steps",
-                            # Stage3b masked eval (HF datasets)
                             "hf_eval_acc_masked",
                             "hf_eval_total_masked",
                             "hf_eval_skipped_unsup",
                             "hf_eval_coverage",
                             "hf_eval_skipped_ratio",
-                            # Stage3b collapse / marginal sanity (K=5 action imitation)
                             "action_pred_entropy",
                             "action_pred_mode_frac",
                             "action_pred_kl_gt",
                             "action_unsup_pred_frac",
                             "action_unsup_gt_frac",
-                            # per-class stance metrics on eval split
                             "stance_gt0_frac",
                             "stance_gt1_frac",
                             "stance_gt2_frac",
@@ -1038,7 +922,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                         ):
                             if k in test_stats:
                                 logger.log_stat(f"test/{k}", float(test_stats[k]), t_env)
-                        # Also log per-action marginals if present (Stage3b K=5)
                         try:
                             for k, v in test_stats.items():
                                 if not isinstance(k, str):
@@ -1048,7 +931,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                                         logger.log_stat(f"test/{k}", float(v), t_env)
                         except Exception:
                             pass
-                        # Stage3a per-stage buckets (dynamic keys)
                         try:
                             for k, v in test_stats.items():
                                 if not isinstance(k, str):
@@ -1062,7 +944,6 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
                 _ddp_barrier("post-test")
         
         episode += 1
-        # For multi-step environments, count the actual number of env steps executed
         try:
             steps = int(getattr(runner, "t", 1))
             if steps <= 0:
@@ -1071,13 +952,11 @@ def run_training(config: SimpleNamespace, runner, learner, logger, device):
             steps = int(getattr(config, "episode_length", 1))
         t_env += steps
     
-    # Final save
     final_dir = str(getattr(config, "final_save_dir", "") or "").strip()
     if final_dir:
         save_path = Path(final_dir)
     else:
         save_path = Path(config.logging.checkpoint_path) / "final"
-    # Final save (rank0 only in DDP)
     if is_rank0:
         save_path.mkdir(parents=True, exist_ok=True)
         learner.save_models(str(save_path))
@@ -1108,9 +987,8 @@ def _safe_kl(p: np.ndarray, q: np.ndarray, eps: float = 1e-8) -> float:
     return float(np.sum(p * (np.log(p + eps) - np.log(q + eps))))
 
 
-def run_test(runner, logger, config: SimpleNamespace):
+def run_test(runner, learner, logger, config: SimpleNamespace):
     """Run test episodes (task-specific evaluation for social-media simulation)."""
-    # In DDP, multiple ranks may run eval in parallel. Avoid duplicated console spam from non-rank0.
     try:
         _rank = int(getattr(config, "distributed_rank", 0) or 0)
     except Exception:
@@ -1122,14 +1000,10 @@ def run_test(runner, logger, config: SimpleNamespace):
     test_episodes = int(getattr(config, "test_nepisode", 10))
     test_episodes = max(1, test_episodes)
 
-    # Optional: evaluate on a different dataset split than training (useful for HF dataset env).
-    # Example in YAML:
-    #   eval_dataset_split: "test"
     eval_split = str(getattr(config, "eval_dataset_split", "") or "").strip() or None
     eval_runner = runner
     if eval_split and hasattr(config, "env") and str(getattr(config, "env", "")).strip() == "huggingface_dataset_env":
         try:
-            # cache per-split runner to avoid reloading dataset every eval
             cache = getattr(runner, "_eval_runner_cache", None)
             if cache is None:
                 cache = {}
@@ -1140,17 +1014,13 @@ def run_test(runner, logger, config: SimpleNamespace):
                 cfg_eval = copy.deepcopy(config)
                 if hasattr(cfg_eval, "env_args") and hasattr(cfg_eval.env_args, "dataset_split"):
                     cfg_eval.env_args.dataset_split = eval_split
-                # Optional: control evaluation sampling behavior independently from training.
-                # This helps reduce eval noise on imbalanced splits.
                 try:
                     eval_use_rs = getattr(cfg_eval, "eval_use_random_sampling", None)
                     if eval_use_rs is not None and hasattr(cfg_eval, "env_args"):
                         cfg_eval.env_args.use_random_sampling = bool(eval_use_rs)
                 except Exception:
                     pass
-                # Build a new runner/env for evaluation, but reuse the same MAC (model weights)
                 eval_runner = r_REGISTRY[cfg_eval.runner](cfg_eval, logger)
-                # reuse same scheme/groups/mac
                 eval_runner.setup(getattr(runner, "scheme", None), getattr(runner, "groups", None), getattr(runner, "preprocess", None), getattr(runner, "mac", None))
                 cache[eval_split] = eval_runner
             if _is_rank0:
@@ -1159,18 +1029,12 @@ def run_test(runner, logger, config: SimpleNamespace):
             logger.warning(f"Failed to create eval runner for split='{eval_split}', fallback to training runner: {e}")
             eval_runner = runner
 
-    # ==========================
-    # Stage3a encoder-only eval
-    # ==========================
-    # For z_transition dataset env, env_info doesn't naturally include z_pred.
-    # We therefore compute metrics directly from EpisodeBatch + MAC/BeliefEncoder.
     try:
         if bool(getattr(config, "train_encoder_only", False)) and float(getattr(config, "z_transition_loss_weight", 0.0) or 0.0) > 0:
             import torch
             import torch.nn.functional as F
 
             test_episodes_eff = test_episodes
-            # weighted sums (by mask count) for stable aggregation
             sum_loss = 0.0
             sum_kl_tgt_zt = 0.0
             sum_kl_tgt_zp = 0.0
@@ -1183,22 +1047,18 @@ def run_test(runner, logger, config: SimpleNamespace):
             sum_dz_tgt = 0.0
             sum_mask = 0.0
 
-            # per-stage buckets
             stage_sum_dz_pred: Dict[int, float] = {}
             stage_sum_dz_tgt: Dict[int, float] = {}
             stage_sum_mask: Dict[int, float] = {}
 
-            # ablations
             sum_kl_tgt_zp_nostage = 0.0
             sum_kl_tgt_zp_nogr = 0.0
 
-            # helpers
             def _renorm(p: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
                 p = torch.clamp(p, min=0.0)
                 return p / torch.clamp(p.sum(dim=-1, keepdim=True), min=eps)
 
             def _kl_tgt_pred(tgt: torch.Tensor, pred: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-                # returns (N,)
                 t = _renorm(tgt, eps=eps)
                 q = _renorm(pred, eps=eps)
                 return torch.sum(t * (torch.log(t + eps) - torch.log(q + eps)), dim=-1)
@@ -1214,14 +1074,12 @@ def run_test(runner, logger, config: SimpleNamespace):
                     logger.warning("Stage3a eval: BeliefEncoder missing; skipping encoder-only eval.")
                     break
 
-                # tensors: (bs, seq, K)
                 z_t = episode_batch["z_t"][:, :-1]
                 z_target = episode_batch["z_target"][:, :-1]
                 z_mask = episode_batch["z_mask"][:, :-1]  # (bs, seq, 1)
                 stage_t = episode_batch["stage_t"][:, :-1] if "stage_t" in episode_batch.scheme else None  # (bs, seq, 1)
                 gr = episode_batch["group_representation"][:, :-1] if "group_representation" in episode_batch.scheme else None
 
-                # flatten
                 bs0, sl0, k0 = z_t.shape
                 N = bs0 * sl0
                 zt_f = z_t.reshape(N, k0).to(getattr(config, "device", None) or torch.device("cpu"))
@@ -1234,7 +1092,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                 gr_f = gr.reshape(N, -1).to(zt_f.device) if gr is not None else None
                 st_f = stage_t.reshape(N, -1).to(zt_f.device) if stage_t is not None else None
 
-                # forward
                 with torch.no_grad():
                     lt = str(getattr(config, "z_transition_loss_type", "kl") or "kl").strip().lower()
                     if lt.startswith("dirichlet"):
@@ -1244,7 +1101,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                             raise RuntimeError("Stage3a eval: dirichlet requested but BeliefEncoder lacks compute_population_belief_loss_dirichlet_kl().")
                         alpha_pred = be.predict_next_population_belief_alpha(zt_f, group_repr=gr_f, stage_t=st_f)
                         zpred_f = be.population_belief_mean_from_alpha(alpha_pred)
-                        # Prefer per-sample inferred alpha0_target if present in batch (EpisodeRunner passthrough)
                         a0_tgt = None
                         try:
                             if "z_alpha0_target" in episode_batch.scheme:
@@ -1259,7 +1115,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                         )
                     else:
                         zpred_f = be.predict_next_population_belief(zt_f, group_repr=gr_f, stage_t=st_f, return_logits=False)
-                        # loss
                         loss = be.compute_population_belief_loss(
                             zpred_f,
                             ztar_f,
@@ -1267,27 +1122,22 @@ def run_test(runner, logger, config: SimpleNamespace):
                             loss_type=lt,
                         )
 
-                    # KL baseline vs model
                     kl_tgt_zt = _kl_tgt_pred(ztar_f, zt_f)
                     kl_tgt_zp = _kl_tgt_pred(ztar_f, zpred_f)
 
-                    # deltas
                     dz_pred = torch.norm((zpred_f - zt_f), p=2, dim=-1)
                     dz_tgt = torch.norm((ztar_f - zt_f), p=2, dim=-1)
 
-                    # dist stats
                     if int(zpred_f.shape[-1]) == 3:
                         zp = _renorm(zpred_f)
                         ent = -torch.sum(zp * torch.log(zp + 1e-8), dim=-1)
                         mx = torch.max(zp, dim=-1)[0]
-                        # masked weighted sums
                         sum_pred_ent += float((ent * zm_f).sum().item())
                         sum_pred_max += float((mx * zm_f).sum().item())
                         sum_p0 += float((zp[:, 0] * zm_f).sum().item())
                         sum_p1 += float((zp[:, 1] * zm_f).sum().item())
                         sum_p2 += float((zp[:, 2] * zm_f).sum().item())
 
-                    # aggregate masked sums
                     sum_loss += float(loss.item()) * denom
                     sum_kl_tgt_zt += float((kl_tgt_zt * zm_f).sum().item())
                     sum_kl_tgt_zp += float((kl_tgt_zp * zm_f).sum().item())
@@ -1295,7 +1145,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                     sum_dz_tgt += float((dz_tgt * zm_f).sum().item())
                     sum_mask += denom
 
-                    # stage buckets
                     if st_f is not None:
                         st1 = st_f.reshape(-1).to(dtype=torch.long)
                         for s in torch.unique(st1).tolist():
@@ -1314,7 +1163,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                             stage_sum_dz_pred[si] = float(stage_sum_dz_pred.get(si, 0.0) + float((dz_pred[sel] * m_s).sum().item()))
                             stage_sum_dz_tgt[si] = float(stage_sum_dz_tgt.get(si, 0.0) + float((dz_tgt[sel] * m_s).sum().item()))
 
-                    # stage ablation (strongly suggested): set all stage to 0
                     try:
                         if st_f is not None:
                             st0 = torch.zeros_like(st_f)
@@ -1324,7 +1172,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                     except Exception:
                         pass
 
-                    # group_repr sensitivity: zero-out group_repr
                     try:
                         if gr_f is not None:
                             gr0 = torch.zeros_like(gr_f)
@@ -1348,13 +1195,11 @@ def run_test(runner, logger, config: SimpleNamespace):
             out["test_z_pred_p0_mean"] = float(sum_p0 / sum_mask) if sum_p0 > 0 else 0.0
             out["test_z_pred_p1_mean"] = float(sum_p1 / sum_mask) if sum_p1 > 0 else 0.0
             out["test_z_pred_p2_mean"] = float(sum_p2 / sum_mask) if sum_p2 > 0 else 0.0
-            # ablations
             if sum_kl_tgt_zp_nostage > 0:
                 out["test_kl_target_zpred_nostage"] = float(sum_kl_tgt_zp_nostage / sum_mask)
             if sum_kl_tgt_zp_nogr > 0:
                 out["test_kl_target_zpred_nogr"] = float(sum_kl_tgt_zp_nogr / sum_mask)
 
-            # per-stage buckets (mean)
             for s, m in stage_sum_mask.items():
                 if m <= 0:
                     continue
@@ -1368,24 +1213,54 @@ def run_test(runner, logger, config: SimpleNamespace):
         logger.warning(f"Stage3a encoder-only eval failed; falling back to legacy run_test: {e}")
 
     returns: List[float] = []
-    # core-user metrics
     core_action_type_acc: List[float] = []
     core_stance_acc: List[float] = []
     core_text_sim: List[float] = []
     core_valid_steps: List[int] = []
-    # secondary-user belief metrics
     z_kl_list: List[float] = []
     z_eval_steps: int = 0
 
-    # HF dataset eval (per-class stats on eval split).
-    # - Stage1/2 stance classification: K=3
-    # - Stage3b action imitation: K=5
+    td_loss_sum = 0.0
+    td_abs_sum = 0.0
+    q_tot_sum = 0.0
+    tgt_q_tot_sum = 0.0
+    td_steps_sum = 0.0
+
+    def _maybe_eval_td(ep_batch) -> None:
+        nonlocal td_loss_sum, td_abs_sum, q_tot_sum, tgt_q_tot_sum, td_steps_sum
+        try:
+            if bool(getattr(config, "train_belief_supervised", False)):
+                return
+            if bool(getattr(config, "train_encoder_only", False)):
+                return
+            if learner is None or (not hasattr(learner, "eval_td_metrics")):
+                return
+            out_td = learner.eval_td_metrics(ep_batch)
+            if not isinstance(out_td, dict):
+                return
+            w = float(out_td.get("test_td_steps", 0.0) or 0.0)
+            if (w <= 0.0) or (not np.isfinite(w)):
+                return
+            v_loss = float(out_td.get("test_loss_td_qtot", float("nan")))
+            v_abs = float(out_td.get("test_td_error_abs_mean", float("nan")))
+            v_q = float(out_td.get("test_q_tot_mean", float("nan")))
+            v_tq = float(out_td.get("test_target_q_tot_mean", float("nan")))
+            if np.isfinite(v_loss):
+                td_loss_sum += v_loss * w
+            if np.isfinite(v_abs):
+                td_abs_sum += v_abs * w
+            if np.isfinite(v_q):
+                q_tot_sum += v_q * w
+            if np.isfinite(v_tq):
+                tgt_q_tot_sum += v_tq * w
+            td_steps_sum += w
+        except Exception:
+            return
+
     try:
         hf_k = int(getattr(getattr(config, "env_args", SimpleNamespace()), "n_actions", getattr(config, "n_actions", 3)))
     except Exception:
         hf_k = 3
-    # Stage3b option: binary(0/1) imitation prior.
-    # Keep model/env head as K=5 for Stage4, but report eval metrics with K=2 since we only care about labels {0,1}.
     try:
         if bool(getattr(config, "train_action_imitation", False)) and bool(getattr(config, "action_imitation_binary_01", False)):
             hf_k = 2
@@ -1420,7 +1295,6 @@ def run_test(runner, logger, config: SimpleNamespace):
         except Exception:
             return None
 
-    # Aggregate masked-eval counters across ALL test episodes (stable + interpretable).
     hf_eval_total_all = 0
     hf_eval_correct_all = 0
     hf_eval_skipped_unsup_all = 0
@@ -1428,20 +1302,15 @@ def run_test(runner, logger, config: SimpleNamespace):
     for _ in range(test_episodes):
         episode_batch = eval_runner.run(test_mode=True)
         if episode_batch is not None:
-            # === return ===
             episode_return = float(episode_batch["reward"].sum().item())
             returns.append(episode_return)
+            _maybe_eval_td(episode_batch)
 
-            # === task-specific evaluation from env infos ===
             env_infos = getattr(eval_runner, "last_env_infos", None)
             if not isinstance(env_infos, list) or not env_infos:
                 continue
 
-            # Decide evaluation schema:
-            # - Legacy social-sim envs may emit gt_t/gt_available/reward_action_type/reward_text.
-            # - HuggingFaceDatasetEnv emits is_correct/reward_ts/reward_al/reward_cc (+ optional z_*).
             use_legacy_schema = False
-            # Optional: Stage3b adjustment — only count post/retweet as supervised labels during evaluation.
             sup_ids = None
             try:
                 if (not use_legacy_schema) and bool(getattr(config, "train_action_imitation", False)):
@@ -1451,7 +1320,6 @@ def run_test(runner, logger, config: SimpleNamespace):
             except Exception:
                 sup_ids = None
 
-            # Per-episode counters (will be accumulated into *_all)
             hf_eval_total = 0
             hf_eval_correct = 0
             hf_eval_skipped_unsup = 0
@@ -1463,16 +1331,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                     use_legacy_schema = True
                     break
 
-            # core: use per-step signals that env already provides
-            # - reward_action_type: 1/0
-            # - reward_ts: stance match 1/0
-            # - reward_text: similarity 0..1
-            #
-            # IMPORTANT:
-            # - Some envs (e.g., hisim_social_env) do NOT provide gt_t/gt_available, but still provide
-            #   reward_action_type/reward_ts/reward_text and z_* signals. We should still evaluate.
-            # - Also, secondary z-eval should NOT be gated by gt_t. Previously a `continue` in the
-            #   legacy branch accidentally skipped z_* metrics entirely, producing all-0 test stats.
             valid = 0
             sum_at = 0.0
             sum_st = 0.0
@@ -1482,8 +1340,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                 if not isinstance(info, dict):
                     continue
 
-                # secondary: stage boundary evaluation (z_mask == 1)
-                # Evaluate z alignment regardless of core supervision gating.
                 try:
                     z_mask = float(info.get("z_mask", 0.0))
                 except Exception:
@@ -1493,31 +1349,26 @@ def run_test(runner, logger, config: SimpleNamespace):
                         z_eval_steps += 1
                         z_kl_list.append(_safe_kl(np.array(info["z_target"]), np.array(info["z_pred"])))
                     except Exception:
-                        # best-effort; don't crash eval due to a single bad sample
                         pass
 
                 if use_legacy_schema:
                     try:
-                        # Some envs don't emit gt_t; fall back to stage index `t` if present.
                         _gt_t = info.get("gt_t", None)
                         if _gt_t is None:
                             _gt_t = info.get("t", -1)
                         gt_t = int(_gt_t)
                     except Exception:
                         gt_t = -1
-                    # A: only evaluate steps with usable supervision
                     try:
                         gt_av = int(info.get("gt_available", 1))
                     except Exception:
                         gt_av = 1
                     try:
-                        # Use runtime env n_stages if available (curriculum may change it)
                         n_stages = int(getattr(getattr(runner, "env", None), "n_stages", getattr(getattr(config, "env_args", SimpleNamespace()), "n_stages", 13)))
                     except Exception:
                         n_stages = 13
                     if gt_av <= 0:
                         continue
-                    # If gt_t is missing/invalid, skip ONLY core metrics, not secondary z-metrics.
                     if gt_t < 0 or gt_t >= n_stages:
                         continue
 
@@ -1526,8 +1377,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                     sum_st += float(info.get("reward_ts", 0.0))
                     sum_txt += float(info.get("reward_text", 0.0))
                 else:
-                    # HuggingFaceDatasetEnv schema: treat each step as valid.
-                    # If sup_ids is set, only evaluate those labels; others are treated as latent (skipped).
                     gt = _parse_boxed_int(info.get("ground_truth_answer", ""))
                     if gt is None:
                         gt = _parse_boxed_int(info.get("ground_truth", ""))
@@ -1536,18 +1385,14 @@ def run_test(runner, logger, config: SimpleNamespace):
                         continue
 
                     valid += 1
-                    # IMPORTANT: For HF datasets, evaluate boxed-id accuracy, not just "is boxed".
                     pr = _parse_boxed_int(info.get("llm_answer", ""))
                     sum_at += 1.0 if (gt is not None and pr is not None and int(gt) == int(pr)) else 0.0
-                    # keep legacy "stance" slot as is_correct (HF env sets is_correct based on boxed-id equality)
                     sum_st += 1.0 if bool(info.get("is_correct", False)) else 0.0
-                    # no explicit reward_text; use reward_al as a proxy (often 0 when al_weight=0)
                     try:
                         sum_txt += float(info.get("reward_al", 0.0))
                     except Exception:
                         sum_txt += 0.0
 
-                    # Also compute per-class stats on eval split (boxed ids)
                     try:
                         if gt is not None and 0 <= int(gt) < hf_k:
                             hf_gt_counts[int(gt)] += 1
@@ -1558,7 +1403,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                     except Exception:
                         pass
 
-                    # additional masked-eval stats for Stage3b
                 try:
                         if gt is not None:
                             hf_eval_total += 1
@@ -1572,7 +1416,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                 core_action_type_acc.append(sum_at / valid)
                 core_stance_acc.append(sum_st / valid)
                 core_text_sim.append(sum_txt / valid)
-            # accumulate masked-eval counters across episodes
             try:
                 hf_eval_total_all += int(hf_eval_total)
                 hf_eval_correct_all += int(hf_eval_correct)
@@ -1580,9 +1423,7 @@ def run_test(runner, logger, config: SimpleNamespace):
             except Exception:
                 pass
     
-    # Calculate averages
     avg_return = float(np.mean(returns)) if returns else 0.0
-    # Keep legacy "success" definition, but based on return.
     success_rate = float(np.mean([1.0 if r > 0 else 0.0 for r in returns])) if returns else 0.0
 
     core_at = float(np.mean(core_action_type_acc)) if core_action_type_acc else 0.0
@@ -1592,7 +1433,6 @@ def run_test(runner, logger, config: SimpleNamespace):
 
     z_kl = float(np.mean(z_kl_list)) if z_kl_list else 0.0
     
-    # Per-class HF metrics on eval split (best-effort)
     hf_total_gt = float(sum(hf_gt_counts))
     hf_total_pred = float(sum(hf_pred_counts))
     hf_gt_frac = [float(c) / hf_total_gt if hf_total_gt > 0 else float("nan") for c in hf_gt_counts]
@@ -1612,18 +1452,29 @@ def run_test(runner, logger, config: SimpleNamespace):
         "test_return_mean": avg_return,
         "test_success_rate": success_rate,
         "test_episodes": len(returns),
-        # Note: string metadata is printed in console logs; TB only logs numeric stats
         "eval_dataset_split": eval_split or str(getattr(getattr(config, "env_args", SimpleNamespace()), "dataset_split", "train")),
-        # core user evaluation (next-step prediction)
         "core_action_type_acc": core_at,
         "core_stance_acc": core_st,
         "core_text_sim": core_txt,
         "core_eval_steps_mean": avg_core_steps,
-        # secondary belief evaluation
         "secondary_z_kl": z_kl,
         "secondary_z_eval_steps": int(z_eval_steps),
     }
-    # Stage3b masked-eval helpers (only meaningful for HF schema + action_imitation_supervised_action_ids)
+    try:
+        if td_steps_sum > 0 and np.isfinite(td_steps_sum):
+            out["test_loss_td_qtot"] = float(td_loss_sum / td_steps_sum)
+            out["test_td_error_abs_mean"] = float(td_abs_sum / td_steps_sum)
+            out["test_q_tot_mean"] = float(q_tot_sum / td_steps_sum)
+            out["test_target_q_tot_mean"] = float(tgt_q_tot_sum / td_steps_sum)
+            out["test_td_steps"] = float(td_steps_sum)
+        else:
+            out["test_loss_td_qtot"] = float("nan")
+            out["test_td_error_abs_mean"] = float("nan")
+            out["test_q_tot_mean"] = float("nan")
+            out["test_target_q_tot_mean"] = float("nan")
+            out["test_td_steps"] = 0.0
+    except Exception:
+        pass
     try:
         if hf_eval_total_all > 0:
             out["hf_eval_acc_masked"] = float(hf_eval_correct_all / max(1, hf_eval_total_all))
@@ -1634,9 +1485,6 @@ def run_test(runner, logger, config: SimpleNamespace):
         out["hf_eval_skipped_ratio"] = float(hf_eval_skipped_unsup_all / denom) if denom > 0 else 0.0
     except Exception:
         pass
-    # Per-class keys:
-    # - K=3: keep backward-compatible stance_* keys (Stage1/2).
-    # - K!=3: emit action_* keys (Stage3b action imitation).
     if hf_k == 3:
         out.update(
             {
@@ -1681,12 +1529,10 @@ def run_test(runner, logger, config: SimpleNamespace):
             out[f"action_has_gt{i}"] = float(hf_has_gt[i]) if i < len(hf_has_gt) else 0.0
             out[f"action_has_pred{i}"] = float(hf_has_pred[i]) if i < len(hf_has_pred) else 0.0
 
-        # === Stage3b sanity metrics: detect collapse on UNSUP actions (when partial supervision is enabled) ===
         try:
             import math
 
             eps = 1e-8
-            # entropy of predicted marginal distribution over actions
             p = [float(x) for x in hf_pred_frac]
             if all((x == x) for x in p) and len(p) > 0:
                 pp = [max(eps, x) for x in p]
@@ -1695,7 +1541,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                 out["action_pred_entropy"] = float(-sum(x * math.log(x + eps) for x in pp))
                 out["action_pred_mode_frac"] = float(max(pp))
 
-            # compare pred marginal to gt marginal (KL)
             q = [float(x) for x in hf_gt_frac]
             if all((x == x) for x in p) and all((x == x) for x in q) and len(p) == len(q) and len(p) > 0:
                 pp = [max(eps, x) for x in p]
@@ -1706,7 +1551,6 @@ def run_test(runner, logger, config: SimpleNamespace):
                 qq = [x / sq for x in qq]
                 out["action_pred_kl_gt"] = float(sum(pp[i] * (math.log(pp[i] + eps) - math.log(qq[i] + eps)) for i in range(len(pp))))
 
-            # unsupervised mass (only meaningful when action_imitation_supervised_action_ids is set)
             sup_ids_cfg = None
             try:
                 only_ids = getattr(config, "action_imitation_supervised_action_ids", None)
@@ -1754,22 +1598,16 @@ def log_to_wandb(data: Dict, step: int, prefix: str = ''):
 def main():
     """Main training function"""
     try:
-        # Parse arguments
         args = parse_args()
         
-        # Load configuration
         config = load_config(args.config)
         
-        # Update configuration with command line arguments
         config = update_config_with_args(config, args)
         
-        # Setup experiment
         runner, mac, learner, logger, device = setup_experiment(config)
         
-        # Setup wandb if enabled
         setup_wandb(config, logger)
         
-        # Run training
         run_training(config, runner, learner, logger, device)
         
         logger.info("Training completed successfully!")
@@ -1780,14 +1618,12 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # Clean up distributed process group (if any)
         try:
             if _HAS_DIST and dist is not None and dist.is_initialized():
                 dist.barrier()
                 dist.destroy_process_group()
         except Exception:
             pass
-        # Clean up wandb
         if wandb is not None and wandb.run is not None:
             wandb.finish()
 

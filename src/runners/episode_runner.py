@@ -70,65 +70,47 @@ class EpisodeRunner:
         self.args = args
         self.logger = logger
         
-        # Environment and batch information
         self.env = None
         self.env_info = None
         self.batch = None
         
-        # Training state
         self.t = 0  # Current timestep within episode
         self.t_env = 0  # Total timesteps across all episodes
         self.t_episodes = 0  # 添加episode计数器
         
-        # Testing state
         self.test_returns = []
         self.train_returns = []
         self.last_test_t = 0
         self.last_save_t = 0
         
-        # MAC and processing components
         self.mac = None
         self.batch_handler = None
         
-        # Statistics tracking
         self.train_stats = {}
         self.test_stats = {}
-        # store raw env step infos for the most recent episode (useful for task-specific evaluation)
         self.last_env_infos: List[Dict[str, Any]] = []
 
-        # ===== Debug: forced-vs-parsed alignment (Stage4 social credit assignment) =====
-        # We print ONCE (per process) when debug is enabled, to verify that env-consumed JSON
-        # matches the policy-forced action_type/stance_id.
         self._forced_align_printed = False
         self._forced_align_action_n = 0
         self._forced_align_action_ok = 0
         self._forced_align_stance_n = 0
         self._forced_align_stance_ok = 0
         
-        # Episode management
         self.episode_limit = 1  # Single step per episode for LLM environments
         self.n_agents = args.n_agents
         self.batch_size = self.args.batch_size_run
-        # NOTE:
-        # 当前 runner/env 逻辑是“单环境实例”采样；当 batch_size_run > 1 时，
-        # EpisodeBatch 的 batch 维会被同一条轨迹广播填充（用于形状兼容/调试/并行化前过渡）。
-        # 如果你需要真正的并行采样，需要引入 vectorized env 或多 env 实例。
         if self.batch_size != 1:
             self.logger.warning(
                 f"EpisodeRunner batch_size_run={self.batch_size} (>1). "
                 "Current implementation will broadcast a single env trajectory across batch dimension."
             )
         
-        # Initialize environment using the registry and env_args from config
         self.env = self._init_environment()
         self.env_info = self.env.get_env_info()
         self.episode_limit = self.env_info["episode_limit"]
         self.obs_shape = self.env_info["obs_shape"]
         self.t = 0 # Step within the current episode
         
-        # Initialize batch handling
-        # max_seq_length for EpisodeBatch will be self.episode_limit + 1.
-        # If episode_limit is 1 (one data sample = one step), max_seq_length is 2.
         self.new_batch = self._init_batch_handler()
         self.batch = self.new_batch()
 
@@ -143,14 +125,11 @@ class EpisodeRunner:
         """Initialize and return the environment from the registry."""
         try:
             env_key = self.args.env
-            # Prepare environment arguments including reward configuration
-            # Convert SimpleNamespace to dict
             if hasattr(self.args.env_args, '__dict__'):
                 env_kwargs = vars(self.args.env_args)
             else:
                 env_kwargs = dict(self.args.env_args)
             
-            # Add reward configuration if it exists
             if hasattr(self.args, 'reward'):
                 env_kwargs['reward_config'] = self.args.reward
             
@@ -173,7 +152,6 @@ class EpisodeRunner:
             device=self.args.device
         )
 
-    # ===== B: curriculum support (update n_stages / episode_limit at runtime) =====
     def set_env_n_stages(self, n_stages: int) -> None:
         """
         Update env.n_stages (if supported) and rebuild episode_limit + EpisodeBatch factory.
@@ -188,10 +166,8 @@ class EpisodeRunner:
         if not hasattr(self.env, "n_stages"):
             self.logger.warning("Runner curriculum requested but env has no attribute n_stages.")
             return
-        # update env
         try:
             self.env.n_stages = int(ns)
-            # keep env episode_limit consistent
             if hasattr(self.env, "core_users"):
                 if bool(getattr(self.env, "sync_stage_update", False)):
                     self.env.episode_limit = int(ns)
@@ -201,7 +177,6 @@ class EpisodeRunner:
             self.logger.warning(f"Failed to set env.n_stages={ns}: {e}")
             return
 
-        # refresh env_info / episode_limit and rebuild batch factory
         try:
             self.env_info = self.env.get_env_info()
             self.episode_limit = int(self.env_info.get("episode_limit", self.episode_limit))
@@ -222,10 +197,6 @@ class EpisodeRunner:
             Collected episode data for the processed sample.
         """
         try:
-            # Reset environment and MAC hidden state
-            # For HuggingFaceDatasetEnv, reset() loads the next data sample (e.g., a question)
-            # and sets self.env.current_question and self.env.current_sample.
-            # The observation returned by self.env.reset() is self.env.current_question.
             current_obs, env_step_info = self.env.reset() # env_step_info contains the full sample
             self.reset_runner_state() # Resets self.batch and self.t
             
@@ -243,25 +214,17 @@ class EpisodeRunner:
             _next_obs = current_obs
             self.last_env_infos = []
 
-            # 多步 episode：循环直到 env 返回 terminated 或达到 episode_limit
             while (not terminated) and (self.t < self.episode_limit):
                 pre_transition_data = self._get_pre_transition_data(_next_obs, env_step_info)
                 self.batch.update(pre_transition_data, ts=self.t)
 
-                # Sync-stage social env may return observation as list[str] (per-agent).
-                # Also, in sync-stage mode we typically disable LLM rollout and drive env with discrete policy only.
                 raw_for_mac = _next_obs if isinstance(_next_obs, str) else None
                 discrete_actions, mac_extra_info = self._get_actions(test_mode, raw_observation_text=raw_for_mac)
 
-                # Determine action for env.step()
-                # Default: use coordinator commitment_text (string).
-                # For offline classification-style training (HF dataset with \\boxed{id}),
-                # you can set args.env_action_source="discrete_action_boxed" to use the chosen discrete action.
                 action_source = str(getattr(self.args, "env_action_source", "commitment")).strip().lower()
                 action_for_env_step = ""
                 secondary_z_next_override = None
                 secondary_z_next_source = None
-                # HiSimSocialEnv sync-stage mode: pass list[dict] actions aligned to env.core_users.
                 try:
                     if bool(getattr(self.env, "sync_stage_update", False)):
                         a = discrete_actions
@@ -304,14 +267,6 @@ class EpisodeRunner:
                         action_for_env_step = acts
                         action_source = "sync_stage_policy"
 
-                        # ===== Structured alignment for learned z-update (Stage4) =====
-                        # Goal: make env z-update depend on stage-end aggregate behavior.
-                        # We build a compact post-stage group representation from the policy-chosen
-                        # (action_type, stance_id) across all core users, then ask BeliefEncoder
-                        # Causal semantics (paper §2.1):
-                        # - At stage t, core actions happen and population responds to form z_t.
-                        # - Policy is conditioned on z_{t-1} (pre-stage belief input), and we predict z_t.
-                        # Therefore this call predicts the *current* stage population state from the *previous* one.
                         try:
                             env_name = str(getattr(self.args, "env", "") or "").strip().lower()
                             pbm = str(getattr(getattr(self.args, "env_args", None), "population_z_updater", "") or "").strip().lower()
@@ -319,7 +274,6 @@ class EpisodeRunner:
                             if env_name == "hisim_social_env" and use_sec and pbm in ("noop", "none", "no_op", "no-op"):
                                 be = getattr(self.mac, "belief_encoder_module", None)
                                 if be is not None and hasattr(be, "predict_next_population_belief"):
-                                    # Build nonparam post-stage group repr vector
                                     dim = int(getattr(getattr(self.args, "env_args", None), "group_representation_dim", getattr(self.args, "belief_dim", 128)))
                                     dim = max(8, int(dim))
                                     v = torch.zeros((dim,), dtype=torch.float32, device=self.args.device)
@@ -356,7 +310,6 @@ class EpisodeRunner:
                                     if at_sum > 0:
                                         v[3:8] = at_counts / at_sum
 
-                                    # Fetch z_t / stage_t from current batch (bs-level at current timestep)
                                     z_t = None
                                     st_t = None
                                     try:
@@ -387,19 +340,11 @@ class EpisodeRunner:
                             secondary_z_next_source = None
                 except Exception:
                     pass
-                # If we're in HiSim sync-stage policy mode, we've already constructed a per-agent
-                # list[dict] action aligned to env.core_users. Do NOT override it with commitment/LLM text.
                 if action_source in ("sync_stage_policy",):
                     pass
                 elif action_source in ("discrete_action_boxed", "boxed", "discrete"):
                     try:
-                        # discrete_actions is typically shape (bs, n_agents) or (n_agents,)
                         a = discrete_actions
-                        # Stage3b binary(0/1) prior:
-                        # Even though the agent head is 5-way for Stage4, S3b objective/metrics are binary over {0,1}.
-                        # If we pass a 5-way argmax id (e.g., 2/3/4) into HF env, then binary eval (K=2) will treat
-                        # predictions as out-of-range and you will see action_pred0_count/action_pred1_count both == 0.
-                        # Fix: in binary mode, derive the env action id from the first two logits argmax.
                         s3b_binary_01 = False
                         try:
                             if bool(getattr(self.args, "train_action_imitation", False)):
@@ -410,7 +355,6 @@ class EpisodeRunner:
                         if s3b_binary_01:
                             q = mac_extra_info.get("action_type_q_values")
                             if isinstance(q, torch.Tensor):
-                                # q: (bs, n_agents, 5) or (n_agents, 5)
                                 if q.ndim >= 3:
                                     q0 = q[0, 0, :2]
                                 elif q.ndim == 2:
@@ -418,8 +362,6 @@ class EpisodeRunner:
                                 else:
                                     q0 = None
                                 if isinstance(q0, torch.Tensor) and q0.numel() == 2:
-                                    # Optional: avoid hard argmax collapse for binary(0/1) imitation.
-                                    # Default remains argmax for backward-compatibility.
                                     sel = str(getattr(self.args, "s3b_boxed_action_selection", "argmax") or "argmax").strip().lower()
                                     if sel in ("sample", "sampling", "softmax_sample", "categorical"):
                                         try:
@@ -436,7 +378,6 @@ class EpisodeRunner:
                                         p = torch.softmax(logits, dim=-1).view(-1)
                                         if eps > 0:
                                             p = (1.0 - eps) * p + eps * torch.full_like(p, 0.5)
-                                        # multinomial expects probs sum>0
                                         p = torch.clamp(p, min=1e-12)
                                         p = p / p.sum()
                                         aid = int(torch.multinomial(p, num_samples=1).item())
@@ -448,12 +389,10 @@ class EpisodeRunner:
                                 aid = 0
                         else:
                             if isinstance(a, torch.Tensor):
-                                # take batch 0 if exists
                                 if a.ndim >= 2:
                                     a0 = a[0]
                                 else:
                                     a0 = a
-                                # take agent 0 as the env action (you can change to majority vote later)
                                 aid = int(a0[0].item()) if a0.numel() > 0 else 0
                             else:
                                 aid = int(a)
@@ -461,7 +400,6 @@ class EpisodeRunner:
                         aid = 0
                     action_for_env_step = f"\\boxed{{{aid}}}"
                 elif action_source in ("llm_response_0", "executor0", "executor_0", "response0"):
-                    # Use the first executor response directly (useful for hisim_social_env where env expects JSON action).
                     rs = mac_extra_info.get("llm_responses") or []
                     action_for_env_step = rs[0] if isinstance(rs, list) and len(rs) > 0 else ""
                 else:
@@ -475,7 +413,6 @@ class EpisodeRunner:
                     "agent_log_probs": mac_extra_info.get("agent_log_probs"),
                     "prompt_embeddings": mac_extra_info.get("prompt_embeddings"),
                     "belief_states": mac_extra_info.get("belief_states"),
-                    # optional: secondary user belief for env-side simulation
                     "secondary_z_next": secondary_z_next_override if secondary_z_next_override is not None else mac_extra_info.get("secondary_z_next"),
                     "secondary_z_next_source": secondary_z_next_source,
                     "secondary_action_probs": mac_extra_info.get("secondary_action_probs"),
@@ -484,7 +421,6 @@ class EpisodeRunner:
                 _next_obs, reward_total_float, terminated, _truncated, env_step_info = self.env.step(
                     action_for_env_step, extra_info=step_extra_info
                 )
-                # Attach preference-scorer signals for Stage3b eval (retweet vs post bias)
                 try:
                     if isinstance(env_step_info, dict):
                         q = mac_extra_info.get("action_type_q_values")
@@ -504,11 +440,9 @@ class EpisodeRunner:
                             env_step_info["pref_p1"] = p1
                 except Exception:
                     pass
-                # cache for evaluation
                 if isinstance(env_step_info, dict):
                     self.last_env_infos.append(env_step_info)
 
-                # ---- Debug: forced vs parsed alignment (print once) ----
                 try:
                     dbg = bool(getattr(getattr(self.args, "system", None), "debug", False))
                     env_name = str(getattr(self.args, "env", "") or "").strip().lower()
@@ -543,7 +477,6 @@ class EpisodeRunner:
                             except Exception:
                                 pass
 
-                        # Print once after enough samples (or near episode end).
                         thr = int(getattr(self.args, "forced_align_log_after", 50))
                         thr = max(1, thr)
                         if (self._forced_align_action_n >= thr) or bool(terminated):
@@ -592,13 +525,10 @@ class EpisodeRunner:
                 )
                 self.batch.update(post_data, ts=self.t)
                 self.t += 1
-                # Maintain a true global environment-step counter used by action selection schedules.
-                # Previously this runner never incremented t_env, causing epsilon schedules to stay at start.
                 try:
                     self.t_env += 1
                 except Exception:
                     self.t_env = int(getattr(self, "t_env", 0)) + 1
-                # Best-effort epsilon schedule update (multinomial selector supports epsilon_decay).
                 try:
                     sel = getattr(getattr(self.mac, "action_selector", None), "epsilon_decay", None)
                     if callable(sel):
@@ -620,7 +550,6 @@ class EpisodeRunner:
             
         except StopIteration: # Raised by self.env.reset() if dataset is exhausted
             self.logger.info(f"Dataset exhausted after {self.t_env} samples.")
-            # Potentially return the last partially filled batch or a special signal
             return self.batch # Or None, or raise further to signal completion
         except Exception as e:
             logger.error(f"Error during episode execution: {str(e)}")
@@ -638,7 +567,6 @@ class EpisodeRunner:
 
         if isinstance(current_observation_text, (list, tuple)):
             obs_list = [str(x) for x in list(current_observation_text)]
-            # pad/truncate to n_agents
             if len(obs_list) < self.n_agents:
                 obs_list = obs_list + ["" for _ in range(self.n_agents - len(obs_list))]
             if len(obs_list) > self.n_agents:
@@ -657,14 +585,12 @@ class EpisodeRunner:
             ],
         }
 
-        # ---- Best-effort: parse reset/step info to fill global fields at pre-transition ----
         try:
             info0 = env_reset_or_step_info if isinstance(env_reset_or_step_info, dict) else {}
             sample = info0.get("sample") if isinstance(info0.get("sample", None), dict) else None
             if sample is None:
                 sample = info0 if isinstance(info0, dict) else {}
 
-            # stage index (prefer next-state belief_inputs t when available)
             st = None
             try:
                 bi0 = sample.get("belief_inputs", None)
@@ -687,7 +613,6 @@ class EpisodeRunner:
                 except Exception:
                     pass
 
-            # group_representation (global): prefer next-stage value if provided by env
             gr = sample.get("group_representation_next", None)
             if gr is None:
                 gr = sample.get("group_representation", None)
@@ -704,7 +629,6 @@ class EpisodeRunner:
                 except Exception:
                     pass
 
-            # belief inputs: prefer env-provided belief_inputs; otherwise fall back to sample z_t
             get_bt = getattr(self.env, "get_belief_tensor", None)
             if callable(get_bt):
                 bi = sample.get("belief_inputs", None)
@@ -727,12 +651,6 @@ class EpisodeRunner:
                     if "is_core_user" in bt_pre:
                         pre_data["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
 
-            # === Sanity/diagnostic: z_t ablation modes (for validate script / appendix) ===
-            # This ONLY affects the policy input (EpisodeBatch fields), not the env's internal state update.
-            # Modes:
-            # - none: use original z_t
-            # - zero: replace with zeros (remove z signal)
-            # - shuffle: replace with a previously-seen z_t (sample-level shuffle) to break alignment
             try:
                 mode = str(getattr(self.args, "z_ablation_mode", "none") or "none").strip().lower()
             except Exception:
@@ -746,11 +664,9 @@ class EpisodeRunner:
                         pre_data["z_t"] = torch.zeros_like(z)
                         pre_data["belief_pre_population_z"] = torch.zeros_like(z) if "belief_pre_population_z" in pre_data else pre_data.get("belief_pre_population_z", z)
                     elif mode in ("shuffle", "shuffled"):
-                        # Use a deterministic RNG if provided; otherwise fallback to random.
                         if len(self._z_shuffle_pool) >= 1:
                             try:
                                 seed0 = int(getattr(self.args, "z_shuffle_seed", 0) or 0)
-                                # vary with t_env to avoid constant reuse
                                 rnd = np.random.RandomState(seed0 + int(getattr(self, "t_env", 0)))
                                 j = int(rnd.randint(0, len(self._z_shuffle_pool)))
                             except Exception:
@@ -760,15 +676,12 @@ class EpisodeRunner:
                                 pre_data["z_t"] = z2.to(self.args.device)
                                 if "belief_pre_population_z" in pre_data and isinstance(pre_data["belief_pre_population_z"], torch.Tensor):
                                     pre_data["belief_pre_population_z"] = z2.to(self.args.device)
-                        # push current z after sampling
                         try:
                             self._z_shuffle_pool.append(z.detach().float().cpu().view_as(z))
-                            # cap pool size
                             if len(self._z_shuffle_pool) > 4096:
                                 self._z_shuffle_pool = self._z_shuffle_pool[-2048:]
                         except Exception:
                             pass
-            # --- end z_ablation ---
         except Exception as e:
             self.logger.debug(f"Failed to inject pre-transition conditioning fields: {e}")
 
@@ -776,8 +689,6 @@ class EpisodeRunner:
 
     def _get_actions(self, test_mode: bool, raw_observation_text: Optional[str] = None) -> Tuple[torch.Tensor, Dict]:
         """Get actions and extra info from MAC."""
-        # self.batch here contains the pre_transition_data at self.t (which is 0)
-        # self.mac.select_actions expects the whole batch and current timestep t_ep.
         return self.mac.select_actions(
             self.batch, # Pass the current episode batch (contains tokenized obs at ts=0)
             t_ep=self.t,  # Current step in the episode (0)
@@ -800,23 +711,13 @@ class EpisodeRunner:
                                 ) -> Dict:
         """Get post-transition data."""
         
-        # actions should be a tensor of shape (self.n_agents, expected_action_vshape_in_scheme)
-        # scheme[actions][vshape] is (1,) for discrete actions.
-        # So, actions should be (self.n_agents, 1)
-        # Ensure `actions` (processed_actions from `run`) has this shape.
-        # If `actions` from MAC is (n_agents, ), we might need to .view(-1, 1) if scheme expects (1,)
 
-        # 对于全局奖励，创建标量张量
         final_reward_scalar = torch.tensor([reward_total], dtype=torch.float32, device=self.args.device)  # (1,)
         
-        # 对于per-agent奖励，创建张量
         rewards_al_tensor = torch.tensor(rewards_al, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
         rewards_ts_tensor = torch.tensor(rewards_ts, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
         rewards_cc_tensor = torch.tensor(rewards_cc, dtype=torch.float32, device=self.args.device).view(self.n_agents, 1)
 
-        # discrete_actions_for_agents should be a tensor of shape (self.n_agents, scheme_action_vshape)
-        # If scheme_action_vshape is (1,), then (self.n_agents, 1)
-        # If discrete_actions_for_agents is (self.n_agents, ), then .view(self.n_agents, 1)
         if discrete_actions_for_agents.ndim == 1:
              actions_for_batch = discrete_actions_for_agents.view(self.n_agents, 1)
         else:
@@ -833,8 +734,6 @@ class EpisodeRunner:
             "filled": torch.tensor([1], dtype=torch.long, device=self.args.device)
         }
 
-        # === offline supervised ground-truth label (HF dataset) ===
-        # Prefer HuggingFaceDatasetEnv: env_info["ground_truth_answer"] like "\\boxed{2}"
         try:
             import re
 
@@ -843,7 +742,6 @@ class EpisodeRunner:
                     return None
                 m = re.search(r"\\boxed\{\s*([-+]?\d+)\s*\}", s)
                 if not m:
-                    # tolerate "boxed{2}" without backslash
                     m = re.search(r"boxed\{\s*([-+]?\d+)\s*\}", s)
                 return int(m.group(1)) if m else None
 
@@ -852,7 +750,6 @@ class EpisodeRunner:
                 gt = _parse_boxed_int(env_info.get("ground_truth_answer"))
                 if gt is None:
                     gt = _parse_boxed_int(env_info.get("ground_truth"))
-                # social env style: directly provides gt stance id
                 if gt is None:
                     v = env_info.get("gt_stance_id")
                     if isinstance(v, int):
@@ -862,21 +759,16 @@ class EpisodeRunner:
         except Exception as e:
             self.logger.debug(f"Failed to parse gt_action from env_info: {e}")
 
-        # === optional partial supervision mask (Stage3b) ===
-        # action_mask=1.0 => supervised CE applies; action_mask=0.0 => treat as latent (no CE / no acc)
         try:
             am = None
             if isinstance(env_info, dict):
                 am = env_info.get("action_mask")
             if am is None:
-                # backward-compatible default: fully supervised
                 am = 1.0
             post_data_dict["action_mask"] = torch.tensor([float(am)], dtype=torch.float32, device=self.args.device)
         except Exception:
             post_data_dict["action_mask"] = torch.tensor([1.0], dtype=torch.float32, device=self.args.device)
 
-        # === offline supervised soft label distribution (HF dataset) ===
-        # Prefer env_info["target_distribution_prob"] which is a dict like {"0":0.2,"1":0.1,"2":0.7}
         try:
             if isinstance(env_info, dict) and "target_distribution_prob" in env_info:
                 na = int(self.env_info.get("n_actions", 1))
@@ -901,31 +793,22 @@ class EpisodeRunner:
         except Exception as e:
             self.logger.debug(f"Failed to parse gt_action_dist from env_info: {e}")
 
-        # === belief inputs (explicit, tensorized) ===
-        # env_info may contain: belief_inputs_pre / belief_inputs_post (dict)
         try:
             if isinstance(env_info, dict):
-                # stage index (global)
                 if "t" in env_info:
-                    # vshape=(1,) -> tensor shape (1,), will broadcast to (bs,1) in EpisodeBatch.update
                     post_data_dict["stage_t"] = torch.tensor([int(env_info.get("t", 0))], dtype=torch.int64, device=self.args.device)
 
-                # tensorize via env helper if available
                 get_bt = getattr(self.env, "get_belief_tensor", None)
                 if callable(get_bt):
                     bi_pre = env_info.get("belief_inputs_pre")
                     bt_pre = get_bt(bi_pre, device=self.args.device) if bi_pre is not None else None
                     if isinstance(bt_pre, dict):
-                        # canonical tensors
                         if "population_z" in bt_pre:
-                            # vshape=(population_belief_dim,) -> tensor shape (K,), will broadcast to (bs,K)
                             post_data_dict["belief_pre_population_z"] = bt_pre["population_z"].to(self.args.device)
-                            # for population_update_head training
                             post_data_dict["z_t"] = bt_pre["population_z"].to(self.args.device)
                         if "neighbor_stance_counts" in bt_pre:
                             post_data_dict["belief_pre_neighbor_counts"] = bt_pre["neighbor_stance_counts"].to(self.args.device)
                         if "is_core_user" in bt_pre:
-                            # vshape=(1,) -> tensor shape (1,), will broadcast to (bs,1)
                             post_data_dict["belief_pre_is_core_user"] = bt_pre["is_core_user"].to(self.args.device)
 
                     bi_post = env_info.get("belief_inputs_post")
@@ -940,8 +823,6 @@ class EpisodeRunner:
         except Exception as e:
             self.logger.warning(f"Failed to add belief tensor fields to batch: {e}")
 
-        # === optional latent-z supervision fields (global, from env_info) ===
-        # env_info may contain: z_pred/z_target (len=population_belief_dim), z_mask (float)
         try:
             if isinstance(env_info, dict) and ("z_pred" in env_info or "z_target" in env_info or "z_mask" in env_info):
                 z_pred = env_info.get("z_pred")
@@ -952,7 +833,6 @@ class EpisodeRunner:
                 if isinstance(z_target, list):
                     post_data_dict["z_target"] = torch.tensor(z_target, dtype=torch.float32, device=self.args.device)
                 post_data_dict["z_mask"] = torch.tensor([float(z_mask)], dtype=torch.float32, device=self.args.device)
-                # Optional: Dirichlet alpha0_target (effective pseudo-counts) inferred by HF env
                 try:
                     a0 = env_info.get("z_alpha0_target", None)
                     if a0 is not None:
@@ -962,8 +842,6 @@ class EpisodeRunner:
         except Exception as e:
             self.logger.warning(f"Failed to add z supervision fields to batch: {e}")
 
-        # === optional: structured conditioning fields for z_transition (global, from env_info) ===
-        # These are passthrough fields from HuggingFaceDatasetEnv samples.
         try:
             if isinstance(env_info, dict):
                 if "core_stance_id_t" in env_info:
@@ -989,7 +867,6 @@ class EpisodeRunner:
                 if "neighbor_stance_counts_t" in env_info:
                     v = env_info.get("neighbor_stance_counts_t")
                     if isinstance(v, dict):
-                        # stance order fixed to [Neutral,Oppose,Support] -> [0,1,2]
                         order = ["Neutral", "Oppose", "Support"]
                         arr = [float(v.get(k, 0.0)) for k in order]
                     elif isinstance(v, (list, tuple)):
@@ -1018,11 +895,6 @@ class EpisodeRunner:
             try:
                 qv = q_values_per_agent
                 if isinstance(qv, torch.Tensor):
-                    # Common variants observed in this codebase:
-                    # - (bs, n_agents) coming from BasicMAC ("q_values" is often (bs,n_agents))
-                    # - (n_agents,) scalar per agent
-                    # - (n_agents,1)
-                    # - (1,n_agents,1)
                     if qv.ndim == 1 and qv.shape[0] == self.n_agents:
                         qv = qv.view(self.n_agents, 1)
                     elif qv.ndim == 2:
@@ -1033,7 +905,6 @@ class EpisodeRunner:
                         elif qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
                             qv = qv.view(self.n_agents, 1)
                         else:
-                            # if it's (bs, n_agents) with bs==1, squeeze to (n_agents,1)
                             if qv.shape[0] == 1 and qv.shape[1] == self.n_agents:
                                 qv = qv.squeeze(0).view(self.n_agents, 1)
                     elif qv.ndim == 3 and qv.shape == (1, self.n_agents, 1):
@@ -1069,9 +940,6 @@ class EpisodeRunner:
                 processed_group_representation = None 
             
             if processed_group_representation is not None:
-                 # IMPORTANT:
-                 # Avoid "overlapping memory" assignment in EpisodeBatch.update when the source tensor
-                 # aliases the destination buffer (e.g., MAC returns a view/reference to batch storage).
                  post_data_dict["group_representation"] = processed_group_representation.detach().clone()
         
         if belief_states is not None:
@@ -1119,7 +987,6 @@ class EpisodeRunner:
                 safe_text = str(next_observation_text)
         except Exception:
             safe_text = ""
-        # Preprocess the next (dummy) observation text
         next_obs_tensor = self.mac.preprocess_observation(safe_text)
 
         default_state_vshape = self.env_info.get("state_shape", (1,))
@@ -1149,13 +1016,10 @@ class EpisodeRunner:
         belief_dim = getattr(self.args, 'belief_dim')
         pop_dim = int(getattr(self.args, "population_belief_dim", 3))
         pop_dim = max(1, pop_dim)
-        # Max question length here refers to max token length after tokenization
-        # It should come from env_args, which HuggingFaceDatasetEnv also uses.
         max_token_len = getattr(self.args.env_args, "max_question_length", 512)
 
         scheme = {
             "state": {"vshape": self.env_info["state_shape"]}, # Usually (1,) for these envs
-            # obs is now token IDs, per agent
             "obs": {"vshape": (max_token_len,), "group": "agents", "dtype": torch.long},
             "actions": {"vshape": (1,), "group": "agents", "dtype": torch.long}, # Symbolic actions
             "avail_actions": {
@@ -1167,7 +1031,6 @@ class EpisodeRunner:
             "terminated": {"vshape": (1,), "dtype": torch.uint8},
             "filled": {"vshape": (1,), "dtype": torch.long},  # 添加filled字段，标记有效的时间步
             
-            # Fields per agent (these are fine)
             "q_values": {"vshape": (1,), "group": "agents", "dtype": torch.float32}, 
             "prompt_embeddings": {"vshape": (2,), "group": "agents", "dtype": torch.float32}, 
             "belief_states": {"vshape": (belief_dim,), "group": "agents"},
@@ -1175,37 +1038,25 @@ class EpisodeRunner:
             "reward_ts": {"vshape": (1,), "group": "agents", "dtype": torch.float32},
             "reward_cc": {"vshape": (1,), "group": "agents", "dtype": torch.float32},
 
-            # Global fields (these are fine)
             "commitment_embedding": {"vshape": (commitment_dim,), "dtype": torch.float32},
             "group_representation": {"vshape": (belief_dim,), "dtype": torch.float32}
             ,
-            # === offline supervised label (global) ===
-            # For HuggingFaceDatasetEnv stance-id training: ground-truth \\boxed{<id>} parsed to int.
             "gt_action": {"vshape": (1,), "dtype": torch.int64},
-            # Optional: partial supervision mask for Stage3b action imitation
             "action_mask": {"vshape": (1,), "dtype": torch.float32},
-            # Optional soft-label distribution over stance ids (aligned to env_info["n_actions"])
             "gt_action_dist": {"vshape": (self.env_info.get("n_actions", 1),), "dtype": torch.float32},
-            # latent z supervision (global)
             "z_pred": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_target": {"vshape": (pop_dim,), "dtype": torch.float32},
             "z_mask": {"vshape": (1,), "dtype": torch.float32},
-            # Dirichlet alpha0_target (optional; scalar)
             "z_alpha0_target": {"vshape": (1,), "dtype": torch.float32},
 
-            # === belief inputs (explicit, tensorized; global) ===
-            # stage index
             "stage_t": {"vshape": (1,), "dtype": torch.int64},
-            # for population belief update head (z(t) -> z(t+1))
             "z_t": {"vshape": (pop_dim,), "dtype": torch.float32},
-            # belief inputs (pre/post)
             "belief_pre_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
             "belief_pre_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
             "belief_pre_is_core_user": {"vshape": (1,), "dtype": torch.int64},
             "belief_post_population_z": {"vshape": (pop_dim,), "dtype": torch.float32},
             "belief_post_neighbor_counts": {"vshape": (3,), "dtype": torch.float32},
             "belief_post_is_core_user": {"vshape": (1,), "dtype": torch.int64},
-            # === optional structured conditioning for z_transition (global) ===
             "core_stance_id_t": {"vshape": (1,), "dtype": torch.int64},
             "core_action_type_id_t": {"vshape": (1,), "dtype": torch.int64},
             "has_user_history": {"vshape": (1,), "dtype": torch.int64},
@@ -1236,16 +1087,13 @@ class EpisodeRunner:
         """
         stats = self.test_stats if test_mode else self.train_stats
         
-        # Calculate average reward
         if metrics.rewards:
             stats['mean_reward'] = np.mean(metrics.rewards)
         
-        # Calculate LLM response diversity
         if metrics.llm_responses:
             unique_responses = len(set(map(str, metrics.llm_responses)))
             stats['response_diversity'] = unique_responses / len(metrics.llm_responses)
         
-        # Log statistics
         prefix = 'test_' if test_mode else 'train_'
         for k, v in stats.items():
             self.logger.log_stat(f"{prefix}{k}", v, self.t_env)
@@ -1258,22 +1106,9 @@ class EpisodeRunner:
             metrics: Collected LLM metrics
         """
         self.logger.info("_add_llm_data_to_batch called. Current logic mostly commented out or for text logging only.")
-        # try:
-            # Only stack if there are items and they are stackable (e.g. tensors)
-            # llm_data_to_add = {}
-            # if metrics.llm_responses and all(isinstance(x, torch.Tensor) for x in metrics.llm_responses):
-            #     llm_data_to_add["llm_responses"] = torch.stack(metrics.llm_responses) 
             
-            # if metrics.belief_states: # Already added per step
-            #    pass 
 
-            # if llm_data_to_add: 
-            #    self.batch.update(llm_data_to_add) 
-            #    self.logger.info("_add_llm_data_to_batch: Added to batch - " + str(list(llm_data_to_add.keys())))
 
-        # except Exception as e:
-        #     logger.error(f"Error in _add_llm_data_to_batch: {str(e)}. Data types might be incompatible.")
-        #     raise
 
     def reset(self):
         """Reset the runner state."""

@@ -128,12 +128,10 @@ def _infer_action_type_from_macro_tweet(tweet: Dict[str, Any]) -> str:
     - We map quotedTweet to retweet (user request: quote ≈ retweet for action-type).
     """
     def _is_missing(v: Any) -> bool:
-        # Treat None / NaN / empty-string as missing.
         if v is None:
             return True
         if isinstance(v, str):
             return len(v.strip()) == 0
-        # pandas/numpy may store NaN as float('nan')
         try:
             import math
 
@@ -143,23 +141,19 @@ def _infer_action_type_from_macro_tweet(tweet: Dict[str, Any]) -> str:
             pass
         return False
 
-    # If there is no text, treat as do_nothing
     txt = _extract_text(tweet)
     if not txt:
         return "do_nothing"
 
-    # Prefer explicit structure
     try:
         if not _is_missing(tweet.get("retweetedTweet")):
             return "retweet"
-        # quotedTweet 表示引用 -> 映射为 retweet（合并到转发类）
         if not _is_missing(tweet.get("quotedTweet")):
             return "retweet"
     except Exception:
         pass
 
     s = str(txt).lstrip()
-    # Fallback to common Twitter conventions
     if s.startswith("RT @") or s.startswith("RT@"):
         return "retweet"
     if s.startswith("@"):
@@ -233,7 +227,6 @@ def _neighbor_recent_items(
                 continue
             dt = _parse_datetime(d.get("date") or d.get("time") or d.get("current_time"))
             items.append((dt, d))
-    # sort: dt present first, then by dt desc
     items.sort(key=lambda x: (x[0] is None, -(x[0].timestamp() if x[0] else 0.0)))
     out = [d for _dt, d in items]
     if k_recent and k_recent > 0:
@@ -261,7 +254,6 @@ def _action_type_counts_from_texts(texts: List[str]) -> Dict[str, int]:
     for txt in texts or []:
         at = _infer_action_type_from_text(txt)
         counter[at] += 1
-    # ensure fixed keys
     out = {k: int(counter.get(k, 0)) for k in ["post", "retweet", "reply", "like", "do_nothing"]}
     return out
 
@@ -282,17 +274,14 @@ def _parse_datetime(s: Any) -> Optional[datetime]:
     if not ss:
         return None
     try:
-        # normalize Z
         if ss.endswith("Z"):
             ss = ss[:-1] + "+00:00"
-        # fromisoformat supports 'YYYY-MM-DDTHH:MM:SS(.ffffff)(+HH:MM)'
         dt = datetime.fromisoformat(ss)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
-    # try common fallback formats
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
         try:
             dt = datetime.strptime(ss, fmt)
@@ -329,7 +318,6 @@ def _load_micro_items(micro_path: str) -> List[Dict[str, Any]]:
         if isinstance(data, list):
             return [x for x in data if isinstance(x, dict)]
         if isinstance(data, dict):
-            # 兼容 dict[user]->list 的情况
             out: List[Dict[str, Any]] = []
             for u, items in data.items():
                 if not isinstance(items, list):
@@ -375,7 +363,6 @@ def _build_stage_time_windows_from_macro(
             stage = u_dict.get(t) or []
             if not isinstance(stage, list) or not stage:
                 continue
-            # sample a few items to reduce cost
             for it in stage[: max_items_per_user_stage if max_items_per_user_stage > 0 else len(stage)]:
                 d = _as_mapping(it)
                 if not d:
@@ -500,10 +487,8 @@ def _find_macro_event_files(hisim_with_tweet_dir: str) -> Dict[str, Dict[str, st
       { topic: { "e1": "/.../topic_macro_e1.pkl", "e2": "/.../topic_macro_e2.pkl", "p1": "/.../topic_macro_p1.pkl", ... } }
     """
     out: Dict[str, Dict[str, str]] = defaultdict(dict)
-    # 支持多种宏观文件命名：*_macro_e1.pkl、*_macro_e2.pkl、*_macro_p1.pkl 等
     for path in glob.glob(os.path.join(hisim_with_tweet_dir, "*_macro_*.pkl")):
         base = os.path.basename(path)
-        # e.g., metoo_macro_e1.pkl / blm_macro_p1.pkl
         if "_macro_" not in base:
             continue
         topic = base.split("_macro_")[0]
@@ -525,7 +510,6 @@ class BuildArgs:
     self_label_t: Optional[str]
     neighbor_texts: List[Tuple[str, str]]  # (neighbor_user, text)
     neighbor_label_counter: Dict[str, int]
-    # action-type features aligned to ["post","retweet","reply","like","do_nothing"]
     self_action_counts: List[int]
     self_action_ratio: List[float]
     neighbor_action_counts: List[int]
@@ -534,22 +518,12 @@ class BuildArgs:
     population_label_counter: Dict[str, int]
     label2id: Dict[str, int]
     is_core_user: bool
-    # - neighbor_tp1: predict neighbors' stance at stage t+1 (belief about others)
-    # - self_tp1: predict the user's OWN stance at stage t+1 (Scheme C for non-core users without network)
     target_mode: Literal["neighbor_tp1", "self_tp1"] = "neighbor_tp1"
-    # Observation semantics for building the prompt text:
-    # - legacy: observation features are taken from the same stage t
-    # - prev_stage: observation features are taken from stage (t-1) to mimic sync-stage env semantics
     observation_mode: str = "legacy"
     observation_t: int = -1
-    # Prompt truncation budget (token-level). If <=0, do not enforce.
     prompt_max_tokens: int = 0
-    # Tokenizer name for accurate token counting (best-effort; falls back to heuristic if unavailable).
     prompt_tokenizer_name: str = "gpt2"
-    # Optional: non-parametric stage-level group representation (core-aggregate) used to condition z-transition
     group_representation: Optional[List[float]] = None
-    # Optional: prompt truncation statistics accumulator (mutated in-place during data generation).
-    # If provided, _truncate_sections_to_budget will record how many prompts were over budget and how many tokens were dropped.
     truncation_stats: Optional[Dict[str, Any]] = None
 
 
@@ -612,19 +586,16 @@ def _nonparam_group_repr_from_core_macro(
     d = max(1, int(group_repr_dim))
     v = [0.0 for _ in range(d)]
     if int(stage_t) < 0:
-        # default "no previous info": uniform stance + do_nothing action
         if d >= 3:
             v[0] = v[1] = v[2] = 1.0 / 3.0
         if d >= 8:
             v[3 + 4] = 1.0
         return v
 
-    # stance dist (from stance-expressing actions only)
     K = 3
     stance_counts = [0 for _ in range(K)]
     stance_total = 0
 
-    # action dist (sum over users)
     action_counts = [0, 0, 0, 0, 0]
     action_total = 0
 
@@ -641,16 +612,13 @@ def _nonparam_group_repr_from_core_macro(
         active_users += 1
         tweet_total += int(len(st_items))
 
-        # action counts from macro items
         for it in st_items:
             d0 = _as_mapping(it)
             if not d0:
                 continue
             at = _infer_action_type_from_macro_tweet(d0)
-            # action
             idx_map = {"post": 0, "retweet": 1, "reply": 2, "like": 3, "do_nothing": 4}
             action_counts[idx_map.get(at, 4)] += 1
-            # stance (only for stance-expressing actions)
             if at in ("post", "retweet", "reply"):
                 lab = _normalize_label(_extract_label(d0))
                 if lab and lab in label2id:
@@ -663,25 +631,20 @@ def _nonparam_group_repr_from_core_macro(
                         stance_total += 1
 
     action_total = int(sum(int(x) for x in action_counts))
-    # stance distribution (stance-expressing actions only; matches S4 env aggregation semantics)
     if stance_total > 0:
         for i in range(min(K, d)):
             v[i] = float(stance_counts[i]) / float(stance_total)
     else:
-        # uniform if no labeled stance
         for i in range(min(K, d)):
             v[i] = 1.0 / float(K)
 
-    # action distribution
     if d >= 8:
         if action_total > 0:
             for i in range(5):
                 v[3 + i] = float(action_counts[i]) / float(action_total)
         else:
-            # default: all do_nothing
             v[3 + 4] = 1.0
 
-    # activity / intensity scalars
     if d >= 9:
         denom_u = float(max(1, len(core_users)))
         v[8] = float(active_users) / denom_u
@@ -689,7 +652,6 @@ def _nonparam_group_repr_from_core_macro(
         denom_u = float(max(1, len(core_users)))
         v[9] = float(tweet_total) / denom_u
     if d >= 11:
-        # expresses_stance: post/retweet/reply = 0/1/2 in our fixed order
         expresses = float(action_counts[0] + action_counts[1] + action_counts[2])
         v[10] = float(expresses / float(action_total)) if action_total > 0 else 0.0
 
@@ -705,7 +667,6 @@ def _approx_token_len(text: str) -> int:
         s = str(text or "")
     except Exception:
         s = ""
-    # + newlines/whitespace are slightly undercounted by len//4; add a small correction
     return int(max(0, (len(s) // 4) + s.count("\n") // 2))
 
 
@@ -721,15 +682,8 @@ def _get_tokenizer(name: str):
         return None
     try:
         tok = AutoTokenizer.from_pretrained(str(name or "gpt2"), use_fast=True)
-        # Ensure we can encode plain text robustly
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
-        # IMPORTANT:
-        # We use the tokenizer here mainly for token counting / budgeting during dataset generation.
-        # For very long raw texts, transformers may warn:
-        #   "Token indices sequence length is longer than the specified maximum sequence length..."
-        # This warning is about feeding long sequences into a model, not about token counting.
-        # To avoid noisy warnings while still counting accurately, set an effectively-unbounded max length.
         try:
             tok.model_max_length = int(10**9)
         except Exception:
@@ -781,7 +735,6 @@ def _truncate_sections_to_budget(
             out0.extend([str(x) for x in (s0.get("lines") or [])])
         return out0
 
-    # Mutable copy
     ss: List[Dict[str, Any]] = []
     for s in sections:
         ss.append(
@@ -795,7 +748,6 @@ def _truncate_sections_to_budget(
 
     order = sorted(range(len(ss)), key=lambda i: (ss[i]["priority"], ss[i]["name"]))
 
-    # stats: snapshot original section lengths (in lines)
     orig_lens: Dict[str, int] = {}
     if isinstance(stats, dict):
         try:
@@ -822,7 +774,6 @@ def _truncate_sections_to_budget(
                 stats["tokens_after_total_truncated"] = int(stats.get("tokens_after_total_truncated", 0)) + int(exact_after)
                 stats["tokens_dropped_total"] = int(stats.get("tokens_dropped_total", 0)) + int(dropped)
                 stats["tokens_dropped_max"] = max(int(stats.get("tokens_dropped_max", 0)), int(dropped))
-                # histogram
                 bins = list(stats.get("tokens_dropped_hist_bins") or [])
                 counts = list(stats.get("tokens_dropped_hist_counts") or [])
                 if bins and counts and len(bins) == len(counts):
@@ -832,7 +783,6 @@ def _truncate_sections_to_budget(
                             idx = j
                     counts[idx] = int(counts[idx]) + 1
                     stats["tokens_dropped_hist_counts"] = counts
-            # per-section removed lines / dropped sections (based on ss)
             if orig_lens:
                 removed = stats.get("removed_lines_by_section") if isinstance(stats.get("removed_lines_by_section"), dict) else {}
                 dropped_secs = stats.get("dropped_sections_count") if isinstance(stats.get("dropped_sections_count"), dict) else {}
@@ -850,7 +800,6 @@ def _truncate_sections_to_budget(
             pass
         return out_lines
 
-    # Fast approximate path first (avoids O(n^2) tokenization loops on very long prompts)
     def _approx_total_tokens() -> int:
         return _approx_token_len("\n".join(_flatten(ss)))
 
@@ -858,7 +807,6 @@ def _truncate_sections_to_budget(
     if approx_before <= mt:
         return _flatten(ss)
 
-    # If approx says "too long", do one exact check before truncating (avoids unnecessary truncation).
     exact_before: Optional[int] = None
     if isinstance(stats, dict):
         try:
@@ -882,7 +830,6 @@ def _truncate_sections_to_budget(
         except Exception:
             pass
 
-    # 1) Drop whole history first (cheap)
     for i in order:
         if _approx_total_tokens() <= mt:
             break
@@ -891,8 +838,6 @@ def _truncate_sections_to_budget(
         if ss[i]["name"] in ("history", "user_history", "optional_history"):
             ss[i]["lines"] = []
 
-    # 2) If still too long, drop other medium sections entirely (recent/self) before trimming texts.
-    # NOTE: persona is treated as high-priority and should not be dropped wholesale here.
     for i in order:
         if _approx_total_tokens() <= mt:
             break
@@ -901,7 +846,6 @@ def _truncate_sections_to_budget(
         if ss[i]["name"] in ("medium", "recent"):
             ss[i]["lines"] = []
 
-    # 3) Trim tails of remaining truncatable sections based on approximate token count (fast list pops)
     for i in order:
         if _approx_total_tokens() <= mt:
             break
@@ -922,12 +866,10 @@ def _truncate_sections_to_budget(
             lines.pop()
         ss[i]["lines"] = lines
 
-    # 4) One exact check; if still over budget, do a small number of exact trims via binary search on the lowest-priority section
     cur_lines = _flatten(ss)
     if _count_tokens("\n".join(cur_lines), tokenizer_name) <= mt:
         return _record_after(cur_lines, exact_before=exact_before)
 
-    # Find the lowest-priority truncatable section with removable lines
     victim = None
     for i in order:
         if not ss[i]["truncatable"]:
@@ -957,7 +899,6 @@ def _truncate_sections_to_budget(
         ok = _count_tokens("\n".join(_flatten(ss)), tokenizer_name) <= mt
         return bool(ok)
 
-    # Binary search max k that fits
     while lo <= hi:
         mid = (lo + hi) // 2
         if _try_keep(mid):
@@ -967,7 +908,6 @@ def _truncate_sections_to_budget(
             hi = mid - 1
 
     ss[victim]["lines"] = lines0[:best]
-    # Optional marker
     if best < len(lines0) and best > keep_head:
         ss[victim]["lines"].append("...[TRUNCATED]")
         if _count_tokens("\n".join(_flatten(ss)), tokenizer_name) > mt:
@@ -993,7 +933,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
     header.append("")
 
     high: List[str] = []
-    # High-priority signals FIRST (must survive truncation)
     obs_suffix = ""
     if str(getattr(args, "observation_mode", "legacy") or "legacy").strip().lower() in ("prev_stage", "prev", "t-1"):
         obs_suffix = " (from PREVIOUS stage t-1)"
@@ -1001,7 +940,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
         high.append(f"User stance at stage t (observed){obs_suffix}: {args.self_label_t}")
         high.append("")
 
-    # Core user action-type summary at stage t (macro-inferred, aligned to 5-way action space)
     try:
         if args.self_action_counts:
             at_names = ["post", "retweet", "reply", "like", "do_nothing"]
@@ -1010,7 +948,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
             high.append("")
     except Exception:
         pass
-    # Neighbor summary (keep short + high priority)
     if args.neighbor_label_counter:
         top = sorted(args.neighbor_label_counter.items(), key=lambda x: -x[1])[:10]
         high.append(f"Neighbor stance distribution at stage t (observed, aggregated){obs_suffix}:")
@@ -1025,7 +962,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
             high.append("")
     except Exception:
         pass
-    # neighbor texts are important, but can be trimmed after summaries if needed
     neighbor_texts_sec: List[str] = []
     if args.neighbor_texts:
         neighbor_texts_sec.append(f"Neighbor posts at stage t (observed, aggregated){obs_suffix}:")
@@ -1037,7 +973,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
                 break
         neighbor_texts_sec.append("")
 
-    # Population-level observation from secondary users (no per-user supervision)
     if args.population_label_counter:
         top = sorted(args.population_label_counter.items(), key=lambda x: -x[1])[:10]
         high.append(f"Population-level stance distribution at stage t (secondary users, observed){obs_suffix}:")
@@ -1052,18 +987,12 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
     else:
         pop_texts_sec = []
 
-    # =========================
-    # Persona (high priority; should survive truncation when possible)
-    # =========================
     persona_sec: List[str] = []
     if args.persona:
         persona_sec.append("User persona (profile):")
         persona_sec.append(args.persona.strip())
         persona_sec.append("")
 
-    # =========================
-    # Medium-priority context
-    # =========================
     medium: List[str] = []
     if args.self_texts:
         medium.append(f"User posts at stage t (observed){obs_suffix}:")
@@ -1071,9 +1000,6 @@ def build_belief_input(args: BuildArgs, max_neighbor_lines: int = 50) -> str:
             medium.append(f"- ({i}) {txt}")
         medium.append("")
 
-    # =========================
-    # Low-priority (should be truncated first)
-    # =========================
     low: List[str] = []
     if args.user_history:
         low.append("Optional / low-priority: User historical posts / memory (may be truncated):")
@@ -1137,7 +1063,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         high.append(f"User stance at stage t (observed): {args.self_label_t}")
         high.append("")
 
-    # User action distribution at stage t (observed)
     try:
         if args.self_action_counts:
             at_names = ["post", "retweet", "reply", "like", "do_nothing"]
@@ -1147,7 +1072,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
     except Exception:
         pass
 
-    # Neighbor summary
     if args.neighbor_label_counter:
         top = sorted(args.neighbor_label_counter.items(), key=lambda x: -x[1])[:10]
         high.append("Neighbor stance distribution at stage t (observed, aggregated):")
@@ -1174,7 +1098,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
                 break
         neighbor_texts_sec.append("")
 
-    # Population-level observation (optional)
     if args.population_label_counter:
         top = sorted(args.population_label_counter.items(), key=lambda x: -x[1])[:10]
         high.append("Population-level stance distribution at stage t (secondary users, observed):")
@@ -1189,18 +1112,12 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
     else:
         pop_texts_sec = []
 
-    # =========================
-    # Persona (high priority; should survive truncation when possible)
-    # =========================
     persona_sec: List[str] = []
     if args.persona:
         persona_sec.append("User persona (profile):")
         persona_sec.append(args.persona.strip())
         persona_sec.append("")
 
-    # =========================
-    # Medium-priority context
-    # =========================
     medium: List[str] = []
     if args.self_texts:
         medium.append("User posts at stage t (observed):")
@@ -1208,9 +1125,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
             medium.append(f"- ({i}) {txt}")
         medium.append("")
 
-    # =========================
-    # Low-priority (should be truncated first)
-    # =========================
     low: List[str] = []
     if args.user_history:
         low.append("Optional / low-priority: User historical posts / memory (may be truncated):")
@@ -1218,7 +1132,6 @@ def build_action_imitation_input(args: BuildArgs, max_neighbor_lines: int = 80) 
         low.append("")
 
     task: List[str] = []
-    # NOTE: action imitation target_mode can be stage t or t+1; prompt text is not used for labeling, keep it generic.
     task.append("Task: Predict the user's MOST LIKELY action_type at this stage.")
     task.append("Valid action types:")
     task.append(action_spec)
@@ -1250,9 +1163,6 @@ def _build_example_from_states(
     target_distribution: Dict[int, int],
 ) -> Dict[str, Any]:
     q = build_belief_input(build_args)
-    # NOTE:
-    # HuggingFace Datasets / pyarrow 不允许 map/dict 的 key 是 int（必须是 str/bytes）。
-    # 这里把分布的 key 转成 str，同时额外提供 list 版本，方便后续训练代码使用。
     target_dist_str: Dict[str, int] = {str(k): int(v) for k, v in (target_distribution or {}).items()}
     target_dist_ids = sorted([int(k) for k in target_distribution.keys()]) if target_distribution else []
     target_dist_counts = [int(target_distribution[i]) for i in target_dist_ids] if target_distribution else []
@@ -1265,9 +1175,7 @@ def _build_example_from_states(
         "answer": f"\\boxed{{{target_id}}}",
         "target_label": target_label,
         "target_id": int(target_id),
-        # safe for HF datasets
         "target_distribution": target_dist_str,
-        # easy-to-consume numeric form
         "target_distribution_ids": target_dist_ids,
         "target_distribution_counts": target_dist_counts,
         "topic": build_args.topic,
@@ -1277,8 +1185,6 @@ def _build_example_from_states(
         "self_label_t": build_args.self_label_t if build_args.self_label_t is not None else "",
         "is_core_user": bool(build_args.is_core_user),
         "target_distribution_prob": target_distribution_prob,
-        # === structured action features (macro-inferred) ===
-        # aligned to ["post","retweet","reply","like","do_nothing"]
         "self_action_counts_t": [int(x) for x in (build_args.self_action_counts or [0, 0, 0, 0, 0])],
         "self_action_ratio_t": [float(x) for x in (build_args.self_action_ratio or [0.0, 0.0, 0.0, 0.0, 0.0])],
         "neighbor_action_counts_t": [int(x) for x in (build_args.neighbor_action_counts or [0, 0, 0, 0, 0])],
@@ -1308,13 +1214,10 @@ def build_label2id_from_macros(macro_paths: List[str]) -> Dict[str, int]:
                         labels.add(_normalize_label(lab))
     if not labels:
         raise RuntimeError("未能从 macro 数据中抽取任何标签字段（stance_label 等）。")
-    # 为了与 hisim_social_env 的实现对齐，这里默认强制 K=3，并优先使用 canonical 映射
-    # Neutral=0, Oppose=1, Support=2
     canonical = {"Neutral": 0, "Oppose": 1, "Support": 2}
     if set(canonical.keys()).issubset(labels):
         return dict(canonical)
 
-    # fallback: 稳定排序取前三类；不足则用 canonical 补齐
     picked = sorted(list(labels))[:3]
     if len(picked) < 3:
         picked = (picked + ["Neutral", "Oppose", "Support"])[:3]
@@ -1348,83 +1251,37 @@ def convert_hisim_macro_to_belief_hf_dataset(
     force_k: int = 3,
     export_z_transition_dataset: bool = True,
     z_transition_out_dir: str = "",
-    # z_transition population belief representation:
-    # - "scalar": K=1 scalar z ∈ [-1,1] (Oppose=-1, Neutral=0, Support=+1) averaged over secondary users
-    # - "dist":   K=3 distribution z ∈ Δ^3 aligned to label2id ids (Neutral/Oppose/Support)
     z_transition_population_mode: str = "scalar",
     noncore_target_mode: str = "self",
-    # Core-user target definition:
-    # - "self": predict the user's OWN stance at t+1 (label from user's stage_tp1)
-    # - "neighbor": predict neighbors' stance at t+1 (label from neighbors' stage_tp1 majority)
     core_target_mode: str = "neighbor",
-    # Neighbor list handling
     shuffle_neighbors_before_truncation: bool = True,
     neighbor_shuffle_seed: int = 0,
-    # z-transition dataset conditioning:
-    # - "population_only": current behavior (population texts only; no per-core conditioning)
-    # - "core_user": build a z-transition sample per (core_user, t) using build_belief_input as question,
-    #               and label with secondary-population z_t/z_{t+1}.
     z_transition_conditioning: str = "population_only",
-    # z-transition dataset split strategy:
-    # - "by_stage": legacy behavior, split by stage id (train:0-9, val:10, test:11-12)  ⚠️ may cause OOD-by-stage
-    # - "random":  random split across ALL stages (recommended for "normal dynamics validation")
-    # - "random_by_user": random split but grouped by user (same core_user never crosses splits; recommended when conditioning=core_user)
     z_transition_split_strategy: str = "by_stage",
     z_transition_split_seed: int = 42,
-    # ratios for random split: "train,validation,test" (e.g., "0.8,0.1,0.1")
     z_transition_split_ratios: str = "0.8,0.1,0.1",
-    # === Stage4 (offline) action policy imitation dataset (core users only) ===
     export_action_imitation_dataset: bool = False,
     action_imitation_out_dir: str = "",
-    # action imitation dataset options (Stage3b):
-    # - observation_mode:
-    #   - "legacy": observation uses same-stage (t) self/neighbor context (old behavior)
-    #   - "sync_prev_stage": observation mimics sync-stage env: use previous-stage (t-1) self/neighbor context
-    # - target_mode:
-    #   - "tp1": label is action_type at next stage (t+1) (old behavior; next-step prediction)
-    #   - "t":   label is action_type at current stage (t) (recommended for behavior cloning under sync-stage env)
     action_imitation_observation_mode: str = "legacy",
     action_imitation_target_mode: str = "tp1",
-    # Partial supervision for Stage3b:
-    # If True, only compute supervised loss on {post, retweet} (ids 0/1).
-    # Other actions (reply/like/do_nothing) remain in the label space but are treated as latent (mask=0).
     action_imitation_supervise_post_retweet_only: bool = False,
-    # More general partial supervision (preferred): comma-separated ids like "0,1".
-    # If non-empty, it overrides action_imitation_supervise_post_retweet_only.
     action_imitation_supervised_action_ids: str = "0,1",
-    # If True, drop unsupervised samples (mask=0) instead of keeping them.
     action_imitation_drop_unsupervised: bool = False,
-    # Action imitation conditioning (Stage3b): how to populate sample["z_t"] (population belief at stage t).
-    # - "macro_secondary_majority_dist": current behavior, compute z_t as a 3-way dist over SECONDARY users' stage-majority labels
-    # - "s3a_rollout": use a Stage3a-trained BeliefEncoder.population_update_head to rollout z_t over stages
-    # - "none": do not include z_t (pure action cloning)
     action_imitation_z_t_source: str = "macro_secondary_majority_dist",
-    # When action_imitation_z_t_source="s3a_rollout": where to load Stage3a belief_encoder weights from.
-    # You can pass either:
-    # - a directory containing belief_encoder.th (saved by ECON), or
-    # - a direct path to belief_encoder.th
     s3a_belief_encoder_path: str = "",
-    # Rollout options:
-    # - "macro_stage0": initialize z_0 from macro-derived secondary dist at stage0 (if available; else uniform)
-    # - "uniform": initialize z_0 as [1/3,1/3,1/3]
     s3a_rollout_init: str = "macro_stage0",
-    # BeliefEncoder construction hints (must match Stage3a training dims to load weights correctly)
     s3a_rollout_belief_dim: int = 128,
     s3a_rollout_population_belief_dim: int = 3,
     s3a_rollout_n_stages: int = 13,
-    # === Preview (auto-generated after export) ===
     export_preview: bool = True,
     preview_num_per_split: int = 3,
     preview_seed: int = 42,
     preview_max_chars: int = 600,
     preview_filename: str = "preview.jsonl",
-    # === Prompt truncation budget (token-level, uses tokenizer if available) ===
     prompt_max_tokens: int = 1024,
     prompt_tokenizer_name: str = "gpt2",
-    # === Observation semantics (to align with sync-stage env) ===
     belief_observation_mode: str = "legacy",
     z_transition_observation_mode: str = "legacy",
-    # === Non-parametric core-group representation (B2-2) ===
     export_nonparam_group_representation: bool = True,
     nonparam_group_repr_dim: int = 128,
 ) -> None:
@@ -1437,7 +1294,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         raise FileNotFoundError(f"目录不存在: {hisim_with_tweet_dir}")
     if not os.path.isdir(user_data_dir):
         raise FileNotFoundError(f"目录不存在: {user_data_dir}")
-    # 可能会在处理中途导出一些辅助文件（如 micro_user_sequences），这里提前创建输出目录
     _ensure_dir(output_dir)
 
     macro_map = _find_macro_event_files(hisim_with_tweet_dir)
@@ -1449,7 +1305,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         if not macro_map:
             raise RuntimeError(f"过滤 topics={topics} 后没有匹配到任何 *_macro_*.pkl")
 
-    # 事件过滤：如果指定了 events，则只处理这些事件；否则使用该 topic 下存在的全部事件
     filtered: Dict[str, Dict[str, str]] = {}
     for topic, ev in macro_map.items():
         if not isinstance(ev, dict) or not ev:
@@ -1472,16 +1327,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     print("收集标签集合并构建 label2id...")
     label2id = build_label2id_from_macros(all_macro_paths)
-    # 兼容参数：当前程序的社交环境强制 K=3，这里也保持一致
     if int(force_k) != 3:
         print(f"[WARN] force_k={force_k} 目前未实现可变 K；将继续使用 K=3 以对齐 hisim_social_env。")
     print(f"标签数(K=3): {len(label2id)} | labels: {list(label2id.keys())}")
 
-    # split buckets (belief dataset)
     split_names = ("train", "validation", "test")
     split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
 
-    # split buckets (z-transition dataset)
     z_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
     z_all_examples: List[Dict[str, Any]] = []
 
@@ -1506,7 +1358,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
     z_r_train, z_r_val, z_r_test = _parse_ratios(str(z_transition_split_ratios or "0.8,0.1,0.1"))
 
-    # split buckets (action imitation dataset; core users only)
     a_split_examples: Dict[str, List[Dict[str, Any]]] = {k: [] for k in split_names}
 
     def _truncate_text(s: Any, n: int) -> str:
@@ -1585,12 +1436,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "skipped_missing_stage": 0,
         "skipped_missing_target": 0,
         "skipped_missing_label": 0,
-        # 更细粒度的跳过原因（便于定位是不是“邻居网络覆盖/方向”问题）
         "skipped_no_neighbors": 0,
         "skipped_neighbors_not_in_macro": 0,
         "skipped_neighbors_no_posts_tp1": 0,
         "skipped_neighbors_no_labels_tp1": 0,
-        # core vs non-core
         "num_candidates_core": 0,
         "num_candidates_noncore": 0,
         "num_examples_core": 0,
@@ -1601,7 +1450,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "core_user_count_intersection": 0,
         "core_user_definition": "",
         "core_user_history_nonempty_files": 0,
-        # population observation stats
         "population_scope": population_scope,
         "use_population_observation": bool(use_population_observation),
         "population_text_source": population_text_source,
@@ -1617,15 +1465,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "nonparam_group_repr_dim": int(nonparam_group_repr_dim),
         "group_repr_version": int(group_repr_version),
         "group_repr_spec": str(group_repr_spec),
-        # neighbor sampling options
         "shuffle_neighbors_before_truncation": bool(shuffle_neighbors_before_truncation),
         "neighbor_shuffle_seed": int(neighbor_shuffle_seed),
-        # target-id histogram (helps detect missing classes like Oppose=1)
         "target_id_counts": {0: 0, 1: 0, 2: 0},
-        # structured neighbor feature window
         "neighbor_k_recent_tweets": int(neighbor_k_recent_tweets),
     }
-    # Prompt truncation stats (belief dataset)
     prompt_trunc_stats = _init_prompt_truncation_stats(
         max_tokens=int(prompt_max_tokens),
         tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
@@ -1657,21 +1501,17 @@ def convert_hisim_macro_to_belief_hf_dataset(
         "action_id_counts": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0},
         "definition": "Predict CORE user's action_type id from context; action_type in [post,retweet,reply,like,do_nothing].",
     }
-    # Prompt truncation stats (action imitation dataset)
     a_prompt_trunc_stats = _init_prompt_truncation_stats(
         max_tokens=int(prompt_max_tokens),
         tokenizer_name=str(prompt_tokenizer_name or "gpt2"),
     )
     a_stats["prompt_truncation"] = a_prompt_trunc_stats
-    # record action imitation options
     try:
         a_stats["action_imitation_observation_mode"] = str(action_imitation_observation_mode or "legacy")
         a_stats["action_imitation_target_mode"] = str(action_imitation_target_mode or "tp1")
         a_stats["action_imitation_supervise_post_retweet_only"] = bool(action_imitation_supervise_post_retweet_only)
         a_stats["action_imitation_supervised_action_ids"] = str(action_imitation_supervised_action_ids or "").strip()
         a_stats["action_imitation_drop_unsupervised"] = bool(action_imitation_drop_unsupervised)
-        # z_t conditioning (Stage3b): populated per sample as `z_t` (list[population_belief_dim])
-        # so HuggingFaceDatasetEnv can emit belief_inputs_pre and EpisodeRunner can fill batch z_t.
         a_stats["action_imitation_include_z_t"] = str(action_imitation_z_t_source or "").strip().lower() not in ("none", "off", "false", "0", "")
         a_stats["action_imitation_z_t_source"] = str(action_imitation_z_t_source or "macro_secondary_majority_dist")
         a_stats["group_repr_version"] = int(group_repr_version)
@@ -1683,8 +1523,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
     a_stats["num_examples_supervised"] = 0
     a_stats["num_examples_dropped_unsupervised"] = 0
 
-    # Parse supervised ids (None => no masking). Note: this only affects dataset fields / optional dropping;
-    # the actual Stage3b training mask is controlled in learner via config.
     supervised_ids: Optional[set] = None
     try:
         s_ids = str(action_imitation_supervised_action_ids or "").strip()
@@ -1727,7 +1565,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     line = line.strip()
                     if not line:
                         continue
-                    # each line is often JSON
                     try:
                         obj = json.loads(line)
                         if isinstance(obj, dict):
@@ -1741,7 +1578,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         except Exception:
             history_cache[key] = ""
             return ""
-        # take the last few as “recent memory”
         if len(texts) > 20:
             texts = texts[-20:]
         out = "\n".join([f"- {t}" for t in texts if t])
@@ -1751,7 +1587,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         return out
 
     for topic, ev_paths in filtered.items():
-        # load user data for this topic (if exists)
         role_desc_path = os.path.join(user_data_dir, topic, "role_desc_v2_clean.json")
         follower_dict_path = os.path.join(user_data_dir, topic, "follower_dict.json")
         role_desc: Dict[str, str] = {}
@@ -1767,8 +1602,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
             except Exception as e:
                 print(f"[WARN] 无法读取 follower_dict: {follower_dict_path} | {e}")
 
-        # === 核心用户判定（验证“主要/次要”标签）===
-        # 经验上：核心用户 = 同时存在 persona(role_desc) 与个人历史(<topic>_v2/*.txt) 的用户集合
         hist_dir = os.path.join(user_data_dir, topic, f"{topic}_v2")
         hist_users: Set[str] = set()
         if os.path.isdir(hist_dir):
@@ -1776,12 +1609,9 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 hist_users.add(os.path.splitext(os.path.basename(fp))[0])
         role_users = set(role_desc.keys())
         core_users = role_users.intersection(hist_users) if role_users and hist_users else set()
-        # 记录验证统计（只记一次）
         stats["core_user_count_role_desc"] = max(stats["core_user_count_role_desc"], len(role_users))
         stats["core_user_count_history"] = max(stats["core_user_count_history"], len(hist_users))
         stats["core_user_count_intersection"] = max(stats["core_user_count_intersection"], len(core_users))
-        # 更稳健的核心用户定义：优先使用 role_desc 覆盖的用户（通常就是核心 LLM 用户）
-        # 如果 role_desc 缺失，则退化使用 history 文件名集合
         if role_users:
             core_users = set(role_users)
             stats["core_user_definition"] = "role_desc_keys"
@@ -1791,7 +1621,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         else:
             core_users = set()
             stats["core_user_definition"] = "none"
-        # history 非空文件数量（用于判断“核心用户更全面”在该 topic 是否成立）
         if os.path.isdir(hist_dir):
             nonempty = 0
             for fp in glob.glob(os.path.join(hist_dir, "*.txt")):
@@ -1802,7 +1631,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     pass
             stats["core_user_history_nonempty_files"] = max(stats.get("core_user_history_nonempty_files", 0), nonempty)
 
-        # if need following mode, invert follower_dict
         following_dict: Dict[str, List[str]] = defaultdict(list)
         if neighbor_mode == "following" and follower_dict:
             for u, followers in follower_dict.items():
@@ -1812,10 +1640,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     if f_u:
                         following_dict[str(f_u)].append(str(u))
 
-        # user history cache per topic (avoid repeated file IO)
         history_cache: Dict[str, str] = {}
 
-        # 按该 topic 实际具备的事件列表迭代（例如 metoo: e1/e2；blm: p1）
         for event in sorted(ev_paths.keys()):
             macro_path = ev_paths[event]
             print(f"读取 macro: topic={topic} event={event} path={macro_path}")
@@ -1825,13 +1651,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 print(f"[WARN] macro 顶层不是 dict，跳过: {macro_path}")
                 continue
 
-            # 加载 micro（用于增强 population_texts）
             micro_items: List[Dict[str, Any]] = []
             micro_path = os.path.join(hisim_with_tweet_dir, f"{topic}_micro.pkl")
             micro_path_json = os.path.join(hisim_with_tweet_dir, f"{topic}_micro.json")
             if population_text_source == "micro":
                 micro_items = _load_micro_items(micro_path) or _load_micro_items(micro_path_json)
-                # 过滤 micro 用户范围（注意：micro 数据不一定覆盖次要用户；默认 all 以提升多样性）
                 if population_micro_user_scope != "all":
                     allowed: Set[str]
                     if population_micro_user_scope == "core":
@@ -1840,7 +1664,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         allowed = set([u for u in macro.keys() if str(u) not in core_users])
                     micro_items = [it for it in micro_items if str(it.get("user", "")) in allowed]
 
-                # 可选：导出 micro 用户序列，供后续 latent z 模型训练
                 if export_micro_user_sequences and micro_items:
                     out_path = os.path.join(output_dir, f"{topic}_{event}_micro_user_sequences.jsonl")
                     by_user: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -1862,15 +1685,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                         "gt_msg_type": x.get("gt_msg_type", ""),
                                     }
                                 )
-                            # sort by time if possible
                             rows.sort(key=lambda r: (r["current_time_epoch"] is None, r["current_time_epoch"] or 0))
                             f.write(json.dumps({"user": u, "items": rows}, ensure_ascii=False) + "\n")
 
-            # === 预计算 population-level observation（按 stage t 聚合次要用户）===
-            # 只生成“群体观测”，不为次要用户生成监督样本。
             population_cache: Dict[int, Dict[str, Any]] = {}
             if use_population_observation:
-                # stage windows (for micro time alignment)
                 stage_windows = _build_stage_time_windows_from_macro(
                     macro,
                     sample_users=stage_window_sample_users,
@@ -1882,7 +1701,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 if population_scope == "all":
                     population_users = list(macro.keys())
                 else:
-                    # secondary users = not in core_users
                     population_users = [u for u in macro.keys() if str(u) not in core_users]
 
                 for t in range(0, 14):
@@ -1895,7 +1713,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         stage = u_dict.get(t) or []
                         if not isinstance(stage, list) or not stage:
                             continue
-                        # labels: count all labeled tweets in this stage
                         for it in stage:
                             d = _as_mapping(it)
                             if not d:
@@ -1903,7 +1720,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             lab = _extract_label(d)
                             if lab:
                                 pop_label_counter[lab] += 1
-                            # texts: macro 文本抽样（仅当 population_text_source=macro）
                             if population_text_source == "macro":
                                 if max_population_tweets_total > 0 and len(pop_texts) >= max_population_tweets_total:
                                     continue
@@ -1911,10 +1727,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 if txt:
                                     pop_texts.append((str(u), txt))
 
-                    # texts: micro 文本抽样（population_text_source=micro）
                     if population_text_source == "micro" and micro_items:
                         cand = micro_buckets.get(t, []) if population_micro_sampling == "time" else micro_items
-                        # 打乱后截断，避免同一用户集中
                         if cand:
                             random.shuffle(cand)
                             for it in cand:
@@ -1930,14 +1744,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         "texts": pop_texts[: max_population_tweets_total if max_population_tweets_total > 0 else None],
                     }
 
-            # === Action imitation (S3b) conditioning: precompute secondary-population z_t (3-way dist) per stage ===
-            # NOTE: this z_t is a GLOBAL event-level latent state (same for all core users at stage t),
-            # computed from SECONDARY users' stage-majority labels (aligns with z-transition definition).
             secondary_z_dist_by_stage: Dict[int, List[float]] = {}
             secondary_z_labeled_by_stage: Dict[int, int] = {}
             try:
                 if export_action_imitation_dataset:
-                    # ---- 1) macro-derived z_t (baseline) ----
                     secondary_users_ai = [u for u in macro.keys() if str(u) not in core_users]
 
                     def _stage_dist_over_users_ai(users_list: List[str], stage_t: int) -> Tuple[List[float], int]:
@@ -1968,7 +1778,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             return [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 0
                         return [c / float(total) for c in counts], int(total)
 
-                    # Keep legacy stage range: [0..13] (14 buckets); some topics may use fewer stages but this is safe.
                     for tt in range(0, 14):
                         zt, labeled = _stage_dist_over_users_ai(secondary_users_ai, int(tt))
                         secondary_z_dist_by_stage[int(tt)] = [float(x) for x in zt]
@@ -1977,9 +1786,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 secondary_z_dist_by_stage = {}
                 secondary_z_labeled_by_stage = {}
 
-            # ---- 2) optional: replace macro z_t with Stage3a rollout z_t ----
-            # This is the user-requested mode: make S3b training input include z_t produced by a Stage3a-trained
-            # population_update_head (so training becomes pi(a|o,z_t) rather than pure pi(a|o)).
             try:
                 z_src = str(action_imitation_z_t_source or "macro_secondary_majority_dist").strip().lower()
             except Exception:
@@ -1987,13 +1793,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
             if export_action_imitation_dataset and z_src in ("s3a", "s3a_rollout", "rollout"):
                 try:
                     import torch  # local import: keep script usable without torch when not needed
-                    # Add ECON/src to sys.path so we can import BeliefEncoder as a namespace package.
                     _src_dir = os.path.join(os.path.dirname(__file__), "src")
                     if _src_dir not in sys.path:
                         sys.path.insert(0, _src_dir)
                     from modules.belief_encoder import BeliefEncoder  # type: ignore
 
-                    # Resolve checkpoint path (dir or file)
                     ckpt = str(s3a_belief_encoder_path or "").strip()
                     if ckpt and os.path.isdir(ckpt):
                         ckpt = os.path.join(ckpt, "belief_encoder.th")
@@ -2003,7 +1807,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             f"Expected a file 'belief_encoder.th' or a directory containing it."
                         )
 
-                    # Instantiate encoder skeleton (dims must match Stage3a training to load weights).
                     bd = int(s3a_rollout_belief_dim)
                     k = int(s3a_rollout_population_belief_dim)
                     ns = int(s3a_rollout_n_stages)
@@ -2032,7 +1835,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         use_secondary_action_head=False,
                     )
 
-                    # Load state dict (shape-filtered for robustness across slightly different configs)
                     sd = torch.load(ckpt, map_location="cpu")
                     if not isinstance(sd, dict):
                         raise TypeError(f"belief_encoder.th should be a state_dict (dict), got: {type(sd)}")
@@ -2055,7 +1857,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     enc.load_state_dict(filtered, strict=False)
                     enc.eval()
 
-                    # Init z_0
                     init_mode = str(s3a_rollout_init or "macro_stage0").strip().lower()
                     if init_mode in ("macro", "macro_stage0", "stage0"):
                         z0 = secondary_z_dist_by_stage.get(0, [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
@@ -2064,16 +1865,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     if (not isinstance(z0, (list, tuple))) or (len(z0) != k):
                         z0 = [1.0 / 3.0 for _ in range(k)] if k > 1 else [0.0]
 
-                    # Rollout over stages: store z_t for t in [0..13] (14 buckets)
                     z_roll: Dict[int, List[float]] = {}
                     z = torch.tensor([float(x) for x in z0], dtype=torch.float32).view(1, k)
                     for tt in range(0, 14):
-                        # record current
                         z_roll[int(tt)] = [float(x) for x in z.detach().view(-1).tolist()]
-                        # predict next using Stage3a head
                         with torch.no_grad():
                             st = torch.tensor([int(tt)], dtype=torch.long)
-                            # Non-parametric core-group repr: use macro core stats at obs stage (tt-1) to mimic sync semantics.
                             if bool(export_nonparam_group_representation):
                                 obs_tt = int(tt) - 1
                                 gr_vec = _nonparam_group_repr_from_core_macro(
@@ -2094,31 +1891,23 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                     return_logits=False,
                                 )
                             except Exception:
-                                # fallback: always pass both (matches common Stage3a config)
                                 z_next = enc.predict_next_population_belief(z, group_repr=gr_t, stage_t=st, return_logits=False)
                             z = z_next
 
                     secondary_z_dist_by_stage = z_roll
-                    # Coverage of z_t now comes from rollout; keep macro labeled counts for debugging/coverage
                     a_stats["action_imitation_z_t_source"] = "s3a_rollout"
                     a_stats["s3a_rollout_loaded_keys"] = int(len(filtered))
                     a_stats["s3a_rollout_skipped_missing"] = int(skipped_missing)
                     a_stats["s3a_rollout_skipped_mismatch"] = int(skipped_mismatch)
                 except Exception as e:
-                    # Hard fallback: keep macro z_t to avoid breaking conversion
                     a_stats["s3a_rollout_error"] = str(e)
 
-            # === 可选：导出 z(t)->z(t+1) transition 数据集（用于训练 BeliefEncoder.population_update_head）===
-            # 支持两种 z 表示：
-            # - scalar: K=1 标量 z∈[-1,1]（Oppose=-1, Neutral=0, Support=+1），取 secondary users 的 stage-majority label 均值
-            # - dist:   K=3 分布 z∈Δ^3（按 label2id 的 id 顺序），取 secondary users 的 stage-majority label 分布
             if export_z_transition_dataset:
                 z_pop_mode = str(z_transition_population_mode or "scalar").strip().lower()
                 if z_pop_mode not in ("scalar", "dist"):
                     z_pop_mode = "scalar"
 
                 def _stage_scalar_over_users(users_list: List[str], stage_t: int) -> Tuple[float, int]:
-                    # label -> scalar mapping
                     v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
                     total = 0
                     acc = 0.0
@@ -2169,11 +1958,9 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             counts[idx] += 1
                             total += 1
                     if total <= 0:
-                        # uniform but will be masked out by labeled_count=0
                         return [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], 0
                     return [c / float(total) for c in counts], int(total)
 
-                # secondary users = not in core_users
                 secondary_users = [u for u in macro.keys() if str(u) not in core_users]
                 z_cond = str(z_transition_conditioning or "population_only").strip().lower()
                 for t in range(0, 13):
@@ -2185,12 +1972,10 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         z_tp1, labeled_tp1 = _stage_scalar_over_users(secondary_users, t + 1)
 
                     if z_cond in ("core_user", "core", "conditioned", "cond"):
-                        # Build a conditioned sample for EACH core user at stage t, but label by secondary population z(t+1).
                         for user in list(core_users):
                             ud = macro.get(user)
                             if not isinstance(ud, dict):
                                 continue
-                            # Observation semantics for S3a: optionally use previous-stage (t-1) user/neighbor/pop context in prompt text
                             z_obs_mode = str(z_transition_observation_mode or "legacy").strip().lower()
                             obs_t = int(t) if z_obs_mode in ("legacy", "t", "curr", "current") else int(t) - 1
                             stage_ut = ud.get(obs_t) or [] if obs_t >= 0 else []
@@ -2202,14 +1987,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             user_history = _load_user_history_snippet(topic, str(user))
                             self_label_t = _stage_label(stage_ut)
                             self_texts = _stage_texts(stage_ut, max_tweets=max_self_tweets)
-                            # neighbor slice consistent with belief dataset
                             neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
                             neighbors = [nb for nb in neighbors if nb in macro]
                             if max_neighbor_users > 0 and len(neighbors) > max_neighbor_users:
                                 neighbors = neighbors[:max_neighbor_users]
                             neighbor_texts: List[Tuple[str, str]] = []
                             neighbor_label_counter: Counter = Counter()
-                            # action-type features aligned to ["post","retweet","reply","like","do_nothing"]
                             self_action_counts = _action_counts_from_stage(stage_ut)
                             self_action_ratio = _counts_to_ratio(self_action_counts)
                             neighbor_action_counts = [0, 0, 0, 0, 0]
@@ -2227,7 +2010,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 for txt in nb_texts:
                                     if txt:
                                         neighbor_texts.append((str(nb), txt))
-                                # macro-inferred action counts for neighbors at stage t (sum across neighbors)
                                 try:
                                     c = _action_counts_from_stage(nb_stage)
                                     for i in range(5):
@@ -2242,7 +2024,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
                             pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
 
-                            # Non-parametric group repr for conditioning (core aggregate at observed stage obs_t)
                             if bool(export_nonparam_group_representation):
                                 gr_vec = _nonparam_group_repr_from_core_macro(
                                     macro=macro,
@@ -2282,7 +2063,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             )
                             q = build_belief_input(bargs)
 
-                            # structured conditioning fields
                             core_stance_id_t = int(label2id.get(str(self_label_t), -1)) if self_label_t else -1
                             core_action_type_t = _infer_action_type_from_text(self_texts[0] if self_texts else "")
                             action2id = {"post": 0, "retweet": 1, "reply": 2, "like": 3, "do_nothing": 4}
@@ -2298,31 +2078,25 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 "t": int(t),
                                 "stage_t": int(t),
                                 "is_core_user": True,
-                                # transition supervision (scalar K=1 or dist K=3)
                                 "z_t": z_t if z_pop_mode == "dist" else float(z_t),
                                 "z_target": z_tp1 if z_pop_mode == "dist" else float(z_tp1),
                                 "z_mask": 1.0 if int(labeled_tp1) > 0 else 0.0,
                                 "labeled_secondary_users_t": int(labeled_t),
                                 "labeled_secondary_users_tp1": int(labeled_tp1),
-                                # extra conditioning (optional)
                                 "core_stance_id_t": int(core_stance_id_t),
                                 "core_action_type_id_t": int(core_action_type_id_t),
                                 "has_user_history": 1 if bool(user_history) else 0,
                                 "has_neighbors": 1 if bool(neighbors) else 0,
                                 "neighbor_action_type_counts_t": neigh_action_counts,
-                                # Non-parametric group repr (global, length=belief_dim expected by trainer)
                                 "group_representation": gr_vec,
                             }
-                            # z_transition split
                             if z_split_strategy in ("random", "random_by_user"):
                                 z_all_examples.append(ex)
                             else:
-                                # legacy: split by stage (may cause OOD-by-stage)
                                 split = "train" if t <= 9 else ("validation" if t == 10 else "test")
                                 z_split_examples[split].append(ex)
                             z_stats["num_examples"] += 1
                     else:
-                        # population-only (current behavior)
                         z_obs_mode = str(z_transition_observation_mode or "legacy").strip().lower()
                         obs_t = int(t) if z_obs_mode in ("legacy", "t", "curr", "current") else int(t) - 1
                         pop = population_cache.get(obs_t, {}) if (use_population_observation and obs_t >= 0) else {}
@@ -2405,10 +2179,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     stats["num_candidates_core"] += 1
                 else:
                     stats["num_candidates_noncore"] += 1
-                # 允许为次要用户也生成监督样本（用于训练“次要用户信念网络”）。
-                # 通过 `--user-scope core/noncore/all` 控制生成范围；样本内用 is_core_user 字段区分。
-                # stages expected 0..13
-                # iterate t in [0,12], require t+1 exists and non-empty
                 for t in range(0, 13):
                     if t not in user_dict or (t + 1) not in user_dict:
                         stats["skipped_missing_stage"] += 1
@@ -2422,10 +2192,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                         stats["skipped_missing_target"] += 1
                         continue
 
-                    # === target definition ===
-                    # Choose supervision target for this sample.
-                    # - core_target_mode controls CORE users (default historical behavior was neighbor_tp1).
-                    # - noncore_target_mode controls NONCORE users (default self_tp1 due to sparse neighbor graph).
                     noncore_tm = str(noncore_target_mode or "self").strip().lower()
                     core_tm = str(core_target_mode or "neighbor").strip().lower()
                     if is_core_user:
@@ -2438,7 +2204,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     target_label: Optional[str] = None
 
                     if target_mode == "self_tp1":
-                        # Predict user's own stance at t+1 (supervised by stage_tp1 label distribution)
                         target_counter_raw = _stage_label_dist(stage_tp1)
                         if not target_counter_raw:
                             stats["skipped_missing_label"] += 1
@@ -2456,16 +2221,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             continue
                         target_id = label2id[target_label]
                     else:
-                        # neighbors
                         if neighbor_mode == "following":
                             neighbors = list(following_dict.get(str(user), []))
                         else:
                             neighbors = list(follower_dict.get(str(user), [])) if follower_dict else []
 
-                        # limit and filter to users existing in macro
                         if shuffle_neighbors_before_truncation and len(neighbors) > 1:
                             try:
-                                # deterministic per-sample shuffle so dataset build is reproducible
                                 seed = int(neighbor_shuffle_seed) ^ int(_stable_hash_to_bucket(f"{topic}:{event}:{user}:{t}", buckets=2**31-1))
                                 rnd = random.Random(seed)
                                 rnd.shuffle(neighbors)
@@ -2480,11 +2242,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             stats["skipped_no_neighbors"] += 1
                             continue
 
-                        # 在当前结构下，简单用一个近似：如果 neighbors 非空但全都没能提供 tp1 label，
-                        # 通常是“t+1 没发帖”或“没有标签”。下面会分别计数。
                         target_counter_raw = _neighbor_stage_label_dist(macro, neighbors, t)
                         if not target_counter_raw:
-                            # 判断是“没发帖”还是“发帖但无标签”
                             any_posts_tp1 = False
                             for nb in neighbors:
                                 nb_dict = macro.get(nb)
@@ -2501,7 +2260,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             stats["skipped_missing_label"] += 1
                             continue
 
-                        # 映射到 label id 空间
                         target_counter = {
                             label2id[lab]: cnt
                             for lab, cnt in target_counter_raw.items()
@@ -2524,13 +2282,11 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
                     persona = role_desc.get(str(user), "")
                     user_history = _load_user_history_snippet(topic, str(user)) if is_core_user else ""
-                    # Observation semantics for S1/S2 belief prompt: optionally use previous-stage (t-1) context
                     b_obs_mode = str(belief_observation_mode or "legacy").strip().lower()
                     obs_t = int(t) if b_obs_mode in ("legacy", "t", "curr", "current") else int(t) - 1
                     stage_obs = user_dict.get(obs_t) or [] if obs_t >= 0 else []
                     self_label_t = _stage_label(stage_obs)
                     self_texts = _stage_texts(stage_obs, max_tweets=max_self_tweets)
-                    # macro-inferred action distribution for the user at observed stage (t or t-1)
                     self_action_counts = _action_counts_from_stage(stage_obs)
                     self_action_ratio = _counts_to_ratio(self_action_counts)
 
@@ -2538,7 +2294,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
                     neighbor_texts: List[Tuple[str, str]] = []
                     neighbor_label_counter: Counter = Counter()
-                    # macro-inferred action distribution for neighbors at stage t (aggregated across neighbors)
                     neighbor_action_counts = [0, 0, 0, 0, 0]
                     if neighbors:
                         for nb in neighbors:
@@ -2551,14 +2306,12 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             nb_lab = _stage_label(nb_stage)
                             if nb_lab:
                                 neighbor_label_counter[nb_lab] += 1
-                            # action counts: sum over neighbor stages
                             try:
                                 c = _action_counts_from_stage(nb_stage)
                                 for i in range(5):
                                     neighbor_action_counts[i] += int(c[i])
                             except Exception:
                                 pass
-                            # take at most 1-2 texts per neighbor to control length
                             nb_texts = _stage_texts(nb_stage, max_tweets=2)
                             for txt in nb_texts:
                                 if txt:
@@ -2600,7 +2353,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
 
                     ex = _build_example_from_states(bargs, target_label=target_label, target_id=target_id, target_distribution=target_counter)
                     try:
-                        # update histogram for quick sanity checks
                         tid = int(target_id)
                         if tid in stats["target_id_counts"]:
                             stats["target_id_counts"][tid] += 1
@@ -2620,12 +2372,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     else:
                         stats["num_examples_noncore"] += 1
 
-                    # === Optional: Stage4 action imitation dataset (core users only) ===
                     if export_action_imitation_dataset and bool(is_core_user):
                         try:
-                            # === S3b/S4 action imitation target definition ===
-                            # Default (legacy): target is stage (t+1) action_type (next-step prediction).
-                            # Sync-stage env (recommended): target is stage (t) action_type (behavior cloning).
                             tgt_mode = str(action_imitation_target_mode or "tp1").strip().lower()
                             if tgt_mode not in ("tp1", "t", "curr", "current"):
                                 tgt_mode = "tp1"
@@ -2637,20 +2385,15 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             if aid is None or int(aid) < 0:
                                 aid = 4
                             aid = int(max(0, min(4, int(aid))))
-                            # === S3b observation definition ===
-                            # Sync-stage env semantics: at stage t, observation should only include previous-stage (t-1)
-                            # self/neighbor simulated content (no same-stage leakage).
                             obs_mode = str(action_imitation_observation_mode or "legacy").strip().lower()
                             if obs_mode not in ("legacy", "sync_prev_stage", "prev_stage", "prev"):
                                 obs_mode = "legacy"
                             if obs_mode in ("sync_prev_stage", "prev_stage", "prev"):
-                                # build a separate BuildArgs using (t-1) self/neighbor, but keep population obs aligned to stage t
                                 t_prev = int(t) - 1
                                 if t_prev >= 0 and isinstance(user_dict.get(t_prev), list):
                                     stage_self_prev = user_dict.get(t_prev) or []
                                 else:
                                     stage_self_prev = []
-                                # neighbor texts/counters at (t-1)
                                 neighbors_prev: List[str] = []
                                 if follower_dict and str(user) in follower_dict:
                                     try:
@@ -2679,7 +2422,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                             neighbor_texts_prev.append((str(nb), txt))
                                     if max_neighbor_tweets_total > 0 and len(neighbor_texts_prev) >= max_neighbor_tweets_total:
                                         break
-                                # population obs at stage t (aligned to env _population_obs(t))
                                 pop = population_cache.get(t, {}) if use_population_observation else {}
                                 pop_label_counter = pop.get("label_counter", {}) if isinstance(pop, dict) else {}
                                 pop_texts = pop.get("texts", []) if isinstance(pop, dict) else []
@@ -2722,8 +2464,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 "t": int(bargs.t),
                                 "is_core_user": True,
                             }
-                            # Optional: provide secondary-population latent state z_t as extra conditioning input.
-                            # This enables S3b to learn pi(a|o,z_t) instead of pure pi(a|o).
                             try:
                                 tt = int(bargs.t)
                             except Exception:
@@ -2732,21 +2472,16 @@ def convert_hisim_macro_to_belief_hf_dataset(
                                 zt = secondary_z_dist_by_stage.get(int(tt))
                                 if isinstance(zt, (list, tuple)) and len(zt) == 3:
                                     a_ex["z_t"] = [float(x) for x in list(zt)[:3]]
-                                    # optional next-step (can be used for auxiliary diagnostics)
                                     ztp1 = secondary_z_dist_by_stage.get(int(tt) + 1)
                                     if isinstance(ztp1, (list, tuple)) and len(ztp1) == 3:
                                         a_ex["z_target"] = [float(x) for x in list(ztp1)[:3]]
-                                    # mask indicates whether z_t is based on any labeled secondary users
                                     labeled = int(secondary_z_labeled_by_stage.get(int(tt), 0))
                                     a_ex["labeled_secondary_users_t"] = int(labeled)
                                     a_ex["z_mask"] = 1.0 if labeled > 0 else 0.0
-                            # === Stage3b partial supervision mask ===
-                            # Only ids in supervised_ids are considered supervised; others are latent.
                             if isinstance(supervised_ids, set) and len(supervised_ids) > 0:
                                 is_sup = bool(int(aid) in supervised_ids)
                                 a_ex["is_supervised"] = bool(is_sup)
                                 a_ex["supervised_mask"] = 1.0 if is_sup else 0.0
-                                # backward-compatible field name
                                 a_ex["action_mask"] = float(a_ex["supervised_mask"])
                                 if (not is_sup) and bool(action_imitation_drop_unsupervised):
                                     a_stats["num_examples_dropped_unsupervised"] = int(a_stats.get("num_examples_dropped_unsupervised", 0)) + 1
@@ -2764,7 +2499,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                             except Exception:
                                 pass
                         except Exception as e:
-                            # keep belief dataset generation robust (do not fail the whole conversion)
                             try:
                                 stats["skipped_action_imitation"] = int(stats.get("skipped_action_imitation", 0)) + 1
                             except Exception:
@@ -2773,7 +2507,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
     if stats["num_examples"] == 0:
         raise RuntimeError("没有构造出任何样本，请检查数据路径/字段或参数。")
 
-    # finalize prompt truncation stats + print a short summary
     try:
         stats["prompt_truncation"] = _finalize_prompt_truncation_stats(stats.get("prompt_truncation") or {})
         pt = stats.get("prompt_truncation") if isinstance(stats.get("prompt_truncation"), dict) else {}
@@ -2803,7 +2536,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
         pass
 
     _ensure_dir(output_dir)
-    # save dataset
     if _HAS_DATASETS:
         ds_dict = DatasetDict({k: Dataset.from_list(v) for k, v in split_examples.items() if v})  # type: ignore[misc]
         print(f"保存 HuggingFace 数据集到: {output_dir}")
@@ -2819,17 +2551,13 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     f.write(json.dumps(it, ensure_ascii=False) + "\n")
         print(f"已输出 JSONL 到: {output_dir}")
 
-    # save metadata
     with open(os.path.join(output_dir, "label2id.json"), "w", encoding="utf-8") as f:
         json.dump(label2id, f, ensure_ascii=False, indent=2)
     with open(os.path.join(output_dir, "stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
-    # preview (belief dataset)
     _write_preview_jsonl(str(output_dir), split_examples, tag="belief")
 
-    # === save z-transition dataset (optional) ===
     if export_z_transition_dataset and z_stats.get("num_examples", 0) > 0:
-        # if requested, build random splits across ALL stages (recommended for "normal dynamics validation")
         if z_split_strategy in ("random", "random_by_user"):
             items = list(z_all_examples)
             rnd = random.Random(int(z_transition_split_seed))
@@ -2848,7 +2576,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 }
 
             def _assign_grouped_by_user(flat_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-                # Group key: (topic,event,user). This prevents leakage of the same core_user across splits.
                 groups: Dict[str, List[Dict[str, Any]]] = {}
                 for ex in flat_items:
                     key = f"{ex.get('topic','')}::{ex.get('event','')}::{ex.get('user','')}"
@@ -2856,7 +2583,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 keys = list(groups.keys())
                 rnd.shuffle(keys)
 
-                # target sizes in number of examples (approximate; exact ratio may not be possible due to grouping)
                 n0 = int(len(flat_items))
                 n_train0 = int(round(z_r_train * n0))
                 n_val0 = int(round(z_r_val * n0))
@@ -2867,7 +2593,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                 out = {"train": [], "validation": [], "test": []}
                 c_train = 0
                 c_val = 0
-                # assign by filling train then val then test
                 for k in keys:
                     g = groups[k]
                     if c_train < n_train0:
@@ -2895,7 +2620,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
                     f"(ratios={z_r_train:.3f},{z_r_val:.3f},{z_r_test:.3f}, seed={int(z_transition_split_seed)})"
                 )
 
-        # add split/stage distribution stats (helps detect OOD-by-stage)
         try:
             split_counts = {k: int(len(v)) for k, v in z_split_examples.items()}
             stage_counts_by_split: Dict[str, Dict[int, int]] = {}
@@ -2943,10 +2667,8 @@ def convert_hisim_macro_to_belief_hf_dataset(
             json.dump(label2id, f, ensure_ascii=False, indent=2)
         with open(os.path.join(z_out, "stats.json"), "w", encoding="utf-8") as f:
             json.dump(z_stats, f, ensure_ascii=False, indent=2)
-        # preview (z_transition dataset)
         _write_preview_jsonl(str(z_out), z_split_examples, tag="z_transition")
 
-    # === save action imitation dataset (optional; core users only) ===
     if export_action_imitation_dataset and a_stats.get("num_examples", 0) > 0:
         a_out = str(action_imitation_out_dir or "").strip()
         if not a_out:
@@ -2970,7 +2692,6 @@ def convert_hisim_macro_to_belief_hf_dataset(
             json.dump({"post": 0, "retweet": 1, "reply": 2, "like": 3, "do_nothing": 4}, f, ensure_ascii=False, indent=2)
         with open(os.path.join(a_out, "stats.json"), "w", encoding="utf-8") as f:
             json.dump(a_stats, f, ensure_ascii=False, indent=2)
-        # preview (action imitation dataset)
         _write_preview_jsonl(str(a_out), a_split_examples, tag="action_imitation")
 
     print("完成。")

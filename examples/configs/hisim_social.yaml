@@ -31,8 +31,8 @@ enable_llm_rollout: true
 llm_model_name: "gpt2"
 # 不要把 key 写进仓库：用环境变量或命令行 --api-key 覆盖
 together_api_key: "${TOGETHER_API_KEY}"
-coordinator_model: "gpt-4.1"
-executor_model: "gpt-4.1"
+coordinator_model: "gpt-3.5-turbo"
+executor_model: "gpt-3.5-turbo"
 commitment_embedding_model_name: "BAAI/bge-large-en-v1.5"
 
 # OpenAI-compatible JSON mode (if provider supports response_format); env 侧也有 JSON 修复，因此此项可选

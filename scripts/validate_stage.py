@@ -20,7 +20,6 @@ Stage3a（z transition）必须单独验证：
 - 防退化：z_pred entropy / maxprob / mean probs（避免退化成均值分布）
 
 用法示例：
-  # Stage1：用 Stage1 的 config + checkpoint + logdir 验证
   conda run -n HiSim python ECON/scripts/validate_stage1_s3a.py \\
     --mode stage1 \\
     --config /home/zhuyinzhou/MAS/ECON/examples/configs/hisim_belief_core_stable.yaml \\
@@ -29,7 +28,6 @@ Stage3a（z transition）必须单独验证：
     --eval_split test \\
     --eval_episodes 200
 
-  # Stage3a：用 Stage3a 的 config + checkpoint + logdir 验证（held-out split no_grad）
   conda run -n HiSim python ECON/scripts/validate_stage1_s3a.py \\
     --mode stage3a \\
     --config /home/zhuyinzhou/MAS/ECON/examples/configs/hisim_z_transition_dist_cond.yaml \\
@@ -38,7 +36,6 @@ Stage3a（z transition）必须单独验证：
     --eval_split test \\
     --eval_episodes 200
 
-  # Stage2：非核心用户 belief（K=3 stance）同 Stage1 的 boxed-id eval + majority baseline
   conda run -n HiSim python ECON/scripts/validate_stage1_s3a.py \\
     --mode stage2 \\
     --config /home/zhuyinzhou/MAS/ECON/examples/configs/hisim_belief_noncore_stage2.yaml \\
@@ -47,7 +44,6 @@ Stage3a（z transition）必须单独验证：
     --eval_split test \\
     --eval_episodes 200
 
-  # Stage3b：action imitation（K=5），并支持 masked supervision（例如只评估 post/retweet）
   conda run -n HiSim python ECON/scripts/validate_stage1_s3a.py \\
     --mode stage3b \\
     --config /home/zhuyinzhou/MAS/ECON/examples/configs/hisim_action_imitation_core.yaml \\
@@ -56,7 +52,6 @@ Stage3a（z transition）必须单独验证：
     --eval_split test \\
     --eval_episodes 200
 
-  # Stage4：online RL（hisim_social_env），跑若干 test episodes 打印 return/z_kl 等诊断（PASS/FAIL 以“可稳定跑完+指标有限”为主）
   conda run -n HiSim python ECON/scripts/validate_stage1_s3a.py \\
     --mode stage4 \\
     --config /home/zhuyinzhou/MAS/ECON/examples/configs/hisim_social_stage4_zreward.yaml \\
@@ -203,25 +198,21 @@ def _stage1_eval_confusion(cfg: Any, ckpt: str, eval_split: str, eval_episodes: 
     """
     通过 runner 在 eval split 上跑若干 episodes，基于 env_info 的 boxed-id 预测/GT 计算 acc 与 confusion matrix。
     """
-    # import project training harness
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
     from train import setup_experiment  # type: ignore
 
     cfg2 = copy.deepcopy(cfg)
-    # enforce eval split for this run
     try:
         if hasattr(cfg2, "env_args") and hasattr(cfg2.env_args, "dataset_split"):
             cfg2.env_args.dataset_split = str(eval_split)
     except Exception:
         pass
-    # load ckpt
     cfg2.load_model_path = str(ckpt)
     runner, _mac, _learner, logger, _device = setup_experiment(cfg2)
 
     k = int(getattr(getattr(cfg2, "env_args", None), "n_actions", 3))
     k = max(1, k)
     if k < 3:
-        # still build square confusion
         k = 3
     conf = [[0 for _ in range(k)] for _ in range(k)]
     correct = 0
@@ -332,8 +323,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
             cfg2.env_args.dataset_split = str(eval_split)
     except Exception:
         pass
-    # Make evaluation deterministic/stable: disable random sampling over the HF dataset split.
-    # This avoids noisy preference_BCE estimates due to different sampled subsets across runs.
     try:
         if hasattr(cfg2, "env_args") and hasattr(cfg2.env_args, "use_random_sampling"):
             cfg2.env_args.use_random_sampling = False
@@ -342,7 +331,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     cfg2.load_model_path = str(ckpt)
     runner, _mac, _learner, logger, _device = setup_experiment(cfg2)
 
-    # supervised ids for masked eval
     sup_ids = None
     try:
         only_ids = getattr(cfg2, "action_imitation_supervised_action_ids", None)
@@ -351,37 +339,30 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     except Exception:
         sup_ids = None
 
-    # Determine K
     try:
         k = int(getattr(getattr(cfg2, "env_args", None), "n_actions", getattr(cfg2, "n_actions", 5)))
     except Exception:
         k = 5
-    # Stage3b option: binary(0/1) imitation prior.
     try:
         if bool(getattr(cfg2, "train_action_imitation", False)) and bool(getattr(cfg2, "action_imitation_binary_01", False)):
             k = 2
     except Exception:
         pass
-    # Stage3b option: preference scorer (retweet vs post)
     try:
         s3b_preference_scorer = bool(getattr(cfg2, "s3b_preference_scorer", False))
     except Exception:
         s3b_preference_scorer = False
     k = max(1, k)
 
-    # confusion for masked rows only (size k x k)
     conf = [[0 for _ in range(k)] for _ in range(k)]
     total = 0
     correct = 0
     skipped_unsup = 0
-    # full marginal stats over ALL labels (including unsupervised ones)
     gt_counts_all = [0 for _ in range(k)]
     pred_counts_all = [0 for _ in range(k)]
     invalid_pred = 0
-    # preference scorer metrics
     pref_p1_targets = []
     pref_p1_preds = []
-    # debug counters for preference scorer
     dbg_pref = bool(getattr(cfg2, "debug_preference", False))
     dbg_pref_total_infos = 0
     dbg_pref_has_dist = 0
@@ -409,7 +390,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
                 pr = _boxed_int(info.get("answer", ""))
             if gt is None:
                 continue
-            # preference scorer: use target_distribution_prob if present
             try:
                 if s3b_preference_scorer and isinstance(info, dict):
                     dist = info.get("target_distribution_prob")
@@ -423,7 +403,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
                             if dbg_pref:
                                 dbg_pref_denom_pos += 1
                             p1_t = p1 / denom
-                            # predicted p1 from bias logit (if provided)
                             bl = info.get("pref_bias_logit", None)
                             if bl is not None:
                                 if dbg_pref:
@@ -471,7 +450,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
                             )
             except Exception:
                 pass
-            # full marginal counts (for collapse detection)
             try:
                 if 0 <= int(gt) < k:
                     gt_counts_all[int(gt)] += 1
@@ -488,12 +466,10 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
                 skipped_unsup += 1
                 continue
             if pr is None:
-                # count as incorrect (still increases total)
                 pr = -1
             if gt < 0 or gt >= k:
                 continue
             if pr < 0 or pr >= k:
-                # treat as invalid prediction; still count total
                 total += 1
                 continue
             conf[int(gt)][int(pr)] += 1
@@ -502,7 +478,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
                 correct += 1
 
     acc = float(correct) / float(total) if total > 0 else 0.0
-    # masked baseline
     maj = _majority_baseline_from_dataset_masked(cfg2, eval_split, only_ids=sup_ids)
     if maj is None:
         maj = 0.0
@@ -512,8 +487,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
     coverage = float(total) / denom if denom > 0 else 0.0
     skipped_ratio = float(skipped_unsup) / denom if denom > 0 else 0.0
 
-    # === Sanity metrics for collapse / marginals ===
-    # We compute marginal distributions over the whole eval split (including unsupervised labels).
     try:
         import numpy as np
 
@@ -526,7 +499,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         kl_pred_gt = _kl_np(pr_frac, gt_frac)
         mode_frac = float(np.max(pr / max(1.0, float(pr.sum())))) if float(pr.sum()) > 0 else 0.0
 
-        # In binary-01 mode (k=2), "unsup" fractions are not meaningful.
         unsup_pred_frac = float("nan")
         unsup_gt_frac = float("nan")
         if k > 2:
@@ -545,7 +517,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         unsup_pred_frac = float("nan")
         unsup_gt_frac = float("nan")
 
-    # preference scorer diagnostics (retweet vs post)
     pref_bce = float("nan")
     pref_bce_baseline = float("nan")
     pref_corr = float("nan")
@@ -558,7 +529,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
             eps = 1e-8
             p = np.clip(p, eps, 1.0 - eps)
             pref_bce = float(np.mean(-(t * np.log(p) + (1.0 - t) * np.log(1.0 - p))))
-            # baseline: constant mean(p1)
             m = float(np.mean(t))
             m = float(min(1.0 - eps, max(eps, m)))
             pref_bce_baseline = float(np.mean(-(t * np.log(m) + (1.0 - t) * np.log(1.0 - m))))
@@ -579,7 +549,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         "confusion": conf,
         "k": int(k),
         "sup_ids": sorted(list(sup_ids)) if isinstance(sup_ids, set) else None,
-        # collapse/marginal sanity
         "pred_counts_all": pred_counts_all,
         "gt_counts_all": gt_counts_all,
         "invalid_pred": int(invalid_pred),
@@ -597,7 +566,6 @@ def _stage3b_eval_action_imitation(cfg: Any, ckpt: str, eval_split: str, eval_ep
         "pref_bce_baseline": float(pref_bce_baseline),
         "pref_bce_margin": float(pref_margin),
         "pref_corr": float(pref_corr),
-        # debug: why pref_n is 0
         "debug_preference": bool(dbg_pref),
         "debug_pref_total_infos": int(dbg_pref_total_infos),
         "debug_pref_has_dist": int(dbg_pref_has_dist),
@@ -651,7 +619,6 @@ def _policy_stats_from_runner(runner: Any, batch: Any, *, k_override: Optional[i
             outs_np = outs.detach().float().cpu().numpy()
         else:
             outs_np = np.array(outs, dtype=np.float64)
-        # expect bs==1
         if outs_np.ndim == 3 and outs_np.shape[0] >= 1:
             logits = outs_np[0]  # (n_agents, n_actions)
         elif outs_np.ndim == 2:
@@ -691,7 +658,6 @@ def _stage3b_compare_z_ablations(cfg: Any, ckpt: str, eval_split: str, eval_epis
 
     modes = ["none", "zero", "shuffle"]
     out_by_mode: Dict[str, Any] = {}
-    # binary(0/1) prior: compare action distribution only over first 2 classes
     k_override = None
     try:
         if bool(getattr(cfg, "train_action_imitation", False)) and bool(getattr(cfg, "action_imitation_binary_01", False)):
@@ -735,7 +701,6 @@ def _stage3b_compare_z_ablations(cfg: Any, ckpt: str, eval_split: str, eval_epis
                 "entropy_mean": float(np.mean(ents)),
             }
 
-    # Compare KLs (with_z vs ablations)
     p0 = out_by_mode.get("none", {}).get("p_mean")
     if isinstance(p0, list) and len(p0) > 0:
         pz = np.array(p0, dtype=np.float64)
@@ -761,19 +726,16 @@ def _stage4_eval_online(cfg: Any, ckpt: str, eval_episodes: int) -> Dict[str, An
 
     cfg2 = copy.deepcopy(cfg)
     cfg2.load_model_path = str(ckpt)
-    # Eval policy mode: greedy (deterministic) vs stochastic (train-like exploration).
     try:
         pol = str(getattr(cfg2, "stage4_eval_policy", "greedy") or "greedy").strip().lower()
     except Exception:
         pol = "greedy"
     if pol in ("stochastic", "sample", "sampling", "trainlike", "train_like"):
-        # Keep config exploration knobs; ensure test_greedy is off so selector can sample.
         try:
             cfg2.test_greedy = False
         except Exception:
             pass
     else:
-        # Deterministic evaluation: disable exploration in action selector (if any)
         try:
             cfg2.test_greedy = True
             cfg2.epsilon_start = 0.0
@@ -798,9 +760,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
     z_kl_list: List[float] = []
     z_steps = 0
 
-    # Extra paper-facing diagnostics for Stage4
-    # - action histogram / entropy (micro-level sanity)
-    # - z trajectory early/late means (macro trend direction)
     action_counts = None  # np.ndarray (K,)
     action_steps = 0
     z_pred_traj: List[np.ndarray] = []
@@ -820,7 +779,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
 
     n_ep = max(1, int(eval_episodes))
     for _ in range(n_ep):
-        # Greedy eval uses test_mode=True; stochastic eval uses test_mode=False to keep exploration (temperature/epsilon).
         try:
             pol = str(getattr(cfg2, "stage4_eval_policy", "greedy") or "greedy").strip().lower()
         except Exception:
@@ -835,7 +793,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
             ep_ret = 0.0
         returns.append(ep_ret)
 
-        # action histogram from EpisodeBatch (best-effort)
         try:
             import torch
 
@@ -846,7 +803,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
             acts = batch["actions"]
             if isinstance(acts, torch.Tensor):
                 a = acts.detach().cpu()
-                # shapes: (bs,T,n_agents,1) or (bs,T,n_agents)
                 if a.ndim == 4 and a.shape[-1] == 1:
                     a = a[..., 0]
                 if a.ndim == 3:
@@ -877,7 +833,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
                     zt_arr = np.array(zt, dtype=np.float32)
                     zp_arr = np.array(zp, dtype=np.float32)
                     z_kl_list.append(_kl(zt_arr, zp_arr))
-                    # trajectory buffers (for early/late mean print)
                     z_pred_traj.append(_renorm(zp_arr))
                     z_gt_traj.append(_renorm(zt_arr))
                 except Exception:
@@ -887,7 +842,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
     ret_std = float(np.std(returns)) if returns else 0.0
     z_kl = float(np.mean(z_kl_list)) if z_kl_list else float("nan")
 
-    # action distribution diagnostics
     act_entropy = float("nan")
     act_mode_frac = float("nan")
     act_hist = None
@@ -903,7 +857,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
         act_mode_frac = float("nan")
         act_hist = None
 
-    # z trajectory summary (early vs late)
     z_pred_early = None
     z_pred_late = None
     z_gt_early = None
@@ -933,7 +886,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
     ok = True
     if not math.isfinite(ret_mean):
         ok = False
-    # If z_kl is present, require it finite.
     if z_steps > 0 and (not math.isfinite(z_kl)):
         ok = False
 
@@ -944,7 +896,6 @@ def _stage4_eval_online_runner(runner: Any, cfg2: Any, eval_episodes: int) -> Di
         "test_episodes": int(len(returns)),
         "z_kl": float(z_kl),
         "z_eval_steps": int(z_steps),
-        # paper-facing diagnostics
         "action_entropy": float(act_entropy),
         "action_mode_frac": float(act_mode_frac),
         "action_hist": act_hist,
@@ -968,7 +919,6 @@ def _stage4_eval_online_with_policy(cfg: Any, ckpt: str, eval_episodes: int, *, 
         policy_mode = "ckpt"
     policy_mode_norm = "random" if policy_mode == "random" else "ckpt"
 
-    # Setup runner once (loads ckpt into MAC/BeliefEncoder)
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
     from train import setup_experiment  # type: ignore
     import torch
@@ -987,18 +937,15 @@ def _stage4_eval_online_with_policy(cfg: Any, ckpt: str, eval_episodes: int, *, 
     if policy_mode_norm == "ckpt":
         return _stage4_eval_online_runner(runner, cfg2, int(eval_episodes))
 
-    # Random policy: patch mac.select_actions to sample uniformly from available actions
     mac = runner.mac
     orig = mac.select_actions
 
     def _rand_select_actions(ep_batch, t_ep: int, t_env: int, raw_observation_text=None, bs=slice(None), test_mode: bool = True):
         avail = ep_batch["avail_actions"][:, t_ep]  # (bs,n_agents,n_actions)
-        # avail is 0/1; sample uniform over avail
         probs = avail.float()
         probs = probs / torch.clamp(probs.sum(dim=-1, keepdim=True), min=1e-12)
         bs0, n_agents, n_act = probs.shape
         samp = torch.multinomial(probs.view(-1, n_act), 1).view(bs0, n_agents)
-        # keep info from original forward pass (for logging/secondary signals)
         try:
             _outs, info = mac.forward(ep_batch, t_ep, test_mode=True)
         except Exception:
@@ -1030,7 +977,6 @@ def _stage4_debug_alignment(cfg: Any, ckpt: str, *, max_steps: int = 15) -> None
 
     cfg2 = copy.deepcopy(cfg)
     cfg2.load_model_path = str(ckpt)
-    # deterministic for debugging
     try:
         cfg2.test_greedy = True
         cfg2.epsilon_start = 0.0
@@ -1046,7 +992,6 @@ def _stage4_debug_alignment(cfg: Any, ckpt: str, *, max_steps: int = 15) -> None
         print("[stage4_debug_alignment] No env infos captured.")
         return
 
-    # Best-effort: read stage_t and z_t inputs stored in EpisodeBatch
     zt = None
     st = None
     try:
@@ -1161,7 +1106,6 @@ def _stage4_debug_alignment(cfg: Any, ckpt: str, *, max_steps: int = 15) -> None
         else:
             sec_print = sec
         print(f"     secondary_z_next(src={sec_src})={sec_print}")
-        # Directly inspect env.core_posts at stage=info.t (should match action_hist semantics)
         try:
             env = getattr(runner, "env", None)
             cps = getattr(env, "core_posts", None)
@@ -1203,7 +1147,6 @@ def _stage4_compare_z_ablations(cfg: Any, ckpt: str, eval_episodes: int, *, shuf
         cfg2.z_shuffle_seed = int(shuffle_seed)
         res = _stage4_eval_online(cfg2, str(ckpt), int(eval_episodes))
         out[m] = res
-    # simple "slope" proxy: difference vs with-z
     try:
         rz = float(out.get("none", {}).get("test_return_mean", 0.0))
         out["delta_return_zero_minus_withz"] = float(out.get("zero", {}).get("test_return_mean", 0.0) - rz)
@@ -1267,7 +1210,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
     sum_alpha0_tgt = 0.0
     sum_dir_ent = 0.0
     sum_dir_varsum = 0.0
-    # fixed-stage probes help diagnose "stage embeddings for late stages are untrained/misaligned"
     fixed_stage_ids = list(getattr(cfg2, "stage3a_fixed_stages", [11, 12]) or [11, 12])
     fixed_stage_ids = [int(x) for x in fixed_stage_ids if str(x).strip() != ""]
     fixed_stage_sums: Dict[int, float] = {int(s): 0.0 for s in fixed_stage_ids}
@@ -1282,14 +1224,12 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
         batch = runner.run(test_mode=True)
         if batch is None:
             continue
-        # Stage3a: 必须有至少 2 个时间步，否则 [:, :-1] 会变空，eval 结果没有意义
         try:
             seq_len = int(batch["z_t"].shape[1])
         except Exception as e:
             raise RuntimeError(f"Stage3a eval: failed to read batch['z_t'].shape[1]: {e}")
         if seq_len < 2:
             raise AssertionError(f"Stage3a eval requires seq_len>=2, got seq_len={seq_len}. Check dataset episode length.")
-        # (bs, seq, K)
         z_t = batch["z_t"][:, :-1].to(device)
         z_target = batch["z_target"][:, :-1].to(device)
         z_mask = batch["z_mask"][:, :-1].to(device)  # (bs, seq, 1)
@@ -1304,7 +1244,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
         denom = float(zm.sum().item())
         if denom <= 0:
             continue
-        # optional per-sample alpha0_target inferred by env/dataset
         a0_tgt = None
         try:
             if "z_alpha0_target" in batch.scheme:
@@ -1334,7 +1273,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
                     sum_alpha0 += float((a0 * zm).sum().item())
                     if a0_tgt is not None:
                         sum_alpha0_tgt += float((a0_tgt.reshape(-1) * zm).sum().item())
-                    # Dirichlet uncertainty stats
                     try:
                         k_dir = int(alpha_pred.shape[-1])
                         ap = torch.clamp(alpha_pred, min=float(getattr(be, "dirichlet_alpha_min", 1e-6)))
@@ -1376,7 +1314,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
                 sum_p1 += float((zp[:, 1] * zm).sum().item())
                 sum_p2 += float((zp[:, 2] * zm).sum().item())
 
-            # per-stage buckets
             if stf is not None:
                 st1 = stf.reshape(-1).to(dtype=torch.long)
                 for s in torch.unique(st1).tolist():
@@ -1395,29 +1332,24 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
                     stage_sum_dz_pred[si] = float(stage_sum_dz_pred.get(si, 0.0) + float((dz_pred[sel] * m_s).sum().item()))
                     stage_sum_dz_tgt[si] = float(stage_sum_dz_tgt.get(si, 0.0) + float((dz_tgt[sel] * m_s).sum().item()))
 
-            # ablation: no-stage
             if stf is not None:
                 st0 = torch.zeros_like(stf)
                 zpred_nostage = be.predict_next_population_belief(zt, group_repr=grf, stage_t=st0, return_logits=False)
                 kl_nostage = _kl_tgt_pred(ztar, zpred_nostage)
                 sum_kl_nostage += float((kl_nostage * zm).sum().item())
 
-                # ablation: random-stage (shuffle stage_t across steps; preserves marginal distribution)
                 perm = torch.randperm(stf.shape[0], device=stf.device)
                 st_rand = stf[perm]
                 zpred_randstage = be.predict_next_population_belief(zt, group_repr=grf, stage_t=st_rand, return_logits=False)
                 kl_rand = _kl_tgt_pred(ztar, zpred_randstage)
                 sum_kl_randstage += float((kl_rand * zm).sum().item())
 
-                # ablation: shift-stage (use stage_t + 1, clamped to n_stages)
-                # Note: BeliefEncoder internally clamps to [0..n_stages]; we clamp here for clarity.
                 nst = int(getattr(be, "n_stages", 13))
                 st_shift = (stf.to(dtype=torch.long) + 1).clamp(min=0, max=nst).to(dtype=stf.dtype)
                 zpred_shiftstage = be.predict_next_population_belief(zt, group_repr=grf, stage_t=st_shift, return_logits=False)
                 kl_shift = _kl_tgt_pred(ztar, zpred_shiftstage)
                 sum_kl_shiftstage += float((kl_shift * zm).sum().item())
 
-                # probes: fixed-stage constants (e.g., stage 11/12)
                 if fixed_stage_ids:
                     for sid in fixed_stage_ids:
                         s_clamped = int(max(0, min(int(sid), int(nst))))
@@ -1430,7 +1362,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
                             fixed_stage_sums.get(int(sid), 0.0) + float((kl_fixed * zm).sum().item())
                         )
 
-            # sensitivity: no-group-repr
             if grf is not None:
                 gr0 = torch.zeros_like(grf)
                 zpred_nogr = be.predict_next_population_belief(zt, group_repr=gr0, stage_t=stf, return_logits=False)
@@ -1469,7 +1400,6 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
         if v > 0:
             out[f"eval_kl_target_zpred_fixedstage{s}"] = float(v / sum_mask)
     out["eval_mask_sum"] = float(sum_mask)
-    # per-stage buckets
     for s, m in stage_sum_mask.items():
         if m <= 0:
             continue
@@ -1480,12 +1410,10 @@ def _stage3a_eval_z_transition(cfg: Any, ckpt: str, eval_split: str, eval_episod
 
 
 def _find_metrics_jsonl(logdir: str) -> Optional[str]:
-    # common layout: <logdir>/<experiment_name>/metrics.jsonl OR <logdir>/metrics.jsonl
     if not logdir:
         return None
     cand = []
     cand.append(os.path.join(logdir, "metrics.jsonl"))
-    # scan one-level subdirs
     try:
         for name in os.listdir(logdir):
             p = os.path.join(logdir, name, "metrics.jsonl")
@@ -1579,18 +1507,14 @@ def _print_and_assert_stage_flags(cfg: Any, mode: str) -> None:
         print(f"- {k}: {flags[k]}")
 
     if mode == "stage1":
-        # Stage1 应该是 belief supervised（非 encoder-only / 非 imitation）
         if (not flags["train_belief_supervised"]) or flags["train_encoder_only"] or flags["train_action_imitation"]:
             raise AssertionError(
                 "Stage1 config sanity failed: expected train_belief_supervised=True AND "
                 "train_encoder_only=False AND train_action_imitation=False"
             )
-        # 强制 test_mode argmax（非 sampling）：依赖 MultinomialActionSelector(test_mode && test_greedy -> epsilon=0)
-        # 这里不强制 action_selector 名称，但会在运行前把 test_greedy/epsilon 置为确定性。
         return
 
     if mode == "stage2":
-        # Stage2 也是 belief supervised（noncore），同样不应该是 encoder-only / imitation
         if (not flags["train_belief_supervised"]) or flags["train_encoder_only"] or flags["train_action_imitation"]:
             raise AssertionError(
                 "Stage2 config sanity failed: expected train_belief_supervised=True AND "
@@ -1599,7 +1523,6 @@ def _print_and_assert_stage_flags(cfg: Any, mode: str) -> None:
         return
 
     if mode == "stage3b":
-        # Stage3b: belief_supervised mode + train_action_imitation
         if (not flags["train_belief_supervised"]) or flags["train_encoder_only"] or (not flags["train_action_imitation"]):
             raise AssertionError(
                 "Stage3b config sanity failed: expected train_belief_supervised=True AND "
@@ -1608,16 +1531,13 @@ def _print_and_assert_stage_flags(cfg: Any, mode: str) -> None:
         return
 
     if mode == "stage4":
-        # Stage4: neither supervised nor encoder-only by default (online RL)
         if flags["train_belief_supervised"] or flags["train_encoder_only"]:
             raise AssertionError(
                 "Stage4 config sanity failed: expected train_belief_supervised=False AND train_encoder_only=False"
             )
         return
 
-    # stage3a
     if mode == "stage3a":
-        # Stage3a 必须是 encoder-only 且有 z_transition loss
         if (not flags["train_encoder_only"]) or flags["train_belief_supervised"] or flags["train_action_imitation"]:
             raise AssertionError(
                 "Stage3a config sanity failed: expected train_encoder_only=True AND "
@@ -1625,7 +1545,6 @@ def _print_and_assert_stage_flags(cfg: Any, mode: str) -> None:
             )
         if flags["z_transition_loss_weight"] <= 0:
             raise AssertionError("Stage3a config sanity failed: z_transition_loss_weight must be > 0")
-        # 强烈建议：只训练 update head；这里不强制，但打印出来帮助发现不一致
         return
 
 
@@ -1662,7 +1581,6 @@ def main() -> int:
              "For stage3b prints action distribution entropy/KL; for stage4 prints early return deltas.",
     )
     ap.add_argument("--z_shuffle_seed", type=int, default=0, help="Seed for z_t shuffle ablation (diagnostic only).")
-    # Stage4: frozen vs trained comparisons (paper-facing)
     ap.add_argument("--stage4_ref_ckpt", type=str, default="", help="Stage4: reference ckpt for frozen/init baseline (optional).")
     ap.add_argument(
         "--stage4_ref_policy",
@@ -1707,33 +1625,27 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    # load config using src/train.py loader (supports SimpleNamespace)
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
     from train import load_config  # type: ignore
 
     cfg = load_config(str(args.config))
-    # Best-effort set eval seed (env / numpy / torch handled inside project setup)
     try:
         if hasattr(cfg, "system") and hasattr(cfg.system, "seed"):
             cfg.system.seed = int(args.seed)
     except Exception:
         pass
-    # Stage4: trajectory averaging window
     try:
         cfg.stage4_z_traj_k = int(args.stage4_z_traj_k)
     except Exception:
         pass
-    # Stage4: eval policy mode (greedy vs stochastic)
     try:
         cfg.stage4_eval_policy = str(getattr(args, "stage4_eval_policy", "greedy") or "greedy").strip().lower()
     except Exception:
         cfg.stage4_eval_policy = "greedy"
-    # pass debug flags through cfg (used by stage3b eval)
     try:
         cfg.debug_preference = bool(getattr(args, "debug_preference", False))
     except Exception:
         pass
-    # Stage3a diagnostic probe stages (passed via cfg for simplicity)
     try:
         fixed = [int(x) for x in str(args.stage3a_fixed_stages).split(",") if str(x).strip() != ""]
     except Exception:
@@ -1741,7 +1653,6 @@ def main() -> int:
     cfg.stage3a_fixed_stages = fixed
     _print_and_assert_stage_flags(cfg, str(args.mode))
 
-    # --- trend checks from logs (best-effort) ---
     if args.logdir:
         mp = _find_metrics_jsonl(str(args.logdir))
         if mp:
@@ -1761,13 +1672,10 @@ def main() -> int:
             print(f"[WARN] 未找到 metrics.jsonl 于 logdir={args.logdir}（趋势检查跳过）")
 
     if args.mode == "stage1":
-        # --- 强制 test_mode 使用 argmax（非 sampling） ---
-        # 1) 固定 action selector 相关随机性（MultinomialActionSelector 在 test_mode && test_greedy 下会 epsilon=0 -> 纯 argmax）
         cfg.test_greedy = True
         cfg.epsilon_start = 0.0
         cfg.epsilon_finish = 0.0
         cfg.epsilon_anneal_time = 1
-        # 2) 明确 action_selector（避免 config 里被改成其它采样器）
         cfg.action_selector = str(getattr(cfg, "action_selector", "multinomial") or "multinomial")
         if str(cfg.action_selector).strip().lower() != "multinomial":
             raise AssertionError(f"Stage1: for deterministic argmax, require action_selector=multinomial, got {cfg.action_selector}")
@@ -1787,7 +1695,6 @@ def main() -> int:
         for row in res.confusion[:3]:
             print("  " + " ".join([f"{int(x):6d}" for x in row[:3]]))
 
-        # pass/fail gate
         ok = True
         if res.eval_acc < (res.majority_baseline + float(args.min_margin)):
             ok = False
@@ -1829,11 +1736,8 @@ def main() -> int:
         return 0 if ok else 2
 
     if args.mode == "stage3b":
-        # For validation, default to deterministic boxed action selection to avoid sampling noise.
-        # You can opt-in to sampling via --stage3b_eval_sampling.
         try:
             if bool(getattr(args, "stage3b_eval_sampling", False)):
-                # keep config as-is (sampling)
                 pass
             else:
                 cfg.s3b_boxed_action_selection = "argmax"
@@ -1900,7 +1804,6 @@ def main() -> int:
         print(f"- n_skipped_unsup: {out['n_skipped_unsup']}")
         print(f"- coverage: {out['coverage']:.4f}")
         print(f"- skipped_ratio: {out['skipped_ratio']:.4f}")
-        # Collapse sanity (marginal distribution over ALL labels, including unsupervised)
         try:
             if out.get("pred_entropy") == out.get("pred_entropy"):
                 print(f"- pred_entropy(all labels): {float(out.get('pred_entropy',0.0)):.6f}")
@@ -1923,13 +1826,11 @@ def main() -> int:
             print("  " + " ".join([f"{int(x):6d}" for x in row[: min(k, 5)]]))
 
         ok = True
-        # Gate depends on whether S3b is a classifier or preference scorer.
         if bool(out.get("s3b_preference_scorer", False)):
             if float(out.get("pref_n", 0)) <= 0:
                 ok = False
                 print("\n[FAIL] Stage3b: preference eval has zero valid samples (missing target_distribution_prob?).")
             else:
-                # prefer lower BCE than baseline by a margin
                 try:
                     bce = float(out.get("pref_bce", float("nan")))
                     bce_base = float(out.get("pref_bce_baseline", float("nan")))
@@ -1947,7 +1848,6 @@ def main() -> int:
                     ok = False
                     print("\n[FAIL] Stage3b: preference BCE evaluation error.")
         else:
-            # Minimal gate: masked acc should beat masked majority + margin, and coverage should not be 0.
             if float(out["n_masked"]) <= 0:
                 ok = False
                 print("\n[FAIL] Stage3b: masked eval has zero labeled samples. Check supervised ids / dataset.")
@@ -1959,8 +1859,6 @@ def main() -> int:
         return 0 if ok else 4
 
     if args.mode == "stage4":
-        # Stage4 online sanity: must at least have agent; belief_encoder is strongly recommended when using z dynamics.
-        # We don't hard-require belief_encoder.th because some ablations might not save it, but we warn if missing.
         _ckpt_must_have(str(args.ckpt), ["agent.th"])
         if not os.path.exists(os.path.join(str(args.ckpt), "belief_encoder.th")):
             print("[WARN] Stage4 ckpt missing belief_encoder.th (z-dynamics / secondary sim may not work as intended).")
@@ -1981,7 +1879,6 @@ def main() -> int:
             if "delta_return_shuffle_minus_withz" in outz:
                 print(f"- Δreturn(z=shuffle - with_z): {float(outz['delta_return_shuffle_minus_withz']):+.6f}")
 
-        # Main eval (trained ckpt)
         out = _stage4_eval_online_with_policy(cfg, str(args.ckpt), int(args.eval_episodes), policy_mode="ckpt")
 
         def _print_stage4_block(title: str, r: Dict[str, Any]) -> None:
@@ -1999,7 +1896,6 @@ def main() -> int:
                     print("- z_kl: nan")
             except Exception:
                 print("- z_kl: nan")
-            # micro-level action sanity
             try:
                 ae = r.get("action_entropy", float("nan"))
                 am = r.get("action_mode_frac", float("nan"))
@@ -2012,7 +1908,6 @@ def main() -> int:
                     print(f"- action_hist(counts): {ah}")
             except Exception:
                 pass
-            # z trajectory directionality
             try:
                 z0 = r.get("z_pred_mean_early", None)
                 z1 = r.get("z_pred_mean_late", None)
@@ -2027,14 +1922,12 @@ def main() -> int:
             except Exception:
                 pass
 
-        # Optional: reference baseline (frozen/init or random policy)
         ref_ckpt = str(getattr(args, "stage4_ref_ckpt", "") or "").strip()
         if ref_ckpt:
             ref_mode = str(getattr(args, "stage4_ref_policy", "ckpt") or "ckpt").strip().lower()
             ref_out = _stage4_eval_online_with_policy(cfg, ref_ckpt, int(args.eval_episodes), policy_mode=ref_mode)
             _print_stage4_block(f"REF({ref_mode}) ckpt={ref_ckpt}", ref_out)
             _print_stage4_block(f"TRAINED ckpt={args.ckpt}", out)
-            # Key deltas (paper: show there is a gap)
             try:
                 d_ret = float(out.get("test_return_mean", 0.0)) - float(ref_out.get("test_return_mean", 0.0))
                 d_kl = float(ref_out.get("z_kl", float("nan"))) - float(out.get("z_kl", float("nan")))
@@ -2054,8 +1947,6 @@ def main() -> int:
         print("\n[FAIL] Stage4: unstable run or non-finite metrics. Check env config / ckpt / reward settings.")
         return 5
 
-    # stage3a
-    # --- dataset stage distribution sanity (detect OOD-by-stage split) ---
     stage_cnts = _stage_counts_from_hf(cfg)
     if stage_cnts:
         print("\n=== Stage3a dataset stage_t distribution (from HF) ===")
@@ -2086,7 +1977,6 @@ def main() -> int:
         "eval_z_pred_maxprob",
         "eval_z_pred_minus_z_t_l2",
         "eval_z_target_minus_z_t_l2",
-        # Dirichlet-specific (may be absent if loss_type is not dirichlet_* or ckpt doesn't support it)
         "eval_z_target_alpha0_mean",
         "eval_z_pred_alpha0_mean",
         "eval_z_pred_dirichlet_entropy",
@@ -2099,11 +1989,9 @@ def main() -> int:
     ):
         if k in out:
             print(f"- {k}: {out[k]:.6f}")
-    # print fixed-stage probes (if present)
     fixed_keys = sorted([k for k in out.keys() if k.startswith("eval_kl_target_zpred_fixedstage")])
     for k in fixed_keys:
         print(f"- {k}: {out[k]:.6f}")
-    # a few stage buckets (print only those present)
     stages = sorted({int(k.split("stage")[-1]) for k in out.keys() if k.startswith("eval_z_pred_delta_l2_stage")})
     if stages:
         print("\nPer-stage z_delta (masked mean L2):")
@@ -2112,10 +2000,8 @@ def main() -> int:
             kt = f"eval_z_target_delta_l2_stage{s}"
             print(f"  stage{s}: pred={out.get(kp, 0.0):.6f} | target={out.get(kt, 0.0):.6f}")
 
-    # pass/fail heuristic (经验): model KL 应 <= identity baseline KL，且不爆炸；entropy 不应逼近 ln(3) 且 maxprob 不应 ~1/3
     ok = True
     if out.get("eval_kl_target_zpred", 1e9) > (out.get("eval_kl_target_zt", 0.0) + 1e-6):
-        # model worse than identity baseline
         ok = False
         print("\n[FAIL] Stage3a: KL(z_target||z_pred) > KL(z_target||z_t)（模型比 identity baseline 更差）。Stage4 很可能不稳。")
     else:

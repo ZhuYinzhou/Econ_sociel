@@ -29,7 +29,6 @@ def _print_step_info(sample):
         return
     keys = sorted(list(sample.keys()))
     print("keys:", keys[:50])
-    # Show a few common fields if present
     for k in (
         "ground_truth_answer",
         "ground_truth",
@@ -80,7 +79,6 @@ def main():
 
     cfg = load_config(str(args.config))
 
-    # Force safe settings for API validation
     cfg.enable_llm_rollout = False
     if not hasattr(cfg, "env_action_source"):
         cfg.env_action_source = "sync_stage_policy"

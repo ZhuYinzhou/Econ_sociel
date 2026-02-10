@@ -50,24 +50,14 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # 自注意力层
-        # IMPORTANT:
-        # - For padding masks, MultiheadAttention expects key_padding_mask with shape (bs, seq_len) (True=ignore)
-        # - attn_mask is for causal / pairwise masking with shape (seq_len, seq_len)
         attn_mask = None
         key_padding_mask = None
         if mask is not None:
             if isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.shape[0] == x.shape[0]:
-                # This is a padding mask (bs, seq_len)
                 key_padding_mask = mask
             elif isinstance(mask, torch.Tensor) and mask.ndim == 2 and mask.shape[0] == mask.shape[1]:
-                # This is an attention mask (seq_len, seq_len)
                 attn_mask = mask
 
-        # Memory note:
-        # MultiheadAttention defaults to need_weights=True, which returns (and may materialize) attention weights
-        # of shape (bs, num_heads, seq_len, seq_len). For long seq_len (e.g., 1024) and large effective batch
-        # (bs*n_agents), this can easily OOM. We do NOT need attention weights here, so disable them.
         attended, _ = self.attention(
             x,
             x,
@@ -77,13 +67,10 @@ class TransformerBlock(nn.Module):
             need_weights=False,
         )
         
-        # 残差连接和层归一化
         attended = self.norm1(x + attended)
         
-        # 前馈网络
         ff_output = self.feed_forward(attended)
         
-        # 残差连接和层归一化
         output = self.norm2(attended + ff_output)
         
         return output
@@ -100,7 +87,6 @@ class BeliefNetwork(nn.Module):
                  vocab_size: int = 50257):  # 添加词汇表大小参数，GPT2的默认值
         super(BeliefNetwork, self).__init__()
         
-        # 保存参数
         self.observation_dim = observation_dim  # 这是max_token_length
         self.belief_dim = belief_dim
         self.T_min = T_min
@@ -108,13 +94,10 @@ class BeliefNetwork(nn.Module):
         self.p_min = p_min
         self.p_max = p_max
         
-        # Token嵌入层：将token IDs转换为dense vectors
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         
-        # 位置编码
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
         
-        # Transformer 层
         self.transformer_layers = nn.ModuleList([
             TransformerBlock(
                 embed_dim=hidden_dim,
@@ -124,7 +107,6 @@ class BeliefNetwork(nn.Module):
             ) for _ in range(n_layers)
         ])
         
-        # 输出映射层（从 hidden_dim 到 belief_dim）
         self.belief_projection = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), # Added a layer for more capacity
             nn.LayerNorm(hidden_dim),
@@ -132,12 +114,9 @@ class BeliefNetwork(nn.Module):
             nn.Linear(hidden_dim, belief_dim)
         )
         
-        # Prompt embedding 参数生成网络 (对应 W_T, b_T, W_p, b_p)
-        # 为 T 和 p 分别创建线性层，更接近论文公式
         self.temp_projection = nn.Linear(belief_dim, 1) # W_T b_i + b_T
         self.penalty_projection = nn.Linear(belief_dim, 1) # W_p b_i + b_p
         
-        # Q 值预测网络 (参数 φ_i)
         self.q_network = nn.Sequential(
             nn.Linear(belief_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -157,41 +136,28 @@ class BeliefNetwork(nn.Module):
         Returns:
             包含置信状态 b_i、缩放后的提示嵌入 e_i = [T_i, p_i] 和局部 Q值 Q_i^t 的字典。
         """
-        # 确保token_ids是正确的形状
         if token_ids.ndim == 1:
             token_ids = token_ids.unsqueeze(0)  # (seq_len,) -> (1, seq_len)
         if token_ids.ndim == 3:
             token_ids = token_ids.squeeze(1)    # (batch, 1, seq_len) -> (batch, seq_len)
         
-        # Token嵌入
         x = self.token_embedding(token_ids.long())  # (batch_size, seq_len, hidden_dim)
         
-        # 位置编码
         x = self.pos_encoder(x) # x is (batch, seq_len, hidden_dim)
         
-        # 应用 Transformer 层
         for layer in self.transformer_layers:
             x = layer(x, mask) # x is (batch, seq_len, hidden_dim)
         
-        # 序列池化：取最后一个有效token的输出作为序列的总结
-        # 这里我们简单地取最后一个时间步的输出
         if mask is not None:
-            # 如果有mask，找到每个序列中最后一个有效token
-            # mask为True表示需要忽略的位置
             valid_lengths = (~mask).sum(dim=1)  # 每个序列的有效长度
             batch_indices = torch.arange(x.size(0), device=x.device)
             last_valid_indices = (valid_lengths - 1).clamp(min=0)
             processed_sequence = x[batch_indices, last_valid_indices]  # (batch, hidden_dim)
         else:
-            # 没有mask，直接取最后一个位置
             processed_sequence = x[:, -1]  # (batch, hidden_dim)
             
-        # 生成置信状态 b_i
         belief_state = self.belief_projection(processed_sequence) # (batch, belief_dim)
         
-        # 生成 prompt embedding e_i = [T_i, p_i]
-        # T_i = T_min + (T_max - T_min) * σ(W_T b_i + b_T)
-        # p_i = p_min + (p_max - p_min) * σ(W_p b_i + b_p)
         
         temp_logit = self.temp_projection(belief_state) # (batch, 1)
         penalty_logit = self.penalty_projection(belief_state) # (batch, 1)
@@ -199,10 +165,8 @@ class BeliefNetwork(nn.Module):
         temperature = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(temp_logit)
         penalty = self.p_min + (self.p_max - self.p_min) * torch.sigmoid(penalty_logit)
         
-        # prompt_embedding_scaled 形状: (batch_size, 2)
         prompt_embedding_scaled = torch.cat([temperature, penalty], dim=1)
         
-        # 生成 Q 值 Q_i^t
         q_value = self.q_network(belief_state) # (batch, 1)
         
         return {
@@ -220,22 +184,16 @@ class LLMTransformerAgent(nn.Module):
     def __init__(self, input_shape: int, args: Any): # input_shape 现在代表 observation_dim + action_dim 或仅 observation_dim
         super(LLMTransformerAgent, self).__init__()
         
-        # 参数设置
         self.args = args
-        # self.input_shape = input_shape # 改为直接使用 args 中的维度或推断
         self.belief_dim = args.belief_dim
-        # 正确访问use_cuda属性
         use_cuda = hasattr(args, 'system') and hasattr(args.system, 'use_cuda') and args.system.use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
         
-        # 温度和 top_p 范围 (从 args 或 BeliefNetwork 的默认值获取)
-        # NOTE: 旧/精简配置可能没有 sampling 节点；这里提供向后兼容默认值
         sampling_cfg = getattr(args, "sampling", None)
         if sampling_cfg is None:
             try:
                 from types import SimpleNamespace
                 sampling_cfg = SimpleNamespace()
-                # 尽量写回 args，方便其他模块统一读取
                 setattr(args, "sampling", sampling_cfg)
             except Exception:
                 sampling_cfg = None
@@ -245,9 +203,6 @@ class LLMTransformerAgent(nn.Module):
         self.p_min = getattr(sampling_cfg, 'p_min', 0.1) if sampling_cfg is not None else 0.1
         self.p_max = getattr(sampling_cfg, 'p_max', 0.9) if sampling_cfg is not None else 0.9
         
-        # 初始化个体置信网络
-        # 输入应该是tokenized观察的长度，而不是state_shape
-        # 从配置中获取观察的最大token长度
         max_token_len = getattr(args.env_args, "max_question_length", 512)
         belief_network_input_dim = max_token_len  # 使用tokenized观察的长度
 
@@ -264,11 +219,6 @@ class LLMTransformerAgent(nn.Module):
             vocab_size=getattr(args, 'vocab_size', 50257)  # 添加词汇表大小
         )
         
-        # 输出层（生成动作概率） - 这部分可能需要重新审视
-        # NOTE (重要): 为避免 Stage1(stance=3) 与 Stage4(action_type=5) 的 head 语义冲突，
-        # 这里拆分两个离散 head：
-        # - stance_head: K=3 (Neutral/Oppose/Support)，用于 Stage1/2 离线 stance 监督
-        # - action_type_head: A=5 (post/retweet/reply/like/do_nothing)，用于 Stage4 社交仿真离散动作选择（如使用）
         self.stance_n_actions = int(getattr(args, "stance_n_actions", 3))
         self.stance_n_actions = max(1, self.stance_n_actions)
         self.action_type_n_actions = int(getattr(args, "action_type_n_actions", getattr(args, "n_actions", 5)))
@@ -276,12 +226,8 @@ class LLMTransformerAgent(nn.Module):
 
         self.stance_head = nn.Linear(self.belief_dim, self.stance_n_actions)
         self.action_type_head = nn.Linear(self.belief_dim, self.action_type_n_actions)
-        # Backward-compat alias: old checkpoints used "output_network" for discrete-action logits
-        # We keep an alias so state_dict keys can be loaded with strict=False.
         self.output_network = self.action_type_head
 
-        # ===== Optional: S3b prior head for S4 bias injection =====
-        # We keep a frozen copy of action_type_head to serve as a "preference scorer" prior.
         self.s3b_bias_enabled = bool(getattr(args, "s3b_bias_enabled", False))
         self.s3b_bias_mode = str(getattr(args, "s3b_bias_mode", "diff01") or "diff01").strip().lower()
         self.s3b_bias_alpha = float(getattr(args, "s3b_bias_alpha", 1.0))
@@ -292,24 +238,18 @@ class LLMTransformerAgent(nn.Module):
         self.s3b_prior_head = None
         if self.s3b_bias_enabled:
             self.s3b_prior_head = nn.Linear(self.belief_dim, self.action_type_n_actions)
-            # Freeze prior head by default; we only use it as a fixed bias source.
             for p in self.s3b_prior_head.parameters():
                 p.requires_grad = False
             if self.s3b_bias_alpha_trainable:
-                # Parameterize alpha = exp(beta) to guarantee alpha >= 0
                 alpha0 = float(max(self.s3b_bias_alpha, 1e-6))
                 self.s3b_bias_alpha_param = nn.Parameter(torch.tensor(float(np.log(alpha0))))
             else:
                 self.s3b_bias_alpha_param = None
-        # cached stats for logging
         self.last_s3b_bias_alpha = float("nan")
         self.last_s3b_bias_logit_mean = float("nan")
         self.last_s3b_bias_logit_std = float("nan")
         self.last_s3b_bias_applied_frac = float("nan")
 
-        # ===== Optional: condition action logits on population belief z_t (from Stage3a) =====
-        # Motivation: for S3b we want "policy imitation conditioned on secondary-population state",
-        # not a pure action clone from text alone.
         self.use_population_belief_in_action_head = bool(getattr(args, "use_population_belief_in_action_head", False))
         try:
             self.population_belief_dim = int(
@@ -321,25 +261,20 @@ class LLMTransformerAgent(nn.Module):
         self.population_belief_proj = None
         self.population_belief_gate_logit = None
         if self.use_population_belief_in_action_head:
-            # project z_t -> belief_dim, then fuse via gated residual addition
             self.population_belief_proj = nn.Sequential(
                 nn.Linear(self.population_belief_dim, self.belief_dim),
                 nn.Tanh(),
             )
-            # gate in (0,1); initialize near 0 so existing behavior isn't destroyed
             self.population_belief_gate_logit = nn.Parameter(torch.tensor(-2.0, device=self.device))
         
-        # 初始化 LLM 包装器
         self.llm_wrapper = ImprovedLLMWrapper(
             api_key=args.together_api_key,
             model_name=args.executor_model,
             belief_dim=self.belief_dim # LLM Wrapper 可能也需要信念状态
         )
         
-        # 缓存最新的提示嵌入
         self.current_prompt_embedding_tensor = torch.tensor([ (self.T_min + self.T_max) / 2, (self.p_min + self.p_max) / 2 ], device=self.device) # (2,)
         
-        # 初始化提示嵌入字典（用于日志和调试）
         self.current_prompt_embedding = {
             'temperature': (self.T_min + self.T_max) / 2,
             'repetition_penalty': (self.p_min + self.p_max) / 2
@@ -350,12 +285,9 @@ class LLMTransformerAgent(nn.Module):
         inputs: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         test_mode: bool = False,
-        # 兼容旧签名：hidden_state 不再使用，统一返回 None
         hidden_state: Optional[torch.Tensor] = None,
-        # 社交媒体任务：允许外部覆盖采样参数（温度/重复惩罚）
         temperature: Optional[Any] = None,
         repetition_penalty: Optional[Any] = None,
-        # Optional conditioning signals (aligned to bs*n_agents rows)
         population_belief: Optional[torch.Tensor] = None,
         stage_t: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
@@ -373,11 +305,6 @@ class LLMTransformerAgent(nn.Module):
         Returns:
             (outputs_dict, hidden_state=None)
         """
-        # 通过置信网络获取置信状态, prompt embedding e_i, 和局部 Q值 Q_i^t
-        # 'inputs' 参数现在被理解为 local_history_obs
-        # Stage4 memory optimization:
-        # If belief_network is frozen in RL, do NOT build an autograd graph for it.
-        # This keeps gradients flowing to action heads while avoiding huge attention activations.
         freeze_bn_rl = bool(getattr(self.args, "freeze_belief_network_in_rl", False))
         use_no_grad_bn = bool(self.training) and (not bool(test_mode)) and freeze_bn_rl
         if use_no_grad_bn:
@@ -392,8 +319,6 @@ class LLMTransformerAgent(nn.Module):
         temp_logit = belief_outputs['temp_logit'] # 原始温度 logit
         penalty_logit = belief_outputs['penalty_logit'] # 原始惩罚 logit
 
-        # Optional: fuse population belief z_t into belief_state before discrete heads
-        # Note: BasicMAC will pass population_belief expanded to (bs*n_agents, K).
         if self.use_population_belief_in_action_head and (self.population_belief_proj is not None) and (population_belief is not None):
             try:
                 z = population_belief
@@ -406,12 +331,6 @@ class LLMTransformerAgent(nn.Module):
                     if z.ndim == 2 and z.shape[1] != int(self.population_belief_dim):
                         z = z.reshape(z.shape[0], int(self.population_belief_dim))
                     if z.ndim == 2 and belief_state.ndim == 2 and z.shape[0] == belief_state.shape[0]:
-                        # === Anti-shortcut regularization (S3b) ===
-                        # Keep z_t as an input feature, but prevent the policy from relying on it as a shortcut.
-                        # During TRAINING only, we randomly:
-                        # - drop z rows to 0 (input dropout)
-                        # - or shuffle z rows within the batch (break correlation)
-                        # This forces the head to also use non-z features, while still allowing z to help when present.
                         try:
                             if bool(self.training) and (not bool(test_mode)):
                                 p_drop = float(getattr(self.args, "s3b_z_drop_prob", 0.0))
@@ -433,8 +352,6 @@ class LLMTransformerAgent(nn.Module):
             except Exception:
                 pass
         
-        # 覆盖采样参数：temperature / repetition_penalty
-        # 优先级：显式 override > test_mode 固定值 > 网络输出
         bs = int(belief_state.shape[0]) if isinstance(belief_state, torch.Tensor) else 1
 
         def _coerce_param(v: Any, *, default_val: float, lo: float, hi: float) -> torch.Tensor:
@@ -449,7 +366,6 @@ class LLMTransformerAgent(nn.Module):
                 elif t.ndim == 2 and t.shape[1] == 1:
                     pass
                 else:
-                    # 尝试 squeeze 到 (bs,1)
                     t = t.reshape(bs, 1)
             else:
                 t = torch.full((bs, 1), float(v), device=self.device, dtype=belief_state.dtype)
@@ -470,12 +386,10 @@ class LLMTransformerAgent(nn.Module):
             )
             prompt_embedding = torch.cat([temp_t, pen_t], dim=1)  # (bs,2)
         elif test_mode:
-            # 测试模式默认用中值（与先前行为一致）
             temp_t = torch.full((bs, 1), float((self.T_min + self.T_max) / 2), device=self.device, dtype=belief_state.dtype)
             pen_t = torch.full((bs, 1), float((self.p_min + self.p_max) / 2), device=self.device, dtype=belief_state.dtype)
             prompt_embedding = torch.cat([temp_t, pen_t], dim=1)
 
-        # 更新缓存的提示嵌入 (张量形式)：使用当前 forward 实际采用的 prompt_embedding
         if prompt_embedding is not None and isinstance(prompt_embedding, torch.Tensor) and prompt_embedding.numel() >= 2:
             try:
                 self.current_prompt_embedding_tensor = prompt_embedding[0].detach().clone()
@@ -483,27 +397,16 @@ class LLMTransformerAgent(nn.Module):
                 pass
 
 
-        # ECON 中的动作是 prompt_embedding e_i
-        # output_network 的作用需要根据具体场景确定。
-        # 如果是用于从 belief_state 派生其他类型的动作（例如离散动作选择），则保留。
-        # 如果ECON框架中的动作 *仅仅* 是 e_i，那么 action_q_values 可能不直接用于最终动作选择，
-        # 或者 Q_i^t 本身就是针对 e_i 的价值评估。
-        # Discrete logits (two heads):
-        # - stance_action_q_values: shape (bs, 3)
-        # - action_type_q_values: shape (bs, 5)
         stance_action_q_values = self.stance_head(belief_state)
         action_type_q_values = self.action_type_head(belief_state)
 
-        # Optional: inject S3b prior bias into action_type logits (S4 only).
         try:
             if self.s3b_bias_enabled and (not bool(getattr(self.args, "train_action_imitation", False))):
                 if isinstance(self.s3b_prior_head, nn.Module):
                     with torch.no_grad():
                         prior_logits = self.s3b_prior_head(belief_state)
-                    # Default bias: retweet(1) vs post(0)
                     if prior_logits.shape[-1] >= 2:
                         bias = (prior_logits[:, 1] - prior_logits[:, 0]).view(-1)
-                        # Optional gate: only inject when stance head is confident enough
                         apply_mask = torch.ones_like(bias, dtype=torch.float32)
                         if self.s3b_bias_gate_by_stance and isinstance(stance_action_q_values, torch.Tensor):
                             try:
@@ -512,20 +415,16 @@ class LLMTransformerAgent(nn.Module):
                                 apply_mask = (maxp >= float(self.s3b_bias_stance_min_conf)).float()
                             except Exception:
                                 apply_mask = torch.ones_like(bias, dtype=torch.float32)
-                        # alpha >= 0 via exp(beta)
                         if self.s3b_bias_alpha_trainable and isinstance(self.s3b_bias_alpha_param, torch.Tensor):
                             alpha_val = torch.exp(self.s3b_bias_alpha_param)
                         else:
                             alpha_val = torch.tensor(float(max(self.s3b_bias_alpha, 0.0)), device=bias.device)
-                        # optional upper bound for stability
                         if float(self.s3b_bias_alpha_max) > 0:
                             alpha_val = torch.clamp(alpha_val, max=float(self.s3b_bias_alpha_max))
-                        # Apply bias: retweet += alpha*bias, post -= alpha*bias (masked)
                         action_type_q_values = action_type_q_values.clone()
                         adj = alpha_val * bias * apply_mask
                         action_type_q_values[:, 1] = action_type_q_values[:, 1] + adj
                         action_type_q_values[:, 0] = action_type_q_values[:, 0] - adj
-                        # cache stats for logging
                         try:
                             self.last_s3b_bias_alpha = float(alpha_val.detach().item())
                             if bool(apply_mask.any().item()):
@@ -543,8 +442,6 @@ class LLMTransformerAgent(nn.Module):
             pass
         
         outputs = {
-            # Backward-compat key: keep "action_q_values" pointing to action_type head by default.
-            # BasicMAC will choose the correct head based on env avail_actions (3 vs 5).
             "action_q_values": action_type_q_values,
             "stance_action_q_values": stance_action_q_values,
             "action_type_q_values": action_type_q_values,
@@ -554,7 +451,6 @@ class LLMTransformerAgent(nn.Module):
             "raw_prompt_embed_params": torch.cat([temp_logit, penalty_logit], dim=1) # 保存原始 logits, 用于可能的后续分析或损失计算
         }
         
-        # 统一 hidden_state 返回为 None（Transformer 不需要 recurrent hidden）
         return outputs, None
     
     def generate_answer(
@@ -581,23 +477,15 @@ class LLMTransformerAgent(nn.Module):
             LLM 生成的答案字符串
         """
         
-        # 获取当前的提示嵌入参数
-        # self.current_prompt_embedding_tensor 存储 [T_i, p_i]
         current_temp = self.current_prompt_embedding_tensor[0].item()
         current_penalty = self.current_prompt_embedding_tensor[1].item()
 
         final_temp = temperature if temperature is not None else current_temp
         final_penalty = repetition_penalty if repetition_penalty is not None else current_penalty
         
-        # 更新 current_prompt_embedding 字典，主要用于日志或调试，实际参数传递给LLM
         self.current_prompt_embedding['temperature'] = final_temp
-        # 论文中 p_i 是 penalty threshold for repetition.
-        # 假设 ImprovedLLMWrapper 有一个 repetition_penalty 参数。
         self.current_prompt_embedding['repetition_penalty'] = final_penalty
 
-        # 社交媒体仿真：executor prompt 要求输出严格 JSON（action_type + stance_id + post_text）
-        # 注意：环境 observation 本身已包含 persona/neighbor/population 信息与 stance_id 映射。
-        # 这里做“最后一道闸门”，确保输出格式可被 env 解析。
         fa = str(forced_action_type).strip().lower() if forced_action_type is not None else ""
         fs = None
         try:
@@ -652,11 +540,9 @@ Return JSON only:"""
             temperature=final_temp,
             repetition_penalty=final_penalty,
             max_tokens=int(getattr(self.args, "max_answer_tokens", 256)),
-            # For social-media simulation, optionally request strict JSON from OpenAI-compatible providers.
             response_format={"type": "json_object"} if bool(getattr(self.args, "llm_response_format_json", False)) else None,
         )
         
-        # 轻量校验/修复：确保返回可解析 JSON（env 侧也有解析，但这里尽量提高成功率）
         fixed = self._ensure_social_json(answer, forced_action_type=fa if fa else None, forced_stance_id=fs)
         return fixed
 
@@ -668,7 +554,6 @@ Return JSON only:"""
         def _coerce_action_type(obj: Dict[str, Any]) -> str:
             at = str(obj.get("action_type") or obj.get("action") or "").strip().lower()
             if not at:
-                # backward-compat: stance/text implies "post"
                 if ("stance_id" in obj) or ("post_text" in obj) or ("text" in obj) or ("tweet" in obj):
                     at = "post"
                 else:
@@ -690,7 +575,6 @@ Return JSON only:"""
 
         def _normalize(obj: Dict[str, Any]) -> str:
             at = _coerce_action_type(obj)
-            # hard constraints (policy-guided): override action_type and stance_id
             fa = str(forced_action_type).strip().lower() if forced_action_type else ""
             if fa in allowed_actions:
                 at = fa
@@ -700,7 +584,6 @@ Return JSON only:"""
                 if sid is None:
                     sid = 0
                 return json.dumps({"action_type": at, "stance_id": int(sid), "post_text": str(txt)}, ensure_ascii=False)
-            # like / do_nothing: no stance expressed
             return json.dumps({"action_type": at, "stance_id": None, "post_text": ""}, ensure_ascii=False)
 
         try:
@@ -713,7 +596,6 @@ Return JSON only:"""
         if not ss:
             return json.dumps({"action_type": "do_nothing", "stance_id": None, "post_text": ""}, ensure_ascii=False)
 
-        # try parse as json directly
         try:
             obj = json.loads(ss)
             if isinstance(obj, dict):
@@ -721,7 +603,6 @@ Return JSON only:"""
         except Exception:
             pass
 
-        # try extract a json object substring
         m = re.search(r"\{[\s\S]*\}", ss)
         if m:
             try:
@@ -731,7 +612,6 @@ Return JSON only:"""
             except Exception:
                 pass
 
-        # fallback: extract stance_id integer if present
         sid = 0
         mid = re.search(r"stance_id\s*[:=]\s*(-?\d+)", ss)
         if mid:
@@ -740,11 +620,9 @@ Return JSON only:"""
             except Exception:
                 sid = 0
 
-        # use remaining text as tweet content (truncate)
         txt = ss
         if len(txt) > 800:
             txt = txt[:800]
-        # fallback implies stance-only, treat as post
         return json.dumps({"action_type": "post", "stance_id": int(sid), "post_text": str(txt)}, ensure_ascii=False)
         
     def save_models(self, path: str):
@@ -755,7 +633,6 @@ Return JSON only:"""
             path: 保存路径
         """
         os.makedirs(path, exist_ok=True)
-        # 统一保存整个 agent，包含 belief_network/output_network 及其它参数
         torch.save(self.state_dict(), f"{path}/agent.th")
     
     def load_models(self, path: str):
@@ -767,7 +644,6 @@ Return JSON only:"""
         """
         agent_path = f"{path}/agent.th"
         if os.path.exists(agent_path):
-            # Backward/forward compatibility: checkpoints may have different head names.
             sd = torch.load(agent_path, map_location=self.device)
             try:
                 missing, unexpected = self.load_state_dict(sd, strict=False)
@@ -776,23 +652,18 @@ Return JSON only:"""
                 if unexpected:
                     logger.warning(f"Agent checkpoint unexpected keys (ignored): {unexpected[:20]}{'...' if len(unexpected) > 20 else ''}")
             except Exception:
-                # ultra-safe fallback
                 self.load_state_dict(sd, strict=False)
-            # Initialize S3b prior head from action_type_head after loading.
             try:
                 if self.s3b_bias_enabled and isinstance(self.s3b_prior_head, nn.Module):
                     self.s3b_prior_head.load_state_dict(self.action_type_head.state_dict(), strict=True)
             except Exception:
                 pass
             return
-        # 兼容旧 checkpoint 命名
         bn = f"{path}/belief_network.th"
         on = f"{path}/output_network.th"
         if os.path.exists(bn):
             self.belief_network.load_state_dict(torch.load(bn, map_location=self.device))
         if os.path.exists(on):
-            # Old behavior: output_network corresponded to discrete logits.
-            # Map it to action_type_head/output_network alias (and ignore shape mismatch via strict=False if needed).
             try:
                 self.output_network.load_state_dict(torch.load(on, map_location=self.device), strict=False)
             except Exception:
@@ -801,7 +672,6 @@ Return JSON only:"""
                 except Exception:
                     pass
 
-        # Initialize S3b prior head from action_type_head after loading.
         try:
             if self.s3b_bias_enabled and isinstance(self.s3b_prior_head, nn.Module):
                 self.s3b_prior_head.load_state_dict(self.action_type_head.state_dict(), strict=True)
@@ -812,7 +682,6 @@ Return JSON only:"""
         """
         将模型参数移动到 CUDA 设备上。
         """
-        # 统一用 self.to(self.device)
         self.to(self.device)
         return self
         
@@ -820,5 +689,4 @@ Return JSON only:"""
         """
         初始化隐藏状态（在 Transformer 中不使用，为接口兼容性而保留）。
         """
-        # Transformer 不需要隐藏状态
         return torch.zeros(1, device=self.device) 

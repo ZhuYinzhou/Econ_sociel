@@ -28,17 +28,13 @@ class BeliefTransformer(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, belief_dim: int, 
                  n_heads: int = 8, n_layers: int = 3, dropout: float = 0.1):
         super().__init__()
-        # Ensure hidden_dim is divisible by n_heads
         assert hidden_dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
         
-        # Input embedding with position encoding
         self.input_embed = nn.Linear(input_dim, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
         
-        # Gradient checkpointing flag
         self.use_checkpointing = True
         
-        # Transformer layers with memory efficient attention
         self.transformer_layers = nn.ModuleList([
             TransformerBlock(
                 dim=hidden_dim,
@@ -51,29 +47,23 @@ class BeliefTransformer(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = x.size(0)
         
-        # Add positional encoding
         x = self.input_embed(x)
         x = self.pos_encoder(x)
         
-        # Create attention mask for padding
         mask = self._create_attention_mask(x)
         
-        # Apply transformer layers with gradient checkpointing
         for layer in self.transformer_layers:
             if self.use_checkpointing and self.training:
                 x = checkpoint.checkpoint(layer, x, mask)
             else:
                 x = layer(x, mask)
                 
-        # Special handling for batch_size=1
         if batch_size == 1:
             x = x.squeeze(0)
             
-        # Generate belief state and parameters
         belief_state = self.belief_net(x)
         params = self.param_net(belief_state)
         
-        # Scale parameters appropriately
         temperature, top_p = self._scale_parameters(params)
         
         return belief_state, (temperature, top_p)
@@ -102,7 +92,6 @@ class LLMTransformerAgent(nn.Module):
     def __init__(self, input_shape: int, args: Any):
         super().__init__()
         
-        # Initialize Transformer-based belief network
         self.belief_transformer = BeliefTransformer(
             input_dim=input_shape,
             hidden_dim=args.hidden_dim,
@@ -112,14 +101,12 @@ class LLMTransformerAgent(nn.Module):
             dropout=args.dropout
         )
         
-        # Initialize LLM wrapper
         self.llm_wrapper = ImprovedLLMWrapper(
             api_key=args.together_api_key,
             model_name=args.executor_model,
             belief_dim=args.belief_dim
         )
         
-        # Output network
         self.output_net = nn.Sequential(
             nn.Linear(args.belief_dim, args.hidden_dim),
             nn.LayerNorm(args.hidden_dim),
@@ -127,14 +114,11 @@ class LLMTransformerAgent(nn.Module):
             nn.Linear(args.hidden_dim, args.n_actions)
         )
         
-        # Cache for current parameters
         self.current_params = {'temperature': 0.7, 'top_p': 0.9}
         
     def forward(self, inputs: torch.Tensor, test_mode: bool = False) -> Dict[str, torch.Tensor]:
-        # Generate belief state and LLM parameters
         belief_state, llm_params = self.belief_transformer(inputs)
         
-        # Generate action logits
         action_out = self.output_net(belief_state)
         
         if test_mode:
@@ -142,7 +126,6 @@ class LLMTransformerAgent(nn.Module):
         else:
             temperature, top_p = llm_params
         
-        # Cache parameters
         self.current_params = {
             'temperature': temperature,
             'top_p': top_p
@@ -163,7 +146,6 @@ class LLMTransformerAgent(nn.Module):
         forced_action_type: Optional[str] = None,
         forced_stance_id: Optional[int] = None,
     ) -> str:
-        # Use belief state to adjust LLM parameters
         temperature = self.current_params['temperature']
         top_p = self.current_params['top_p']
         
@@ -183,5 +165,4 @@ Answer:"""
         )
         
     def init_hidden(self) -> torch.Tensor:
-        # No hidden state needed for transformer
         return torch.zeros(1)

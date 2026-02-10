@@ -19,9 +19,7 @@ def _normalize_label(s: Any) -> str:
     ss = str(s).strip()
     if not ss:
         return ""
-    # 常见大小写/空白差异
     ss2 = re.sub(r"\s+", " ", ss).strip()
-    # 兼容一些变体
     low = ss2.lower()
     mapping = {
         "neutral": "Neutral",
@@ -120,7 +118,6 @@ class ABMDecayUpdater(PopulationZUpdater):
         t: int,
         stage_end: bool,
     ) -> List[float]:
-        # 逻辑上延迟到 stage end 才更新
         if not stage_end:
             return z
         if not isinstance(z, list) or not z:
@@ -132,8 +129,6 @@ class ABMDecayUpdater(PopulationZUpdater):
         total = int(agg.get("n", sum(int(c) for c in counts))) if isinstance(agg, dict) else int(sum(int(c) for c in counts))
         total = max(0, total)
 
-        # 近似等价于：对每个 core post 做一次 decay + alpha*onehot，再归一化
-        # 这里按 stage 聚合：z <- (decay^N)*z + alpha*counts，再归一化
         zz = [float(v) * (self.decay ** float(total)) for v in z]
         for i in range(k):
             try:
@@ -159,7 +154,6 @@ class ScalarABMDecayUpdater:
         return 0.0
 
     def init_aggregator(self) -> Dict[str, Any]:
-        # 仍用 K=3 的计数聚合（对齐核心 stance labels）
         return {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
 
     def update(
@@ -281,7 +275,6 @@ def _stage_label(stage_items: List[Any]) -> Optional[str]:
             labels.append(lab)
     if not labels:
         return None
-    # majority vote
     from collections import Counter
 
     return Counter(labels).most_common(1)[0][0]
@@ -429,41 +422,24 @@ class HiSimSocialEnv(gym.Env):
         self.max_question_length = int(kwargs.get("max_question_length", 1024))
         self.max_answer_length = int(kwargs.get("max_answer_length", 512))
 
-        # rollout settings
         self.n_stages = int(kwargs.get("n_stages", 13))  # use 0..12 by default
         self.max_neighbor_posts = int(kwargs.get("max_neighbor_posts", 8))
         self.max_population_texts = int(kwargs.get("max_population_texts", 20))
-        # A: supervision masking for missing next-step labels/text
         self.mask_missing_gt = bool(kwargs.get("mask_missing_gt", True))
-        # C: gate z supervision by minimum labeled edge users at target stage
         self.min_edge_labels_for_z_target = int(kwargs.get("min_edge_labels_for_z_target", 0))
-        # secondary users (edge) simulation via belief network (innovation hook)
+        self.soft_z_mask = bool(kwargs.get("soft_z_mask", False))
         self.use_secondary_belief_sim = bool(kwargs.get("use_secondary_belief_sim", False))
         self.secondary_sim_max_users = int(kwargs.get("secondary_sim_max_users", 200))
         self.secondary_sim_use_micro_texts = bool(kwargs.get("secondary_sim_use_micro_texts", True))
-        # core user profile/memory prompt controls
         self.max_user_history_lines = int(kwargs.get("max_user_history_lines", 40))
         self.max_recent_self_posts = int(kwargs.get("max_recent_self_posts", 6))
-        # B2-2: non-parametric group representation vector dim (should match belief_dim, e.g., 128)
         self.group_representation_dim = int(kwargs.get("group_representation_dim", 128))
 
-        # === HiSim-style synchronous round update (Stage4 option) ===
-        # If True:
-        # - One env.step() corresponds to ONE stage-round where ALL core users act once (conceptually concurrent).
-        # - Each core user's observation at stage t is generated from the PRE-round state (no same-stage neighbor leakage).
-        # This is intended to strictly replicate HiSim's "same-round concurrent -> unified update" semantics.
         self.sync_stage_update = bool(kwargs.get("sync_stage_update", False))
-        # Optional: limit number of core users for debugging/smoke tests (e.g., 5)
         self.max_core_users = int(kwargs.get("max_core_users", -1))
-        # Optional: shuffle core user order at each stage boundary (mainly for legacy sequential mode).
-        # In sync mode, order does not affect information availability (all see pre-round state).
         self.shuffle_core_users_each_stage = bool(kwargs.get("shuffle_core_users_each_stage", False))
         self.core_users_shuffle_seed = int(kwargs.get("core_users_shuffle_seed", 42))
 
-        # ABM/latent z update (baseline; can be swapped later)
-        # population_belief_mode (new preferred name; keep backward compatibility with population_z_mode):
-        # - "categorical3": legacy, z is a prob vector over K=3 labels
-        # - "scalar"/"continuous": z is a scalar in [-1,1] representing direction & intensity
         _pbm = kwargs.get("population_belief_mode", None)
         if _pbm is None:
             _pbm = kwargs.get("population_z_mode", "categorical3")
@@ -479,18 +455,11 @@ class HiSimSocialEnv(gym.Env):
         self.population_z_updater_name = str(kwargs.get("population_z_updater", "abm_decay")).strip().lower()
         self.z_agg_max_texts = int(kwargs.get("z_agg_max_texts", 0))  # 0=不存 text；>0 存储部分 post 文本供 NN updater 用
 
-        # reward weights
         self.reward_w_action_type = float(kwargs.get("reward_w_action_type", 0.2))
         self.reward_w_stance = float(kwargs.get("reward_w_stance", 0.7))
         self.reward_w_text = float(kwargs.get("reward_w_text", 0.3))
-        # Optional: z-based reward (Stage4 recommendation: start simple with z-only reward)
-        # - Computed at stage boundary where z_mask==1
-        # - Causal semantics (paper §2.1): at time t, core actions happen and population responds to form z_t.
-        #   Therefore the supervision/target at step t is the edge stance distribution at stage t (NOT t+1).
-        # - Default 0.0 keeps backward compatibility
         self.reward_w_z = float(kwargs.get("reward_w_z", 0.0))
         self.reward_z_on_stage_end_only = bool(kwargs.get("reward_z_on_stage_end_only", True))
-        # normalize if user provided weird weights (keep backward compatibility if action_type weight is 0)
         sw = (
             max(0.0, self.reward_w_action_type)
             + max(0.0, self.reward_w_stance)
@@ -503,11 +472,9 @@ class HiSimSocialEnv(gym.Env):
             self.reward_w_text /= sw
             self.reward_w_z /= sw
 
-        # action types (core user behavior)
         self.action_types: List[str] = ["post", "retweet", "reply", "like", "do_nothing"]
         self.action2id: Dict[str, int] = {a: i for i, a in enumerate(self.action_types)}
 
-        # Load data
         macro_path = os.path.join(self.hisim_data_root, "hisim_with_tweet", f"{self.topic}_macro_{self.event}.pkl")
         if not os.path.exists(macro_path):
             raise FileNotFoundError(f"macro 文件不存在: {macro_path}")
@@ -518,8 +485,6 @@ class HiSimSocialEnv(gym.Env):
 
         role_desc_path = os.path.join(self.hisim_data_root, "user_data", self.topic, "role_desc_v2_clean.json")
         follower_dict_path = os.path.join(self.hisim_data_root, "user_data", self.topic, "follower_dict.json")
-        # user historical posts (observed memory)
-        # default path aligns with convert_hisim_to_econ_dataset.py: user_data/<topic>/<topic>_v2/<user>.txt
         self.user_history_dir = kwargs.get(
             "user_history_dir",
             os.path.join(self.hisim_data_root, "user_data", self.topic, f"{self.topic}_v2"),
@@ -541,7 +506,6 @@ class HiSimSocialEnv(gym.Env):
         self.edge_users = [u for u in self.all_users if u not in set(self.core_users)]
         logger.info(f"[HiSimSocialEnv] topic={self.topic} event={self.event} macro_users={len(self.all_users)} core={len(self.core_users)} edge={len(self.edge_users)}")
 
-        # optional: validate user scale
         expected_core = int(kwargs.get("expected_core_users", -1))
         expected_edge = int(kwargs.get("expected_edge_users", -1))
         strict_counts = bool(kwargs.get("strict_user_counts", False))
@@ -556,7 +520,6 @@ class HiSimSocialEnv(gym.Env):
                 raise ValueError(msg)
             logger.warning(msg)
 
-        # load observed historical posts for core users if present
         try:
             if isinstance(self.user_history_dir, str) and self.user_history_dir and os.path.isdir(self.user_history_dir):
                 for u in self.core_users:
@@ -572,7 +535,6 @@ class HiSimSocialEnv(gym.Env):
         except Exception as e:
             logger.warning(f"[HiSimSocialEnv] 读取 user_history_dir 失败: {self.user_history_dir} err={e}")
 
-        # label2id: 强制 K=3（与 learner/runner 侧的 vshape(3,) 对齐）
         loaded_label2id: Optional[Dict[str, int]] = None
         if self.label2id_path and os.path.exists(self.label2id_path):
             try:
@@ -584,18 +546,14 @@ class HiSimSocialEnv(gym.Env):
                 logger.warning(f"[HiSimSocialEnv] 读取 label2id_path 失败: {self.label2id_path} err={e}")
 
         if loaded_label2id:
-            # normalize keys
             tmp = {_normalize_label(k): int(v) for k, v in loaded_label2id.items()}
-            # 只保留 0..K-1
             tmp = {k: v for k, v in tmp.items() if 0 <= int(v) < self.stance_k}
-            # 补全缺失（尽量用常见三类）
             if self.stance_k == 3:
                 canonical = {"Neutral": 0, "Oppose": 1, "Support": 2}
                 for k, v in canonical.items():
                     tmp.setdefault(k, v)
             self.label2id = {k: int(v) for k, v in sorted(tmp.items(), key=lambda x: x[1])[: self.stance_k]}
         else:
-            # 从 macro 扫 label（采样即可），然后尽量映射到三类
             labels = set()
             for u in self.all_users[:200]:
                 ud = self.macro.get(u)
@@ -615,28 +573,21 @@ class HiSimSocialEnv(gym.Env):
 
             if self.stance_k == 3:
                 canonical = {"Neutral": 0, "Oppose": 1, "Support": 2}
-                # 如果 canonical 都出现过，直接用 canonical；否则退化为取前三个并告警
                 if set(canonical.keys()).issubset(labels):
                     self.label2id = dict(canonical)
                 else:
                     picked = sorted(list(labels))[:3]
                     if len(picked) < 3:
-                        # 极端情况下不足 3，补 Neutral/Oppose/Support
                         picked = (picked + ["Neutral", "Oppose", "Support"])[:3]
                     self.label2id = {lab: i for i, lab in enumerate(picked)}
                     logger.warning(f"[HiSimSocialEnv] macro labels!=canonical，已退化选取前三类作为 K=3: {self.label2id}")
             else:
                 self.label2id = {lab: i for i, lab in enumerate(sorted(labels))}
 
-        # 最终固定维度
         self.id2label = {i: lab for lab, i in self.label2id.items()}
         self.num_labels = int(self.stance_k)
         logger.info(f"[HiSimSocialEnv] labels(K={self.num_labels})={self.label2id}")
 
-        # population_z updater
-        # NOTE:
-        # - categorical3: use list-prob updater (PopulationZUpdater)
-        # - continuous/scalar: use scalar updater (z in [-1,1]) but still aggregate counts over K=3 labels
         self._z_accumulator = PopulationZUpdater()  # only used for stage-wise count aggregation
         self.z_scalar_updater: Optional[Any] = None
         if self.population_z_mode == "continuous":
@@ -647,7 +598,6 @@ class HiSimSocialEnv(gym.Env):
             else:
                 logger.warning(f"[HiSimSocialEnv] 未知 population_z_updater={self.population_z_updater_name}（continuous 模式），回退 scalar abm_decay")
                 self.z_scalar_updater = ScalarABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
-            # keep a categorical updater instance for compatibility (should not be used in continuous mode)
             self.z_updater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
         else:
             if self.population_z_updater_name in ("abm_decay", "abm", "decay"):
@@ -658,9 +608,6 @@ class HiSimSocialEnv(gym.Env):
                 logger.warning(f"[HiSimSocialEnv] 未知 population_z_updater={self.population_z_updater_name}，回退 abm_decay")
                 self.z_updater = ABMDecayUpdater(alpha=self.z_alpha, decay=self.z_decay)
 
-        # === supervision target for latent z (secondary users) ===
-        # - categorical3: z ∈ Δ^K (K=num_labels=3)
-        # - continuous: z ∈ [-1,1] scalar (mean stance value over secondary users)
         self.edge_dist_by_stage: Dict[int, List[float]] = {}
         self.edge_z_scalar_by_stage: Dict[int, float] = {}
         self.edge_label_count_by_stage: Dict[int, int] = {}
@@ -684,11 +631,8 @@ class HiSimSocialEnv(gym.Env):
                 self.edge_dist_by_stage[t] = [1.0 / self.num_labels for _ in range(self.num_labels)]
             else:
                 self.edge_dist_by_stage[t] = [c / total for c in counts]
-            # continuous scalar: map (Oppose, Neutral, Support) -> (-1,0,+1) then take expectation
             try:
                 p = self.edge_dist_by_stage[t]
-                # indices are aligned to label2id; in canonical mapping we expect Neutral=0, Oppose=1, Support=2
-                # but we keep it robust: compute by label name if possible
                 v_map = {"Oppose": -1.0, "Neutral": 0.0, "Support": 1.0}
                 z_val = 0.0
                 for i in range(self.num_labels):
@@ -698,7 +642,6 @@ class HiSimSocialEnv(gym.Env):
             except Exception:
                 self.edge_z_scalar_by_stage[t] = 0.0
 
-        # precompute micro texts bucketed by stage (for population observation)
         micro_path = os.path.join(self.hisim_data_root, "hisim_with_tweet", f"{self.topic}_micro.pkl")
         micro_items = _load_micro_items(micro_path)
         if micro_items:
@@ -707,35 +650,23 @@ class HiSimSocialEnv(gym.Env):
         else:
             self.micro_texts_by_stage = {t: [] for t in range(14)}
 
-        # Spaces
         self.action_space = spaces.Text(max_length=self.max_answer_length)
         self.observation_space = spaces.Text(max_length=self.max_question_length)
 
-        # Episode state
         self.stage_t = 0
         self.core_idx = 0
         self.episode_steps = 0
-        # episode_limit definition depends on sync mode:
-        # - sync_stage_update=False (legacy): one step per core user, so T = n_stages * |core_users|
-        # - sync_stage_update=True:  one step per stage-round, so T = n_stages
         self.episode_limit = int(self.n_stages) if self.sync_stage_update else (self.n_stages * len(self.core_users))
 
-        # social state
-        # (user, stage)-> {"action_type":str, "stance_id":Optional[int], "text":str}
         self.core_posts: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        # (edge_user, stage)-> {"action_type":str, "stance_id":Optional[int], "text":str}
-        # simulated from belief network (optional)
         self.secondary_posts: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        # population latent z (either prob vec over labels or scalar)
         if self.population_z_mode == "continuous":
-            # scalar z in [-1,1]
             try:
                 self.population_z = float(self.z_scalar_updater.reset()) if self.z_scalar_updater is not None else 0.0
             except Exception:
                 self.population_z = 0.0
         else:
             self.population_z = self.z_updater.reset(self.num_labels)
-        # stage-level aggregation for delayed z update
         if self.population_z_mode == "continuous":
             self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
         else:
@@ -754,7 +685,6 @@ class HiSimSocialEnv(gym.Env):
         if not isinstance(belief_inputs, dict):
             belief_inputs = {}
 
-        # K for core stance labels remains 3; population_z may be scalar when population_z_mode="continuous".
         k = int(belief_inputs.get("k") or self.num_labels or 3)
         k = max(1, k)
 
@@ -765,7 +695,6 @@ class HiSimSocialEnv(gym.Env):
 
         pz_raw = belief_inputs.get("population_z")
         if self.population_z_mode == "continuous":
-            # scalar z in [-1,1] -> tensor shape (1,)
             try:
                 z = float(pz_raw) if pz_raw is not None else float(self.population_z)
             except Exception:
@@ -800,7 +729,6 @@ class HiSimSocialEnv(gym.Env):
         neighbor_counter, neighbor_texts = self._neighbor_context(user, t)
         pop_dist, pop_texts = self._population_obs(t)
 
-        # 计数向量化（按 label id 对齐）
         nb_counts = [0 for _ in range(self.num_labels)]
         for lab, c in (neighbor_counter or {}).items():
             labn = _normalize_label(lab)
@@ -816,7 +744,6 @@ class HiSimSocialEnv(gym.Env):
             "user_history": str(user_history) if user_history is not None else "",
             "neighbor_stance_counts": nb_counts,  # List[int], len=K
             "neighbor_texts": [str(x[1]) for x in (neighbor_texts or [])],
-            # population_z: either List[float] (categorical3) or float scalar (continuous)
             "population_z": self.population_z if self.population_z_mode == "continuous" else [float(v) for v in (self.population_z or [])],
             "population_dist": {str(k): float(v) for k, v in (pop_dist or {}).items()},
             "population_texts": [str(x) for x in (pop_texts or [])],
@@ -826,7 +753,6 @@ class HiSimSocialEnv(gym.Env):
     def get_env_info(self) -> Dict[str, Any]:
         return {
             "episode_limit": self.episode_limit,
-            # NOTE: env.step 实际消费的是 LLM 输出的 JSON 文本；这里的 n_actions 主要用于 runner/buffer 的占位形状
             "n_actions": len(self.action_types),
             "obs_shape": (self.max_question_length,),
             "state_shape": (1,),
@@ -865,7 +791,6 @@ class HiSimSocialEnv(gym.Env):
                 post = self.secondary_posts.get(key)
             if not post:
                 continue
-            # only count stance if this action actually expresses stance
             at = str(post.get("action_type") or "").strip().lower()
             sid = post.get("stance_id")
             if at in ("post", "retweet", "reply") and isinstance(sid, int) and sid in self.id2label:
@@ -895,14 +820,11 @@ class HiSimSocialEnv(gym.Env):
 
     def _population_obs(self, t: int) -> Tuple[Dict[str, float], List[str]]:
         if self.population_z_mode == "continuous":
-            # represent as a single scalar summary
             dist = {"z_scalar": float(self.population_z)}
         else:
             dist = {self.id2label[i]: float(self.population_z[i]) for i in range(self.num_labels) if i in self.id2label}
-        # prefer simulated secondary posts (micro) when enabled; fallback to observed micro texts
         sample: List[str] = []
         if self.use_secondary_belief_sim and self.secondary_posts:
-            # sample from simulated secondary posts at stage t
             items = [(u, p) for (u, tt), p in self.secondary_posts.items() if int(tt) == int(t)]
             random.shuffle(items)
             for u, p in items[: max(0, int(self.max_population_texts))]:
@@ -929,17 +851,14 @@ class HiSimSocialEnv(gym.Env):
         v = [0.0 for _ in range(dim)]
         prev = int(t) - 1
         if prev < 0:
-            # default: uniform stance + do_nothing action
             if dim >= 3:
                 v[0] = v[1] = v[2] = 1.0 / 3.0
             if dim >= 8:
                 v[3 + 4] = 1.0
             return v
 
-        # stance distribution over stance-expressing actions in prev stage
         stance_counts = [0, 0, 0]
         stance_total = 0
-        # action distribution over all actions in prev stage
         at_names = ["post", "retweet", "reply", "like", "do_nothing"]
         at2i = {a: i for i, a in enumerate(at_names)}
         action_counts = [0, 0, 0, 0, 0]
@@ -977,7 +896,6 @@ class HiSimSocialEnv(gym.Env):
             else:
                 v[3 + 4] = 1.0
 
-        # activity/intensity scalars (optional)
         if dim >= 9:
             denom = float(max(1, len(self.core_users)))
             v[8] = float(action_total) / denom  # in sync mode action_total==|core_users|
@@ -987,12 +905,8 @@ class HiSimSocialEnv(gym.Env):
 
         return v
 
-    # === Prompt budget truncation (fast, approximate) ===
-    # Goal: ensure any truncation happens in low-priority sections (history/long texts),
-    # never in critical constraints (task/output format) or critical state summaries (z/pop/neighbor summary).
     def _approx_token_len_lines(self, lines: List[str]) -> int:
         try:
-            # GPT-style BPE heuristic: ~4 chars/token on English; adjust for newlines.
             s = "\n".join([str(x) for x in (lines or [])])
             return int(max(0, (len(s) // 4) + s.count("\n") // 2))
         except Exception:
@@ -1016,7 +930,6 @@ class HiSimSocialEnv(gym.Env):
                 out0.extend([str(x) for x in (s.get("lines") or [])])
             return out0
 
-        # copy
         ss: List[Dict[str, Any]] = []
         for s in sections:
             ss.append(
@@ -1038,10 +951,8 @@ class HiSimSocialEnv(gym.Env):
         if self._approx_token_len_lines(cur) <= mt:
             return cur
 
-        # truncate from lowest priority upward
         order = sorted(range(len(ss)), key=lambda i: (ss[i]["priority"], ss[i]["name"]))
 
-        # 1) drop whole low-priority sections (history)
         for i in order:
             if self._approx_token_len_lines(_flatten()) <= mt:
                 break
@@ -1053,20 +964,17 @@ class HiSimSocialEnv(gym.Env):
         if self._approx_token_len_lines(_flatten()) <= mt:
             return _flatten()
 
-        # 2) drop other truncatable sections entirely (recent) if still too long
         for i in order:
             if self._approx_token_len_lines(_flatten()) <= mt:
                 break
             if not ss[i]["truncatable"]:
                 continue
-            # NOTE: persona is treated as high-priority and should not be dropped wholesale here.
             if ss[i]["name"] in ("medium", "recent"):
                 ss[i]["lines"] = []
 
         if self._approx_token_len_lines(_flatten()) <= mt:
             return _flatten()
 
-        # 3) trim tails of long text sections (neighbor/pop texts), keep their headers if present
         for i in order:
             if self._approx_token_len_lines(_flatten()) <= mt:
                 break
@@ -1075,7 +983,6 @@ class HiSimSocialEnv(gym.Env):
             lines = ss[i]["lines"]
             if not lines:
                 continue
-            # keep header-like first line if it ends with ":"
             keep_head = 0
             try:
                 if len(lines) >= 1 and str(lines[0]).strip().endswith(":"):
@@ -1083,7 +990,6 @@ class HiSimSocialEnv(gym.Env):
             except Exception:
                 keep_head = 0
             while len(lines) > keep_head and self._approx_token_len_lines(_flatten()) > mt:
-                # don't remove the last blank line only; remove meaningful tail
                 lines.pop()
             ss[i]["lines"] = lines
 
@@ -1103,9 +1009,6 @@ class HiSimSocialEnv(gym.Env):
         header.append(f"User: {user} (core user)")
         header.append("")
         high: List[str] = []
-        # =========================
-        # High-priority signals FIRST (must survive truncation)
-        # =========================
         if pop_dist:
             if self.population_z_mode == "continuous":
                 zc = float(pop_dist.get("z_scalar", 0.0))
@@ -1137,19 +1040,12 @@ class HiSimSocialEnv(gym.Env):
                 pop_texts_sec.append(f"- {txt}")
             pop_texts_sec.append("")
 
-        # =========================
-        # Persona (high priority; should survive truncation when possible)
-        # =========================
         persona_sec: List[str] = []
         if persona:
             persona_sec.append("Profile / persona:")
             persona_sec.append(str(persona).strip())
             persona_sec.append("")
 
-        # =========================
-        # Medium-priority context
-        # =========================
-        # recent self actions from simulation (previous stages)
         medium: List[str] = []
         if self.max_recent_self_posts > 0:
             recent: List[Tuple[int, str, str]] = []
@@ -1170,9 +1066,6 @@ class HiSimSocialEnv(gym.Env):
                         medium.append(f"- t={tt} {at}")
                 medium.append("")
 
-        # =========================
-        # Low-priority (should be truncated first)
-        # =========================
         history: List[str] = []
         if user_history:
             history.append("Optional / low-priority: historical posts (observed; may be truncated):")
@@ -1229,9 +1122,7 @@ class HiSimSocialEnv(gym.Env):
             self.population_z = self.z_updater.reset(self.num_labels)
             self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
-        # Sync mode: return per-core-user observations (aligned to core_users order).
         if bool(getattr(self, "sync_stage_update", False)):
-            # Optional shuffle (kept deterministic via seed); mostly irrelevant for sync semantics but helps match HiSim "random order".
             if bool(getattr(self, "shuffle_core_users_each_stage", False)):
                 rnd = random.Random(int(getattr(self, "core_users_shuffle_seed", 42)) + int(self.stage_t))
                 rnd.shuffle(self.core_users)
@@ -1242,9 +1133,7 @@ class HiSimSocialEnv(gym.Env):
                 "is_core_user": True,
                 "agent_infos": [{"user": str(u), "t": int(self.stage_t), "is_core_user": True} for u in self.core_users],
             }
-            # Non-parametric group repr for current stage (derived from previous stage; stage0 uses default)
             self.current_info["group_representation"] = self._nonparam_group_representation_prev_stage(int(self.stage_t))
-            # Provide a global belief_inputs snapshot (population_z/stage) for runner compatibility.
             self.current_info["belief_inputs"] = {
                 "t": int(self.stage_t),
                 "is_core_user": True,
@@ -1256,7 +1145,6 @@ class HiSimSocialEnv(gym.Env):
         user = self._current_user()
         self.current_obs = self._build_observation(user, self.stage_t)
         self.current_info = {"user": user, "t": self.stage_t, "is_core_user": True}
-        # 显式 belief inputs（与 current_obs 对齐）
         self.current_info["belief_inputs"] = self._collect_belief_inputs(user, self.stage_t)
         return self.current_obs, {"sample": self.current_info}
 
@@ -1295,9 +1183,6 @@ class HiSimSocialEnv(gym.Env):
 
         high: List[str] = []
 
-        # =========================
-        # High-priority signals FIRST (must survive truncation)
-        # =========================
         if pop_dist:
             if self.population_z_mode == "continuous":
                 zc = float(pop_dist.get("z_scalar", 0.0))
@@ -1322,19 +1207,12 @@ class HiSimSocialEnv(gym.Env):
                 neighbor_texts_sec.append(f"- [{nb}] {txt}")
             neighbor_texts_sec.append("")
 
-        # =========================
-        # Persona (high priority; should survive truncation when possible)
-        # =========================
         persona_sec: List[str] = []
         if persona:
             persona_sec.append("Profile / persona:")
             persona_sec.append(str(persona).strip())
             persona_sec.append("")
 
-        # =========================
-        # Medium-priority context
-        # =========================
-        # recent self actions (previous stages only)
         medium: List[str] = []
         if self.max_recent_self_posts > 0:
             recent: List[Tuple[int, str, str]] = []
@@ -1352,9 +1230,6 @@ class HiSimSocialEnv(gym.Env):
                     medium.append(f"- stage{tt}: {at}" + (f" | {txt}" if txt else ""))
                 medium.append("")
 
-        # =========================
-        # Low-priority (should be truncated first)
-        # =========================
         if user_history:
             history: List[str] = []
             history.append("Optional / low-priority: historical posts (observed; may be truncated):")
@@ -1437,7 +1312,6 @@ class HiSimSocialEnv(gym.Env):
         Stores results into self.secondary_posts.
         """
         k = int(self.num_labels)
-        # For continuous mode, convert scalar z into a categorical distribution for sampling (keeps existing secondary_posts format).
         if self.population_z_mode == "continuous":
             try:
                 if isinstance(z_probs, torch.Tensor):
@@ -1449,7 +1323,6 @@ class HiSimSocialEnv(gym.Env):
             except Exception:
                 z_scalar = float(self.population_z) if self.population_z is not None else 0.0
             z_scalar = max(-1.0, min(1.0, z_scalar))
-            # simple triangular mapping: more mass to Support when z>0, to Oppose when z<0, Neutral peaks near 0
             p_support = max(0.0, z_scalar)
             p_oppose = max(0.0, -z_scalar)
             p_neutral = max(0.0, 1.0 - abs(z_scalar))
@@ -1457,7 +1330,6 @@ class HiSimSocialEnv(gym.Env):
         else:
             z = self._normalize_prob_vec(z_probs if z_probs is not None else self.population_z, k)
 
-        # action type distribution over 5 actions
         at_default = [1.0, 0.0, 0.0, 0.0, 0.0]  # default: post only
         at = self._normalize_prob_vec(action_probs if action_probs is not None else at_default, len(self.action_types))
 
@@ -1510,11 +1382,7 @@ class HiSimSocialEnv(gym.Env):
         从 LLM 输出里解析 action_type / stance_id / post_text。
         向后兼容：若仅提供 {"stance_id":..,"post_text":..}，则视为 action_type="post"。
         """
-        # Stage4 / RL mode may pass discrete action ids directly (int / numpy int / torch scalar).
-        # In that case we must map id -> action_type; otherwise group_representation/core_posts
-        # will be inconsistent with action_hist and the policy's chosen actions.
         try:
-            # torch scalar (cpu/cuda) -> int
             import torch  # type: ignore
 
             if isinstance(action, torch.Tensor) and action.numel() == 1:
@@ -1553,57 +1421,45 @@ class HiSimSocialEnv(gym.Env):
             return at, sid_int, str(txt)
 
         s = str(action).strip()
-        # try json
         try:
             obj = json.loads(s)
             if isinstance(obj, dict):
                 return self._parse_action(obj)
         except Exception:
             pass
-        # try boxed
         m = re.search(r"\\boxed\{(\d+)\}", s)
         sid_int = int(m.group(1)) if m else None
-        # boxed fallback implies stance-only, treat as post
         return "post", sid_int, s
 
     
     def step(self, action: Any, extra_info: Optional[Dict[str, Any]] = None):
         if extra_info is None:
             extra_info = {}
-        # === HiSim-style synchronous stage update ===
         if bool(getattr(self, "sync_stage_update", False)):
             t = int(self.stage_t)
-            # pre-state belief snapshot (global)
             belief_inputs_pre = {
                 "t": int(t),
                 "is_core_user": True,
                 "neighbor_stance_counts": [0, 0, 0],
                 "population_z": self.population_z,
             }
-            # Non-parametric group repr for this stage t (based on previous stage t-1)
             group_repr_t = self._nonparam_group_representation_prev_stage(int(t))
 
-            # Normalize incoming actions into a list aligned to self.core_users
             acts: List[Any] = []
             if isinstance(action, dict):
-                # allow mapping {user: action_dict}
                 for u in self.core_users:
                     acts.append(action.get(str(u), {}))
             elif isinstance(action, (list, tuple)):
                 acts = list(action)
             else:
-                # single action broadcast (debug)
                 acts = [action for _ in self.core_users]
 
             if len(acts) != len(self.core_users):
-                # best-effort pad/truncate
                 if len(acts) < len(self.core_users):
                     acts = acts + [{} for _ in range(len(self.core_users) - len(acts))]
                 else:
                     acts = acts[: len(self.core_users)]
 
-            # stage-round: apply all core user actions (conceptually concurrent)
-            # store simulated posts at (user, t) and accumulate z aggregator
             sum_reward = 0.0
             sum_at = 0.0
             sum_st = 0.0
@@ -1625,7 +1481,6 @@ class HiSimSocialEnv(gym.Env):
                     "text": str(post_text)[:4000] if expresses_stance else "",
                 }
 
-                # accumulate for z update (stage end)
                 if self._z_agg is None or not isinstance(self._z_agg, dict):
                     if self.population_z_mode == "continuous":
                         self._z_agg = (
@@ -1651,7 +1506,6 @@ class HiSimSocialEnv(gym.Env):
                         post_text=post_for_agg,
                     )
 
-                # optional imitation-style reward against gt at t+1 (averaged across users)
                 gt_t = int(t) + 1
                 if gt_t < self.n_stages:
                     gt_sid, gt_lab, gt_text = self._gt_for(str(u), gt_t)
@@ -1668,13 +1522,11 @@ class HiSimSocialEnv(gym.Env):
                         sum_txt += float(r_txt)
                         valid += 1
 
-            # advance stage pointer (one step per stage)
             self.episode_steps += 1
             self.stage_t += 1
             terminated = bool(self.stage_t >= self.n_stages)
             truncated = False
 
-            # delayed population_z update happens at stage boundary (always true in sync mode)
             is_end_of_stage = True
             z_next_from_belief = extra_info.get("secondary_z_next") if isinstance(extra_info, dict) else None
             if self.population_z_mode == "continuous":
@@ -1713,7 +1565,6 @@ class HiSimSocialEnv(gym.Env):
                         stage_end=True,
                     )
 
-            # reset aggregator for next stage
             if self.population_z_mode == "continuous":
                 self._z_agg = (
                     self.z_scalar_updater.init_aggregator()
@@ -1723,7 +1574,6 @@ class HiSimSocialEnv(gym.Env):
             else:
                 self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
-            # simulate secondary users for the NEXT stage (after population_z updated)
             if self.use_secondary_belief_sim and (not terminated):
                 ap = extra_info.get("secondary_action_probs") if isinstance(extra_info, dict) else None
                 if isinstance(ap, torch.Tensor) and ap.ndim >= 2:
@@ -1735,7 +1585,6 @@ class HiSimSocialEnv(gym.Env):
                 sim_stage = int(self.stage_t)
                 self._simulate_secondary_stage(sim_stage, z_probs=z_use, action_probs=ap)
 
-            # build next observation list (PRE-round state for next stage)
             if not terminated:
                 if bool(getattr(self, "shuffle_core_users_each_stage", False)):
                     rnd = random.Random(int(getattr(self, "core_users_shuffle_seed", 42)) + int(self.stage_t))
@@ -1745,7 +1594,6 @@ class HiSimSocialEnv(gym.Env):
             else:
                 self.current_obs = []
 
-            # reward aggregation
             if valid > 0:
                 r_action_type = sum_at / float(valid)
                 r_stance = sum_st / float(valid)
@@ -1761,7 +1609,6 @@ class HiSimSocialEnv(gym.Env):
                 + self.reward_w_text * float(r_text)
             )
 
-            # post-state belief snapshot (global)
             belief_inputs_post = None
             if not terminated:
                 belief_inputs_post = {
@@ -1770,17 +1617,17 @@ class HiSimSocialEnv(gym.Env):
                     "neighbor_stance_counts": [0, 0, 0],
                     "population_z": self.population_z,
                 }
-            # Non-parametric group repr for NEXT stage (based on the just-finished stage)
             group_repr_next = self._nonparam_group_representation_prev_stage(int(self.stage_t))
 
-            # z supervision: one per stage boundary
-            # Causal semantics: step at stage t forms z_t, so the target stage is t.
             z_target_stage = int(t)
             labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
             z_mask = 1.0
-            # Gate: require enough labeled edge users for a valid target.
             if self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
-                z_mask = 0.0
+                if bool(getattr(self, "soft_z_mask", False)) and self.min_edge_labels_for_z_target > 0:
+                    z_mask = float(labeled_edge_n) / float(self.min_edge_labels_for_z_target)
+                    z_mask = float(max(0.0, min(1.0, z_mask)))
+                else:
+                    z_mask = 0.0
             if self.population_z_mode == "continuous":
                 z_target = [float(self.edge_z_scalar_by_stage.get(z_target_stage, 0.0))] if z_mask > 0 else [0.0]
                 z_pred = [float(self.population_z) if self.population_z is not None else 0.0]
@@ -1802,7 +1649,6 @@ class HiSimSocialEnv(gym.Env):
                 "population_z": float(self.population_z) if self.population_z_mode == "continuous" else list(self.population_z),
                 "belief_inputs_pre": belief_inputs_pre,
                 "belief_inputs_post": belief_inputs_post,
-                # group repr for current/next stage (runner prefers *_next for pre-transition)
                 "group_representation": group_repr_t,
                 "group_representation_next": group_repr_next,
                 "z_pred": z_pred,
@@ -1811,7 +1657,6 @@ class HiSimSocialEnv(gym.Env):
                 "z_target_labeled_edge_n": int(labeled_edge_n),
             }
 
-            # Optional z-based reward
             try:
                 if float(getattr(self, "reward_w_z", 0.0)) > 0.0:
                     do_z = True
@@ -1838,6 +1683,10 @@ class HiSimSocialEnv(gym.Env):
                                 for i in range(min(len(pt), len(pp))):
                                     kl += pt[i] * (math.log(max(eps, pt[i])) - math.log(max(eps, pp[i])))
                                 reward_z = -float(max(0.0, kl))
+                        try:
+                            reward_z = float(reward_z) * float(z_mask)
+                        except Exception:
+                            pass
                         total_reward = float(total_reward) + float(self.reward_w_z) * float(reward_z)
                         info["reward_z"] = float(reward_z)
             except Exception:
@@ -1848,10 +1697,8 @@ class HiSimSocialEnv(gym.Env):
 
         user = self._current_user()
         t = self.stage_t
-        # whether this step finishes the current stage (i.e., last core user posts)
         is_end_of_stage = (self.core_idx + 1) >= len(self.core_users)
 
-        # 显式 belief inputs：pre-state（与用于决策的 observation 一致）
         belief_inputs_pre = self._collect_belief_inputs(user, t)
 
         action_type, pred_sid, post_text = self._parse_action(action)
@@ -1860,28 +1707,23 @@ class HiSimSocialEnv(gym.Env):
             pred_sid = None
         if expresses_stance:
             if pred_sid is None or pred_sid < 0 or pred_sid >= self.num_labels:
-                # invalid stance -> neutral fallback
                 pred_sid = 0
 
-        # store simulated post
         self.core_posts[(user, t)] = {
             "action_type": str(action_type),
             "stance_id": int(pred_sid) if pred_sid is not None else None,
             "text": str(post_text)[:4000] if expresses_stance else "",
         }
 
-        # accumulate per-step signals for delayed z update (stage end)
         if self._z_agg is None or not isinstance(self._z_agg, dict):
             if self.population_z_mode == "continuous":
                 self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
             else:
                 self._z_agg = self.z_updater.init_aggregator(self.num_labels)
-        # 控制聚合文本量，避免 info 太大（供未来 NN updater 可选使用）
         if self.z_agg_max_texts <= 0:
             post_for_agg = ""
         else:
             post_for_agg = str(post_text or "")
-            # 在 accumulate 内部也会截断；这里做一次数量控制
             texts = self._z_agg.get("post_texts")
             if isinstance(texts, list) and len(texts) >= self.z_agg_max_texts:
                 post_for_agg = ""
@@ -1894,12 +1736,10 @@ class HiSimSocialEnv(gym.Env):
                 post_text=post_for_agg,
             )
 
-        # ===== training target: predict NEXT behavior (t+1) for the same core user =====
         gt_t = int(t) + 1
         gt_sid, gt_lab, gt_text = (None, None, None)
         if gt_t < self.n_stages:
             gt_sid, gt_lab, gt_text = self._gt_for(user, gt_t)
-            # A: if t+1 supervision is missing, do NOT treat it as do_nothing; mask it out.
             gt_available = bool((gt_sid is not None) or (gt_text is not None and str(gt_text).strip() != ""))
             if (not gt_available) and self.mask_missing_gt:
                 gt_action_type = ""
@@ -1914,7 +1754,6 @@ class HiSimSocialEnv(gym.Env):
                     reward_stance = 1.0
                 reward_text = _jaccard_sim(str(post_text), str(gt_text)) if (expresses_stance and gt_text) else 0.0
         else:
-            # last stage has no t+1 supervision; do not reward/penalize
             gt_available = False
             gt_action_type = ""
             reward_action_type = 0.0
@@ -1926,7 +1765,6 @@ class HiSimSocialEnv(gym.Env):
             + self.reward_w_text * reward_text
         )
 
-        # advance pointer
         self.episode_steps += 1
         terminated = False
         truncated = False
@@ -1938,12 +1776,9 @@ class HiSimSocialEnv(gym.Env):
         if self.stage_t >= self.n_stages:
             terminated = True
 
-        # delayed population_z update happens at stage boundary (after last core user posts in stage t)
         if is_end_of_stage:
-            # innovation: allow MAC/BeliefEncoder to drive secondary-user simulation via predicted z(t+1)
             z_next_from_belief = extra_info.get("secondary_z_next") if isinstance(extra_info, dict) else None
             if self.population_z_mode == "continuous":
-                # prefer model-predicted z_next scalar if provided
                 if self.use_secondary_belief_sim and z_next_from_belief is not None:
                     try:
                         if isinstance(z_next_from_belief, torch.Tensor):
@@ -1954,7 +1789,6 @@ class HiSimSocialEnv(gym.Env):
                         z_next_val = float(self.population_z) if self.population_z is not None else 0.0
                     self.population_z = float(max(-1.0, min(1.0, z_next_val)))
                 else:
-                    # baseline update: scalar updater
                     if self.z_scalar_updater is not None:
                         self.population_z = float(
                             self.z_scalar_updater.update(
@@ -1965,7 +1799,6 @@ class HiSimSocialEnv(gym.Env):
                             )
                         )
                     else:
-                        # ultra-safe fallback
                         try:
                             self.population_z = float(max(-1.0, min(1.0, float(self.population_z))))
                         except Exception:
@@ -1980,17 +1813,13 @@ class HiSimSocialEnv(gym.Env):
                         t=int(t),
                         stage_end=True,
                     )
-            # reset aggregator for next stage
             if self.population_z_mode == "continuous":
                 self._z_agg = self.z_scalar_updater.init_aggregator() if self.z_scalar_updater is not None else {"k": 3, "n": 0, "counts": [0, 0, 0], "users": [], "post_texts": []}
             else:
                 self._z_agg = self.z_updater.init_aggregator(self.num_labels)
 
-            # simulate secondary users for the NEXT stage (after population_z updated)
             if self.use_secondary_belief_sim and (not terminated):
-                # action probs (optional)
                 ap = extra_info.get("secondary_action_probs") if isinstance(extra_info, dict) else None
-                # if tensor with batch dim, take first item (env uses bs=1)
                 if isinstance(ap, torch.Tensor) and ap.ndim >= 2:
                     ap = ap[0]
                 if isinstance(z_next_from_belief, torch.Tensor) and z_next_from_belief.ndim >= 2:
@@ -2000,14 +1829,12 @@ class HiSimSocialEnv(gym.Env):
                 sim_stage = int(self.stage_t)  # stage_t already advanced to t+1 at boundary
                 self._simulate_secondary_stage(sim_stage, z_probs=z_use, action_probs=ap)
 
-        # 构造 next observation：如果 stage end，population_z 已更新，应体现在下一 stage 的观测里
         if not terminated:
             next_user = self._current_user()
             self.current_obs = self._build_observation(next_user, self.stage_t)
         else:
             self.current_obs = ""
 
-        # 显式 belief inputs：next-state（用于对齐 t+1 的 observation/监督）
         belief_inputs_post = None
         if not terminated:
             belief_inputs_post = self._collect_belief_inputs(next_user, self.stage_t)
@@ -2029,21 +1856,20 @@ class HiSimSocialEnv(gym.Env):
             "reward_cc": 0.0,
             "reward_text": reward_text,
             "population_z": float(self.population_z) if self.population_z_mode == "continuous" else list(self.population_z),
-            # belief inputs（显式）
             "belief_inputs_pre": belief_inputs_pre,
             "belief_inputs_post": belief_inputs_post,
         }
 
-        # === latent z supervision signal ===
-        # Provide target once per stage boundary: at the step that ends stage t.
-        # Causal semantics: step at stage t forms z_t, so target stage is t (NOT t+1).
         z_mask = 1.0 if bool(is_end_of_stage) else 0.0
         z_target_stage = int(t)
         labeled_edge_n = int(self.edge_label_count_by_stage.get(z_target_stage, 0))
         if z_mask > 0 and self.min_edge_labels_for_z_target > 0 and labeled_edge_n < self.min_edge_labels_for_z_target:
-            z_mask = 0.0
+            if bool(getattr(self, "soft_z_mask", False)) and self.min_edge_labels_for_z_target > 0:
+                z_mask = float(labeled_edge_n) / float(self.min_edge_labels_for_z_target)
+                z_mask = float(max(0.0, min(1.0, z_mask)))
+            else:
+                z_mask = 0.0
         if self.population_z_mode == "continuous":
-            # represent as length-1 vector for training compatibility
             z_target = [float(self.edge_z_scalar_by_stage.get(z_target_stage, 0.0))] if z_mask > 0 else [0.0]
             z_pred = [float(self.population_z) if self.population_z is not None else 0.0]
         else:
@@ -2058,8 +1884,6 @@ class HiSimSocialEnv(gym.Env):
             }
         )
 
-        # Optional: add z-based reward (default disabled)
-        # This makes Stage4 start from a clean, macro objective without text-quality noise.
         try:
             if float(getattr(self, "reward_w_z", 0.0)) > 0.0:
                 do_z = True
@@ -2068,12 +1892,10 @@ class HiSimSocialEnv(gym.Env):
                 if do_z:
                     reward_z = 0.0
                     if self.population_z_mode == "continuous":
-                        # scalar: encourage closeness to target scalar (negative L2)
                         zt = float(z_target[0]) if isinstance(z_target, list) and len(z_target) > 0 else 0.0
                         zp = float(z_pred[0]) if isinstance(z_pred, list) and len(z_pred) > 0 else 0.0
                         reward_z = -float((zp - zt) ** 2)
                     else:
-                        # categorical: negative KL(target || pred)
                         import math
 
                         eps = 1e-8
@@ -2088,13 +1910,15 @@ class HiSimSocialEnv(gym.Env):
                             for i in range(min(len(pt), len(pp))):
                                 kl += pt[i] * (math.log(max(eps, pt[i])) - math.log(max(eps, pp[i])))
                             reward_z = -float(max(0.0, kl))
-                    # add to total_reward (weights already normalized)
+                    try:
+                        reward_z = float(reward_z) * float(z_mask)
+                    except Exception:
+                        pass
                     total_reward = float(total_reward) + float(self.reward_w_z) * float(reward_z)
                     info["reward_z"] = float(reward_z)
         except Exception:
             pass
 
-        # merge extra info (LLM responses etc.)
         info.update(extra_info)
         return self.current_obs, float(total_reward), terminated, truncated, info
 

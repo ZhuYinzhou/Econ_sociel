@@ -1,4 +1,3 @@
-# src/modules/reward_controller.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -60,24 +59,19 @@ Score (0-1):"""
         Returns:
             用于权重调整的损失
         """
-        # 确保所有奖励列表长度相同
         reward_lengths = [len(rewards) for rewards in rewards_history.values()]
         if len(set(reward_lengths)) != 1:
             logger.warning(f"Inconsistent reward history lengths: {reward_lengths}")
             return torch.tensor(0.0)
             
-        # 将奖励转换为张量
         reward_al = torch.tensor(rewards_history['al'], dtype=torch.float32)
         reward_ts = torch.tensor(rewards_history['ts'], dtype=torch.float32)
         reward_cc = torch.tensor(rewards_history['cc'], dtype=torch.float32)
         
-        # 计算实际奖励
         rewards_actual = torch.stack([reward_al, reward_ts, reward_cc], dim=1)  # [batch, 3]
         
-        # 计算预期奖励分布 - 使用当前权重
         rewards_expected = self.weights.expand(rewards_actual.shape[0], -1)  # [batch, 3]
         
-        # 计算奖励差异损失 L_dr
         reward_diff_loss = torch.sum((rewards_actual - rewards_expected) ** 2)
         
         return reward_diff_loss
@@ -89,15 +83,12 @@ Score (0-1):"""
         Args:
             rewards_history: 包含各奖励组件的历史记录 {'al': [...], 'ts': [...], 'cc': [...]}
         """
-        # 计算损失
         loss = self._calculate_weight_adjustment_loss(rewards_history)
         
-        # 更新权重
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         
-        # 归一化权重，确保总和为1
         with torch.no_grad():
             self.weights.data = F.softmax(self.weights.data, dim=0)
             
